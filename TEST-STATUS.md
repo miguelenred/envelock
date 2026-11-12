@@ -6,6 +6,33 @@ binaries under `prebuilt/` are a convenience and are reproducible from `docs/BUI
 
 Date: 2026-11-12.
 
+## GitHub CI — green on every platform (2026-11-12)
+
+The source was pushed to a private GitHub repository and the full workflow (`.github/workflows/checks.yml`)
+run end to end. After four runs — the first three fixing portability of the **test harness** and the
+workflow, never the loader — **all 24 jobs pass** (commit `ebbd326`): `static`, `fuzz`, `static-php`,
+`bench`, `fpm`, `frameworks`; `unix` on **ubuntu-22.04** and **macOS 15** for PHP 8.2/8.3/8.4/8.5;
+`linux-arm64` for 8.3/8.4; and `windows` for 8.2–8.5 × NTS/TS. This is the first time the loader has
+been built and the suite run on **macOS** and on **ARM64** in this project.
+
+What the CI runs found (all test-harness or platform matters, with the loader behaving correctly —
+each reproduced before changing a test):
+- **macOS build:** the vendored bytecode layers used `madvise(MADV_DONTDUMP)`, which macOS lacks; they
+  now go through one `ENVELOCK_DONTDUMP` macro (a no-op where the flag is absent). Line counts are
+  unchanged, and a rebuilt Linux 8.4 NTS loader is byte-identical to `prebuilt/` (`a8ced333…`).
+- **Anti-debugger and trusted-time tests on Linux:** both rely on ptrace (the second through `strace`).
+  GitHub runners restrict ptrace, and the loader turns the process non-dumpable at startup, so `strace`
+  loses visibility of the later `connect()`. The anti-debugger test skips under restricted ptrace; the
+  trusted-time test runs with memory hardening off (as its O3 sibling does) so `strace` can observe the
+  connect. Verified on AlmaLinux 8 that the published loader does attempt the fetch at startup.
+- **Machine-bound licence on macOS:** the machine fingerprint reads Linux-only sources, so macOS (like
+  Windows) reports no identity and refuses a machine-bound licence for want of one — machine binding is
+  Linux-only (`docs/MANUAL.md`, `docs/SEGURIDAD.md`). An unbound licence works everywhere.
+- **Portability of the suite:** the virtualize test loads `ext/tokenizer` when PHP ships it as a shared
+  module; the identity, TracerPid, case-collision and release-guard tests no longer assume Linux or
+  Windows. Lint (Ruff, Bandit) clean. Workflow: FPM on ubuntu-24.04, the bench job builds the emitter
+  loader, the Windows job uses a throwaway identity (the encoder refuses the public demo keys).
+
 ## Hosting fixes and rebuild (2026-11-11/12)
 
 The loader changed after the native Windows validation below: OPcache switched off per site and
@@ -139,5 +166,8 @@ not on this machine.
 
 ## By CI only (cannot be built or tested in this environment)
 
-- **macOS** loader and wheels: no SDK/toolchain here; see `docs/PLATAFORMAS.md` for building, signing and
-  notarizing on a Mac.
+- **macOS** loader: no SDK/toolchain on this machine, so it is built and the full suite run **in CI**
+  (the `unix` job on macOS 15 for PHP 8.2–8.5, now green). For distributing a signed, notarized macOS
+  loader and the wheels from a Mac, see `docs/PLATAFORMAS.md`.
+- **ARM64** loader: likewise built and tested **in CI** (`linux-arm64`, PHP 8.3/8.4, green); no ARM64
+  host here.
