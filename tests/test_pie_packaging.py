@@ -82,6 +82,8 @@ def test_packages_every_prebuilt_loader(tmp_path):
     again = tmp_path / "again"
     assert _run("--version", "1.0.0", "--out", again).returncode == 0
     assert (again / "SHA256SUMS").read_text() == (out / "SHA256SUMS").read_text()
+    # LF line ends on every system, so `sha256sum -c SHA256SUMS` works on the Linux side too.
+    assert b"\r" not in (out / "SHA256SUMS").read_bytes()
 
 
 @pytest.mark.skipif(not (ROOT / "prebuilt" / "loader" / "windows-x64").is_dir(), reason="no prebuilt Windows loaders")

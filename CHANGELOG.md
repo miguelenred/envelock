@@ -1,12 +1,14 @@
 # Changelog
 
-## 1.0.0 (unreleased) — 2026-11-09 (first release: anti-root architecture and full obfuscation)
+## 1.0.0 — 2026-11-12 (first release: anti-root architecture and full obfuscation)
 
 Envelock's first release. On top of the strongest source cipher in its class, it makes the PHP source
 itself stop existing in the package and in process memory (the anti-root bytecode layer). The bytecode
 layer and every obfuscation pass are **opt-in and off by default**: a base source package still runs
 with none of them. This work was developed internally under the "2.0" codename; it ships as part of the
-first 1.0.0 release. **Not yet published to GitHub.** The sections dated earlier below are the
+first 1.0.0 release, **published on 2026-11-12**: source at <https://github.com/miguelenred/envelock>,
+the Windows and Linux loaders attached to its GitHub Release, and the package `envelock/loader` for
+PIE (`pie install envelock/loader`). The sections dated earlier below are the
 pre-release development history of this same 1.0.0.
 
 ### Fixes from the external audit of 2026-11-12
@@ -68,6 +70,10 @@ before it was changed. Details and dispositions are in `docs/AUDITORIA.md`, Pass
 - Bytecode images are not reproducible byte for byte; do not compare builds by hash.
 - The trusted-time behaviour above, and the `secret_memory` warning for loaders built before this
   fix.
+
+**Release tooling.** `scripts/package-pie-assets.py` wrote the assets' `SHA256SUMS` with CRLF line
+ends when run on Windows, so `sha256sum -c` failed on Linux; it now writes LF bytes on every system
+(checked by `tests/test_pie_packaging.py`).
 
 **Not changed:**
 - Windows opens the identity file with `_wfopen`, which follows a reparse point (H-07, first half).

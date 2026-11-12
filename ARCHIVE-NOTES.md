@@ -8,4 +8,5 @@ portable Pythons and the offline wheels ship in the complete archive, or are reb
 `docs/BUILDING.md` explains. Linux and Windows (PHP 8.2–8.5) build the full loader including the
 bytecode layer; macOS is built and tested by the CI. The loader can also be installed with PIE
 (`composer.json`, `docs/HOSTING.md` §4.1). See `TEST-STATUS.md`, `docs/PLATAFORMAS.md` and
-`docs/AUDITORIA.md`. This is Envelock's first **1.0.0** release, not yet published.
+`docs/AUDITORIA.md`. This is Envelock's first **1.0.0** release, published on 2026-11-12 at
+<https://github.com/miguelenred/envelock>.

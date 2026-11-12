@@ -140,7 +140,9 @@ def main(argv=None):
     for name, members in built:
         deterministic_zip(out / name, members)
         lines.append(f"{hashlib.sha256((out / name).read_bytes()).hexdigest()}  {name}")
-    (out / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Bytes, not write_text: on Windows write_text turns "\n" into CRLF, and `sha256sum -c` on Linux
+    # then looks for file names that end in a carriage return and finds none.
+    (out / "SHA256SUMS").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
     print(f"{len(built)} PIE assets in {out}:")
     for name, _ in built:
         print("  " + name)

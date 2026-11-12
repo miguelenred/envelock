@@ -66,6 +66,11 @@ PHP. A copy moved away from its deploy root fails, as documented.
 The executable scan finds no build-machine string: the only hits are text inside Python's and
 Tcl/Tk's own libraries.
 
+**GitHub CI** on that source (commit `c1549cf`, the repository now public): **all 24 jobs green**.
+Ubuntu 22.04 PHP 8.2 and 8.4: 1671 passed, 30 skipped; macOS 15 PHP 8.4 and 8.5: 1656 and 1657
+passed; ARM64 PHP 8.4: 1671 passed. The H-01 fork harness and the H-06 date harness run there on a
+kernel with `memfd_create`.
+
 **Not run in this round:**
 - The whole `pytest tests` tree on Windows. Only `tests/test_native.py` ran, plus the encoder,
   assistant, PIE and `prebuilt` tests, which pass.
@@ -74,7 +79,8 @@ Tcl/Tk's own libraries.
 
 ## GitHub CI — green on every platform (2026-11-12)
 
-The source was pushed to a private GitHub repository and the full workflow (`.github/workflows/checks.yml`)
+The source was pushed to its GitHub repository (private at first, public since 2026-11-12:
+<https://github.com/miguelenred/envelock>) and the full workflow (`.github/workflows/checks.yml`)
 run end to end. After four runs — the first three fixing portability of the **test harness** and the
 workflow, never the loader — **all 24 jobs pass** (commit `ebbd326`): `static`, `fuzz`, `static-php`,
 `bench`, `fpm`, `frameworks`; `unix` on **ubuntu-22.04** and **macOS 15** for PHP 8.2/8.3/8.4/8.5;

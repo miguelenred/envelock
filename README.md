@@ -2,9 +2,7 @@
 
 **Offline encoder and loader extension for PHP 8.2–8.5.**  
 Version **1.0.0 experimental** · Python + C + OpenSSL 3 · Apache-2.0 license.  
-Project page: **[miguelenred.es/envelock](https://miguelenred.es/envelock)**
-
-> Apache-2.0 asks for nothing more, but if you build on or ship Envelock, a visible acknowledgement such as **"Powered by Envelock"** — linking [miguelenred.es/envelock](https://miguelenred.es/envelock) — is appreciated.
+Project page: **[miguelenred.es/envelock](https://miguelenred.es/envelock)** · Source: **[github.com/miguelenred/envelock](https://github.com/miguelenred/envelock)**
 
 Distribute PHP projects without shipping their files in readable text. A **generic** extension (with no embedded keys) verifies each file's signature, unwraps the content key with the recipient's private key, decrypts in memory and hands the result to PHP's normal compiler. The private key and the trusted signer are read from an external identity file pointed to by `envelock.identity` in `php.ini`. A single host can serve several projects from different folders, each encrypted with different keys.
 
@@ -31,7 +29,7 @@ The code supports **8.2, 8.3, 8.4 and 8.5**, with different binaries per ABI, sy
 
 **Prebuilt binaries depend on the distribution.** The **complete** distribution ships, under `prebuilt/` and all listed in [`prebuilt/SHA256SUMS`](prebuilt/SHA256SUMS): the loader for every supported engine and platform (Linux x86-64 PHP 8.2/8.3/8.4/8.5 NTS plus 8.4 ZTS, and Windows x64 PHP 8.2–8.5 in NTS and TS), the graphical assistant for Linux and Windows, a portable Python (Windows x64, Linux x86-64 and ARM64, macOS Apple silicon) and the offline wheel bundle. The **source-only** distribution ships none of these — build the loader for your ABI/platform as below. macOS and ARM64 need their own build and validation; a macOS distribution also needs signing and notarization ([how](docs/PLATAFORMAS.md#signing-quarantine-and-the-gatekeeper-exception)).
 
-**Platform testing status (honest).** **Linux x86-64** and **Windows x64** are built and tested: Linux at run time across PHP 8.2–8.5 including ZTS, and the Windows x64 DLLs built and tested natively on Windows 11 with the official PHP for Windows builds. **macOS has NOT been tested on a real Mac — the authors don't have one.** The macOS build, signing and notarization steps are in [docs/PLATAFORMAS.md](docs/PLATAFORMAS.md) and we've done our best to get them right, but the macOS loader is **unvalidated**: anyone on macOS can build and use it, but build it yourself and test it before relying on it. If you run Envelock on macOS — or anywhere — and hit a problem or a bug, please open an issue; we'll be glad to receive it and fix it.
+**Platform testing status (honest).** **Linux x86-64** and **Windows x64** are built and tested: Linux at run time across PHP 8.2–8.5 including ZTS, and the Windows x64 DLLs built and tested natively on Windows 11 with the official PHP for Windows builds. **macOS** (Apple silicon) and **Linux ARM64** are built and their test suites run **in CI** on GitHub's runners — macOS 15 for PHP 8.2–8.5, ARM64 for PHP 8.3/8.4 — but no prebuilt loader is shipped for them yet, and the authors have not run Envelock in production on a Mac: build the loader yourself and test it before relying on it. The macOS build, signing and notarization steps are in [docs/PLATAFORMAS.md](docs/PLATAFORMAS.md). Machine-bound licences are Linux-only (macOS and Windows report no machine identity). If you run Envelock on macOS — or anywhere — and hit a problem or a bug, please open an issue; we'll be glad to receive it and fix it.
 
 The Envelock sources and the vendored `nikic/php-parser` are present, but the upstream source trees of Python, OpenSSL and the Python dependencies are **not** included. Install the Python dependencies using the hash-locked requirements below, or use the portable Python shipped under `prebuilt/python/` in the complete distribution. On POSIX, use `sh ./envelock` if your copy did not preserve the executable bit. See [prebuilt/README.md](prebuilt/README.md) and [BUILDING.md](docs/BUILDING.md).
 
@@ -81,7 +79,7 @@ Repeat `--recipient` to encrypt the same package for several recipients.
 
 Create a new UUID for each distinct project. `pack` does not overwrite destinations nor accept nested source/destination trees. By default it encrypts `.php`, `.phtml`, `.inc` and `.php8`; other resources are only copied via `--asset`. The encoder does not transpile syntax: to run a single package on PHP 8.2, your application must be compatible with PHP 8.2.
 
-The complete distribution includes prebuilt loaders (list in [prebuilt/README.md](prebuilt/README.md); what each needs from the server in [docs/HOSTING.md](docs/HOSTING.md)). Once a release is published, `pie install envelock/loader` installs and enables the right one for the server's PHP ([PIE](https://github.com/php/pie); see [docs/HOSTING.md](docs/HOSTING.md) §4.1). To build a matching loader yourself, on Linux/macOS, use development PHP, OpenSSL 3, autoconf, make and pkg-config:
+The complete distribution includes prebuilt loaders (list in [prebuilt/README.md](prebuilt/README.md); what each needs from the server in [docs/HOSTING.md](docs/HOSTING.md)). `pie install envelock/loader` installs and enables the right one for the server's PHP, from the binaries attached to each [GitHub Release](https://github.com/miguelenred/envelock/releases) ([PIE](https://github.com/php/pie); see [docs/HOSTING.md](docs/HOSTING.md) §4.1). To build a matching loader yourself, on Linux/macOS, use development PHP, OpenSSL 3, autoconf, make and pkg-config:
 
 ```bash
 # The module is generic: it carries no keys.
@@ -108,7 +106,7 @@ Without `ENVELOCK_REQUIRE_NATIVE=1`, the native tests may be skipped if tools ar
 
 ## CI and public repository
 
-`.github/workflows/checks.yml` defines native builds of PHP 8.2–8.5 on Linux/macOS and Windows x64 NTS/TS. Its artifacts use **demonstration public keys**, reproducible from `scripts/demo_material.py`, and are marked `DEMO_ONLY`. **They are not fit to protect a product.** The workflow is provided; it has not been run on a remote repository in this session.
+`.github/workflows/checks.yml` defines native builds of PHP 8.2–8.5 on Linux/macOS and Windows x64 NTS/TS. Its artifacts use **demonstration public keys**, reproducible from `scripts/demo_material.py`, and are marked `DEMO_ONLY`. **They are not fit to protect a product.** It runs on every push to the public repository, <https://github.com/miguelenred/envelock> (Linux x86-64 and ARM64, macOS, Windows NTS/TS, FPM, Laravel/Symfony, static PHP, fuzzing, lint); the results recorded for each release are in [TEST-STATUS.md](TEST-STATUS.md).
 
 Do not publish `owner*.json`, `recipient*.json`, identity files `identity*.bin`, passwords, backups, `.pdb` or private sources. Compiled files are accepted only in `prebuilt/` and only when listed in `prebuilt/SHA256SUMS` (`scripts/check_release.py` enforces it). `.gitignore` helps, but does not replace reviewing the commit and the artifacts. To customize production loaders, use a private and trusted build environment.
 
