@@ -57,7 +57,7 @@ Compromising a server's identity file affects the projects whose keys it contain
 - Impossibility of copying: the loader+package pair can be moved to another compatible machine. There is no physical binding or attestation.
 - Licenses with expiration, counters, revocation or domain control. The identifiers are not complete commercial licenses.
 - Anti-rollback without a configured minimum: until `minimum set` is used for a project, an old, correctly signed release of it remains valid.
-- Integrity of the whole deployment: a tampered signed file is rejected if it is recognized as a container, but someone with write access can replace it with normal PHP, delete files or modify assets. The loader allows unprotected PHP for compatibility. There is no signed global manifest that forces the use of a closed set of files.
+- Integrity of the whole deployment: a tampered signed file is rejected if it is recognized as a container, but someone with write access can replace it with normal PHP, delete files or modify assets. The loader allows unprotected PHP for compatibility. There is no signed global manifest that forces the use of a closed set of files. The runtime manifest (`--enforce-manifest`, on by default) catches a **deleted** file, not a **replaced** one: a protected file swapped for plain PHP is still a regular file at its path, and runs. `--sealed` refuses plain PHP under the package only once a protected file of it has loaded in that process, and never sees a script OPcache serves from shared memory (blacklist the whole package folder to close that). **Write access to the tree is the boundary**: keep it unwritable by the web server, deploy atomically, and run `verify --package` after each deployment and periodically (external audit 2026-11-12, H-02/H-04/H-10).
 - Include protection against plain code inside your call stack: plain files that protected code includes or calls (configuration, `vendor/`, callbacks) run with protected frames below them, so whoever can modify them can load and inspect protected code; keep them write-protected. It also does not fit deployments whose entry point is unencrypted.
 - A sandbox between projects: path binding works within a package folder; a whole package folder can be replaced by another package addressed to the same server, and projects can include files of other authorized projects (without include protection).
 - Protection of dynamically downloaded/generated code or of business secrets/configuration that have not been encrypted.
@@ -179,7 +179,14 @@ Stated plainly, because a guarantee that cannot be checked is worth nothing:
   cannot demonstrate that the pages leave the direct map. That needs a kernel that offers the
   syscall, and is on the verification list.
 - The arena is bumped, never freed: a block is never handed out twice, so nothing retired is left
-  readable for a later allocator. It is wiped and unmapped at module shutdown.
+  readable for a later allocator. At module shutdown it is unmapped; the private fallback mapping is
+  wiped first, the `memfd_secret` region is not. That region is `MAP_SHARED` (the only way
+  `memfd_secret` maps), so every process forked after start-up — FPM's daemonize fork, its workers,
+  Apache's children — shares its pages, and the wipe that used to run at shutdown zeroed the keys of
+  the master and of every live worker the first time any one of them exited: every protected file
+  then failed until PHP restarted (external audit 2026-11-12, H-01, reproduced with a fork harness
+  that is now a regression test). The kernel clears secret-memory pages itself when the last
+  mapping and descriptor go, and nothing else can read them before that.
 
 Cryptographic and C/Zend audit; fuzzing with ASan/UBSan and a malformed signed corpus; review of lifecycles in fatal errors; multithread/ZTS testing; FPM/Apache SAPI; stress and performance; native Windows/macOS matrix; compatibility with extensions that intercept compilation; update strategy and binary signing; secret management/rotation and recovery after compromises.
 

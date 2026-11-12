@@ -93,12 +93,14 @@ python encoder/envelock.py new-project            # once per project; keep the U
 python encoder/envelock.py pack --owner owner.enc.json --recipient servidor1.pub.json --recipient servidor2.pub.json \
   --project <UUID> --source ./miapp --output "./miapp cifrado" \
   --exclude 'vendor/*' --exclude 'tests/*' --asset '*.css' --asset '*.png' \
-  --strip-comments --obfuscate --compact --encode-strings --obfuscate-methods --php php --include-protection --no-prepend
+  --strip-comments --obfuscate --compact --encode-strings --obfuscate-methods --php php --no-prepend
 ```
 
 The command line also has `--php-ext .module` (extra PHP extensions) and `--serial <n>`, which the
 assistant does not show. Deploy the output folder; leave `vendor/` out of the encryption and
-deploy it separately ([MANUAL](MANUAL.md) §14).
+deploy it separately ([MANUAL](MANUAL.md) §14). With `vendor/` left out, keep **Include protection**
+off: an error or shutdown handler registered from `vendor/` would be refused when it loads one of your
+protected classes ([MANUAL](MANUAL.md) §14, `--include-protection`).
 
 Not sure which options to turn on? Use the **Recommend tab** (next section) first.
 
@@ -125,8 +127,9 @@ their own source, and prints a ready-to-fill `pack` command. It is read-only and
 never recommends an option known to break a project (for example `--obfuscate-properties`, which breaks
 the Composer autoloader, or `--sealed` when the code uses `eval()`). For a framework application it leaves
 `vendor/` (Composer) and the run-time caches out of the encryption, keeps Blade templates cleartext, turns
-`--include-protection` off when a console entry point (`artisan`, `bin/console`) would stay unencrypted,
-and lists what the server's `php.ini` must allow for `--no-ffi`, `--no-prepend` and `--bytecode`. Its
+`--include-protection` off when a console entry point (`artisan`, `bin/console`) would stay unencrypted
+or when it leaves `vendor/` out (an error handler registered from there could not load your protected
+classes; external audit 2026-11-12, H-03), and lists what the server's `php.ini` must allow for `--no-ffi`, `--no-prepend` and `--bytecode`. Its
 suggested command was run as printed on real Laravel and Symfony apps (Windows 11, PHP 8.4): every web
 route and the console matched the unprotected app. Command equivalent:
 `python encoder/envelock.py recommend --source <folder>` (add `--json` for machine-readable output).

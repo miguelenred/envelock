@@ -9,6 +9,72 @@ with none of them. This work was developed internally under the "2.0" codename; 
 first 1.0.0 release. **Not yet published to GitHub.** The sections dated earlier below are the
 pre-release development history of this same 1.0.0.
 
+### Fixes from the external audit of 2026-11-12
+
+An independent code review and beta test (Debian 13, PHP 8.4, FPM, CGI and the built-in server;
+report kept by the maintainer) found ten issues, H-01…H-10. Each was checked against the code here
+before it was changed. Details and dispositions are in `docs/AUDITORIA.md`, Pass 34. Every loader in
+`prebuilt/` was rebuilt.
+
+**Loader (`extension/`).**
+- **`envelock.secret_memory=1` took a whole FPM or Apache server down (H-01, high).** The
+  `memfd_secret` region can only be mapped shared, so every process forked after start-up shares
+  its pages. The shutdown wipe zeroed the private keys of the master and of every live worker the
+  first time any one process exited: the daemonize fork, a worker reaching `pm.max_requests`, or an
+  Apache child. Every protected file then failed until PHP was restarted. Now only the private
+  fallback mapping is wiped. The kernel clears secret-memory pages itself when the last user lets
+  go. New fork harness `test_secret_memory_survives_a_worker_exiting`: it fails on the old code
+  and passes on the new. The directive is still off by default.
+- **Trusted time could switch itself off without a word (H-06).**
+  - A non-blocking `connect()` that completed at once left the socket non-blocking, so the TLS
+    handshake failed.
+  - The `Date` parser accepted signed fields, impossible dates that `timegm()` normalised, and
+    trailing garbage. Now only the exact RFC 9110 form is read, every position checked
+    (`test_o8_http_date_is_parsed_strictly`; the old parser accepted 10 of its bad inputs).
+  - A failed fetch is written to the error log, never to a page. The site still never refuses
+    because of it.
+- **Vault literals (H-05).**
+  - `__envelock_lit()` index past 2^32 wrapped to another literal; it is out of range now
+    (`test_php_vault_index_past_32_bits_is_out_of_range`).
+  - The plain-vault path (older or hand-built containers only) returned a string that shared its
+    buffer with the vault, which is wiped in place at request end. It now returns an independent
+    copy, as the encrypted path already did (ENV-2026-24).
+- **Windows key unlock (H-07).** `VirtualUnlock()` works on whole pages, so unlocking one cached
+  key unlocked its neighbours too. The ENV-AUD-01 fix had reached POSIX only; no branch unlocks now
+  (`test_key_unlock_never_unlocks_a_shared_page`).
+
+**Encoder and assistant.**
+- **The recommender contradicted itself (H-03).**
+  - It left `vendor/` out *and* enabled `--include-protection`. Library code that PHP calls back
+    with no protected file on the call stack is then refused when it autoloads a protected class,
+    and the app's error path dies. That code includes an exception handler, a shutdown function, or
+    a session or output handler registered from `vendor/`.
+  - With `vendor/` excluded the option is now "do not enable", with the reason
+    (`test_recommend_turns_include_protection_off_when_it_leaves_vendor_out`).
+- **A `--asset` that copied nothing was dropped in silence (H-08).** Each one is now reported with
+  its reason:
+  - the command line prints a `WARNING`;
+  - `pack_tree` returns `assets_not_copied`, which is not written into the package;
+  - the assistant adds a line to its summary.
+- **`pack --sealed` says what sealing does not cover (H-02):** a fresh process, and scripts OPcache
+  serves from shared memory. It also names the fix: put the whole package folder in
+  `opcache.blacklist_filename`.
+
+**Documentation (H-02, H-04, H-09, H-10).**
+- `--sealed` had one line promising "refuse any plain PHP under the package folder" without
+  conditions. It now states its limits (MANUAL §14, SEGURIDAD, HOSTING §3.3).
+- `--enforce-manifest` proves presence, not content: a file replaced by plain PHP runs. `verify`
+  after each deployment and an unwritable tree are what catch that.
+- Bytecode images are not reproducible byte for byte; do not compare builds by hash.
+- The trusted-time behaviour above, and the `secret_memory` warning for loaders built before this
+  fix.
+
+**Not changed:**
+- Windows opens the identity file with `_wfopen`, which follows a reparse point (H-07, first half).
+  That is deliberate and stays: the type and permission checks run on the file actually opened,
+  and the path is the administrator's.
+- The `clang --analyze` notes listed by the audit are left for a separate review.
+
 ### Hosting compatibility, portable Linux loaders and PIE (2026-11-11/12)
 
 IDs HOST-1…6 in `docs/AUDITORIA.md`, Pass 33; results in `TEST-STATUS.md`.
@@ -84,7 +150,7 @@ PIE 1.5.5 source build was checked on AlmaLinux 8.
   - **Startup trusted-time fetch (`test_o8_trusted_time_is_fetched_at_startup`), Linux.** The test
     uses `strace` (which also needs ptrace) to see the loader's `connect()` to the time host at
     startup. Under the runners' restricted ptrace `strace` records nothing and the trace is empty.
-    Verified on AlmaLinux 8 that the **published** PHP 8.4 NTS loader (`a8ced333…`) does attempt the
+    Verified on AlmaLinux 8 that the PHP 8.4 NTS loader then published (`a8ced333…`) does attempt the
     connection — `connect(…, htons(443), 127.0.0.1) = EINPROGRESS` — and the protected file runs. The
     test now probes once whether `strace` can observe a known `connect()` here and skips when it
     cannot, rather than asserting against an empty trace.
@@ -97,7 +163,8 @@ PIE 1.5.5 source build was checked on AlmaLinux 8.
     `madvise(MADV_DONTDUMP)`, which macOS lacks. They now call one `ENVELOCK_DONTDUMP` macro from
     `envelock_accel_shim.h`, a no-op where `MADV_DONTDUMP` does not exist. Each caller keeps its
     line count (`__LINE__` is part of the bailouts). A rebuilt Linux PHP 8.4 NTS loader is
-    byte-identical to `prebuilt/` (`a8ced333…`). For Windows the preprocessed code is unchanged
+    byte-identical to the one then in `prebuilt/` (`a8ced333…`; all were rebuilt afterwards for the
+    audit fixes above). For Windows the preprocessed code is unchanged
     (that branch never called `madvise`).
   - **Tests that assumed Linux or Windows:**
     - `_identity_check` now sets the owner only. macOS refuses a group the user is not in.

@@ -232,7 +232,9 @@ packed, `vendor/` cleartext; Windows 11, PHP 8.4, 2026-11-10) the set that works
 `--encode-strings --obfuscate --obfuscate-flow --obfuscate-methods --strip-comments --compact --no-ffi
 --no-prepend` — every web route and the console match the unprotected app — but **not**
 `--include-protection`, because their console scripts (`artisan`, `bin/console`) have no `.php` extension
-and stay cleartext. `--no-ffi` needs `enable_dl = Off` in php.ini (see the table below).
+and stay cleartext — and, with `vendor/` cleartext, because an exception or shutdown handler registered
+from `vendor/` would be refused when it loads one of the protected classes (external audit 2026-11-12,
+H-03). `--no-ffi` needs `enable_dl = Off` in php.ini (see the table below).
 
 ## Choosing options: trade-offs and when to use each
 

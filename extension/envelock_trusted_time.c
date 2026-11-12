@@ -43,29 +43,68 @@ int envelock_trusted_time_fetch(const char *host, int port, int timeout_seconds,
 
 /* "Sun, 06 Nov 1994 08:49:37 GMT" — the only form a server must send (RFC 9110 §5.6.7); the two
  * obsolete ones are not accepted, because accepting more formats means parsing more by hand. */
+/* Two ASCII digits at p as a number, or -1. Not isdigit(): that is locale-dependent. */
+static int envelock_tt_digits2(const char *p)
+{
+    if (p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9') {
+        return -1;
+    }
+    return (p[0] - '0') * 10 + (p[1] - '0');
+}
+
 int envelock_http_date_parse(const char *text, uint64_t *out)
 {
     static const char *const months[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    static const char *const weekdays[7] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const int month_days[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     struct tm when;
     time_t value;
-    int day = 0, year = 0, hour = 0, min = 0, sec = 0, mon = -1, i;
-    char mon_name[4] = {0};
+    int day, year, hour, min, sec, century, mon = -1, weekday = -1, i;
+    size_t len;
     if (!text || !out) {
         return 0;
     }
-    /* Parse the fixed RFC 9110 form "Wdy, DD Mon YYYY HH:MM:SS GMT" BY FIELD, not with strptime: its
-     * %a/%b conversions read the weekday and month names through LC_TIME, so on a worker whose locale
-     * is not English, strptime fails to parse the (always-English) HTTP date and the time floor
-     * silently disables itself — fail-open (ENV-2026-32). This reads the English month table directly. */
-    if (sscanf(text, "%*3s, %2d %3s %4d %2d:%2d:%2d", &day, mon_name, &year, &hour, &min, &sec) != 6) {
+    /* Parse the fixed RFC 9110 form "Wdy, DD Mon YYYY HH:MM:SS GMT" BY POSITION, not with strptime:
+     * its %a/%b conversions read the weekday and month names through LC_TIME, so on a worker whose
+     * locale is not English, strptime fails to parse the (always-English) HTTP date and the time floor
+     * silently disables itself — fail-open (ENV-2026-32). This reads the English tables directly.
+     *
+     * Exactly 29 characters, every one checked. The earlier sscanf("%2d") accepted a sign ("-5" passed
+     * `hour > 23`), skipped the weekday and ignored anything after the seconds, and timegm() then
+     * normalised an impossible date (31 Feb) into a plausible one (audit 2026-11-12, H-06). Trailing
+     * blanks are the only slack: envelock_http_header trims the leading ones. */
+    len = strlen(text);
+    while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t')) {
+        len--;
+    }
+    if (len != 29 || text[3] != ',' || text[4] != ' ' || text[7] != ' ' || text[11] != ' '
+            || text[16] != ' ' || text[19] != ':' || text[22] != ':'
+            || memcmp(text + 25, " GMT", 4) != 0) {
         return 0;
+    }
+    for (i = 0; i < 7; i++) {
+        if (memcmp(text, weekdays[i], 3) == 0) { weekday = i; break; }
     }
     for (i = 0; i < 12; i++) {
-        if (strncmp(mon_name, months[i], 3) == 0) { mon = i; break; }
+        if (memcmp(text + 8, months[i], 3) == 0) { mon = i; break; }
     }
-    if (mon < 0 || day < 1 || day > 31 || year < 1970 || hour > 23 || min > 59 || sec > 60) {
+    day = envelock_tt_digits2(text + 5);
+    century = envelock_tt_digits2(text + 12);
+    year = envelock_tt_digits2(text + 14);
+    hour = envelock_tt_digits2(text + 17);
+    min = envelock_tt_digits2(text + 20);
+    sec = envelock_tt_digits2(text + 23);
+    if (weekday < 0 || mon < 0 || day < 0 || century < 0 || year < 0 || hour < 0 || min < 0
+            || sec < 0) {
         return 0;
+    }
+    year += century * 100;
+    if (day < 1 || day > month_days[mon] || year < 1970 || hour > 23 || min > 59 || sec > 60) {
+        return 0;
+    }
+    if (mon == 1 && day == 29 && !((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) {
+        return 0;                                   /* 29 Feb outside a leap year */
     }
     memset(&when, 0, sizeof(when));
     when.tm_mday = day;
@@ -157,28 +196,28 @@ static int envelock_connect_bounded(const char *host, int port, int timeout_seco
             fd = -1;
             continue;
         }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-            connected = 1;
-            break;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+            if (errno != EINPROGRESS) {
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            wait.fd = fd;
+            wait.events = POLLOUT;
+            wait.revents = 0;
+            if (poll(&wait, 1, timeout_seconds * 1000) <= 0
+                    || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) < 0 || error != 0) {
+                close(fd);
+                fd = -1;
+                continue;
+            }
         }
-        if (errno != EINPROGRESS) {
-            close(fd);
-            fd = -1;
-            continue;
-        }
-        wait.fd = fd;
-        wait.events = POLLOUT;
-        wait.revents = 0;
-        if (poll(&wait, 1, timeout_seconds * 1000) <= 0
-                || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) < 0 || error != 0) {
-            close(fd);
-            fd = -1;
-            continue;
-        }
-        connected = 1;
-        /* Back to blocking, with a bounded wait. Leaving it non-blocking would make SSL_connect
-         * return -1/WANT_READ on its first call — which is not an error, but reads exactly like one
-         * to a caller that checks `!= 1` once, and every fetch would fail. Blocking plus SO_*TIMEO
+        /* Connected — after the bounded wait, or at once: a non-blocking connect() may also return 0
+         * (loopback and local peers on some systems). BOTH go back to blocking, with a bounded wait.
+         * Leaving it non-blocking makes SSL_connect return -1/WANT_READ on its first call — not an
+         * error, but it reads exactly like one to a caller that checks `!= 1` once — so the fetch
+         * failed and the time floor stayed off in silence. The immediate case used to `break` here
+         * with the descriptor still non-blocking (audit 2026-11-12, H-06). Blocking plus SO_*TIMEO
          * keeps the same bound without a retry loop around every OpenSSL call. */
         {
             struct timeval limit;
@@ -189,10 +228,10 @@ static int envelock_connect_bounded(const char *host, int port, int timeout_seco
             if (fcntl(fd, F_SETFL, flags) < 0) {
                 close(fd);
                 fd = -1;
-                connected = 0;
                 continue;
             }
         }
+        connected = 1;
     }
     freeaddrinfo(list);
     return connected ? fd : -1;

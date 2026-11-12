@@ -1764,15 +1764,13 @@ static void envelock_protect_bytes(void *p, size_t len)
 
 static void envelock_unprotect_bytes(void *p, size_t len)
 {
-#if defined(__linux__) || defined(__APPLE__)
     /* Deliberately NOT munlock: a 32-byte cache key shares its page with other locked keys, and
      * munlock() clears VM_LOCKED for the WHOLE page, which would let neighbouring keys be swapped
      * (ENV-AUD-01). The locked pages are few (bounded by the key cache) and released at process
-     * exit; the bytes are still cleansed by the caller. */
+     * exit; the bytes are still cleansed by the caller. Windows is the same: VirtualUnlock() works on
+     * whole pages and is not counted, so unlocking one key unlocked every key sharing its page; the
+     * ENV-AUD-01 fix had only reached the POSIX branch (audit 2026-11-12, H-07). */
     (void)p; (void)len;
-#elif defined(_WIN32)
-    VirtualUnlock(p, len);
-#endif
 }
 
 /* Mark the process non-dumpable (no core dump, no ptrace/proc-mem by the same uid). Separate from
@@ -1882,6 +1880,23 @@ PHP_MINIT_FUNCTION(envelock)
                     envelock_clock_watermark = observed;
                     envelock_clock_advance(envelock_clock_path, &envelock_clock_watermark, 0, 0);
                 }
+            } else {
+                /* Fail-open by design (an unreachable host never refuses a site), but not SILENT: the
+                 * administrator configured a control and must be able to see that it is not in force
+                 * (audit 2026-11-12, H-06). Written to the error log (error_log, or the SAPI's own
+                 * log: the FPM log, Apache's error log, stderr for the CLI) — never into a page. */
+                char message[512];
+                snprintf(message, sizeof(message),
+                    "Envelock: the trusted-time source %s could not be read (unreachable, TLS or "
+                    "certificate failure, no usable Date header%s); this process runs on the local "
+                    "clock and the watermark only", tt_host,
+#ifdef PHP_WIN32
+                    ", or Windows, where the loader has no outbound TLS"
+#else
+                    ""
+#endif
+                    );
+                php_log_err(message);
             }
         }
     }
@@ -1998,7 +2013,12 @@ static PHP_FUNCTION(__envelock_lit)
         Z_PARAM_LONG(idx)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!ENVELOCK_G(request_ready) || idx < 0) RETURN_EMPTY_STRING();
+    /* The index is a zend_long and the vault is addressed with uint32_t: a value past UINT32_MAX
+     * used to wrap (2^32 + 3 answered literal 3) instead of being out of range (audit 2026-11-12,
+     * H-05). Vault indexes never come near that, so anything above it is refused outright. */
+    if (!ENVELOCK_G(request_ready) || idx < 0 || (zend_ulong) idx > (zend_ulong) UINT32_MAX) {
+        RETURN_EMPTY_STRING();
+    }
     /* Resolve the vault of the file that DIRECTLY made this call, by inspecting the immediate caller
      * frame rather than zend_get_executed_filename_ex(), which walks PAST internal C frames to the
      * nearest user file. That frame-skipping let `array_map('__envelock_lit', range(0, N))` (or
@@ -2033,7 +2053,11 @@ static PHP_FUNCTION(__envelock_lit)
     if (!entry || Z_TYPE_P(entry) != IS_ARRAY) RETURN_EMPTY_STRING();
     str = zend_hash_index_find(Z_ARRVAL_P(entry), (zend_ulong)idx);
     if (!str || Z_TYPE_P(str) != IS_STRING) RETURN_EMPTY_STRING();
-    RETURN_STR_COPY(Z_STR_P(str));
+    /* An independent copy here too, for the same reason as the encrypted vault above: RSHUTDOWN
+     * wipes these vault strings in place, and a shared copy the app kept (session, output buffer)
+     * would be read back as NUL bytes. Only the encrypted path had been fixed (ENV-2026-24); this
+     * plain-vault path is reached only by older or hand-built containers (audit 2026-11-12, H-05). */
+    RETURN_STRINGL(Z_STRVAL_P(str), Z_STRLEN_P(str));
 }
 
 /* O1 proof of concept (see envelock_bcpoc.c): the two ends of the bytecode round-trip. These are NOT

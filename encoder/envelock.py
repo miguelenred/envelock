@@ -4038,6 +4038,8 @@ def pack_tree(
     portable_names = set()
     portable_dirs = set()                     # folders of packed files, for file/folder collisions
     sources: dict[str, bytes] = {}            # PHP to encrypt, in tree order
+    assets_used: set[str] = set()             # --asset patterns that copied at least one file
+    assets_not_copied: list[dict[str, str]] = []
     try:
         # Excluded entries (and everything under an excluded folder) are skipped before the link
         # checks: they are never read, and tools such as pnpm create links/junctions inside
@@ -4071,8 +4073,32 @@ def pack_tree(
                 validate_asset(rel, data, allow_secret_assets)
                 target.write_bytes(data)
                 copied += 1
+                for pattern in assets or []:
+                    if _pattern_matches(name, [pattern]):
+                        assets_used.add(pattern)
         if not sources:
             raise ValueError("No PHP files found to protect")
+        # An --asset that copied nothing used to vanish in silence (copied_assets 0, exit 0): an
+        # operator who asked for `.netrc` or `.env` shipped a package without it and no word why
+        # (audit 2026-11-12, H-08). Report every such pattern with the reason, for the CLI to warn.
+        for pattern in assets or []:
+            if pattern in assets_used:
+                continue
+            literal = None if any(c in pattern for c in "*?[") else source / pattern.replace("\\", "/")
+            if literal is not None and literal.is_file():
+                rel = literal.relative_to(source)
+                if forbidden(rel):
+                    reason = ("it is a path pack never copies (.env*, .git, .ssh, .netrc and the other "
+                              "secret or tooling locations)")
+                elif _pattern_matches(rel.as_posix(), exclude):
+                    reason = "it is also excluded by --exclude"
+                elif rel.suffix.lower() in extensions:
+                    reason = "it is PHP, so it was encrypted as code rather than copied as an asset"
+                else:
+                    reason = "it was not copied"
+            else:
+                reason = "no file in the source tree matches it"
+            assets_not_copied.append({"asset": pattern, "reason": reason})
         # O4 runs before every other pass: once the body is gone, the passes that follow see a
         # one-line function and cannot undo it, and the program blob is then just another string
         # literal, which --vault-strings will encrypt like the rest.
@@ -4238,6 +4264,9 @@ def pack_tree(
         for child in staging.iterdir():
             child.rename(destination / child.name)
         staging.rmdir()
+        # For the caller only, never inside the package's envelock-package.json: the names of files
+        # the operator asked for and did not get (".netrc", ".env.production") are not for the server.
+        info["assets_not_copied"] = assets_not_copied
         return info
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -4792,6 +4821,20 @@ def recommend_options(source: Path, extensions: set) -> dict:
             ": no .php extension); with include protection the protected code it loads refuses to run, "
             "so its console commands (migrations, queues, the scheduler) would fail. Use it only if every "
             "entry point is protected")
+    elif "vendor/*" in exclude_patterns:
+        # This recommendation itself leaves vendor/ out (above), and the two do not mix: PHP calls some
+        # library code back with no protected file on the call stack — an exception or error handler,
+        # a shutdown function, a session or output handler registered from vendor/ — and when that
+        # code autoloads one of the project's protected classes (through vendor/'s autoloader),
+        # include protection refuses it and the request dies, usually on its error path. Measured by
+        # the external audit of 2026-11-12 (H-03): an exception handler in vendor/ loading a protected
+        # formatter -> "include protection: it can only be loaded by its own application".
+        off["--include-protection"] = (
+            "vendor/ (Composer) is left out of the package, and library code that PHP calls back with no "
+            "protected file on the call stack — an exception or error handler, a shutdown function, a "
+            "session or output handler registered from vendor/ — refuses to load your protected classes "
+            "under include protection, so the request dies, often on its error page. Use it only if "
+            "vendor/ is packed with the application too, and then test the error pages")
     else:
         on.append("--include-protection")
         verify["--include-protection"] = (
@@ -5598,6 +5641,19 @@ def main() -> int:
                 print("Note: base protection only (encryption + signing). For stronger protection "
                       "add --include-protection, --no-ffi, --vault-strings and --sealed "
                       "(see docs/SEGURIDAD.md).", file=sys.stderr)
+            # H-08 (audit 2026-11-12): an --asset that copied nothing is no longer silent.
+            for missing in info.get("assets_not_copied", []):
+                print(f"WARNING: --asset {missing['asset']} was not copied: {missing['reason']}.",
+                      file=sys.stderr)
+            # H-02 (audit 2026-11-12): what --sealed does NOT cover, said where the choice is made.
+            if args.sealed:
+                print("Note: --sealed refuses plain PHP under the package folder only once a protected "
+                      "file of the package has loaded in that PHP process. A plain file run in a fresh "
+                      "process (every CLI run, the first request of a new worker), or one OPcache "
+                      "already holds in shared memory, is not checked. Put the whole package FOLDER in "
+                      "opcache.blacklist_filename (or disable OPcache), keep the entry point protected "
+                      "and keep the folder unwritable by the web server (docs/SEGURIDAD.md).",
+                      file=sys.stderr)
             # --strip-comments / --compact physically REMOVE docblocks. Code that reads its own
             # docblocks at run time (custom annotations such as PrestaShop's @arrayAccess, Doctrine
             # @ORM, WP file headers) then silently misbehaves with no pack-time error. This is the one

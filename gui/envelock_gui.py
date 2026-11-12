@@ -181,6 +181,8 @@ STRINGS = {
     "encrypt": ("Encrypt the file with a password", "Cifrar el fichero con contraseña"),
     "pack_ok": ("Encrypted {n} file(s), copied {a} asset(s).\nProject {p}\nSerial {s}",
                 "Cifrados {n} fichero(s), copiados {a} recurso(s).\nProyecto {p}\nSerial {s}"),
+    "asset_not_copied": ("\n\nNOT copied: {asset} — {reason}.",
+                         "\n\nNO copiado: {asset} — {reason}."),
     # keys tab
     "keys_help": ("Create your keys once. The owner signs; each server has its own recipient key. "
                   "Share only the public (.pub) files and keep the private ones safe.",
@@ -727,7 +729,9 @@ class Assistant(tk.Tk):
 
             self._run_async(work, lambda info: messagebox.showinfo(
                 self.t("done"), self.t("pack_ok", n=info["protected_files"], a=info["copied_assets"],
-                                       p=info["project_id"], s=info["serial"])))
+                                       p=info["project_id"], s=info["serial"])
+                + "".join(self.t("asset_not_copied", asset=m["asset"], reason=m["reason"])
+                          for m in info.get("assets_not_copied", []))))
 
         ttk.Button(f, text=self.t("run"), command=run).pack(pady=8)
 

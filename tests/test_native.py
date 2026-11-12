@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import random
+import re
 import shlex
 import shutil
 import socket
@@ -1703,6 +1704,19 @@ def test_php_vault_per_file_tables_do_not_cross(native, tmp_path):
     assert result.stdout == "alpha-from-index|beta-from-lib"
 
 
+def test_php_vault_index_past_32_bits_is_out_of_range(native, tmp_path):
+    """External audit 2026-11-12, H-05: __envelock_lit takes a zend_long and the vault is addressed
+    with a uint32_t, so 2^32 + k wrapped around to literal k. Past UINT32_MAX it is out of range now,
+    and answers the empty string like any other index the vault does not have."""
+    code = ("<?php $secret = 'ZZSECRETVALUEZZ';"
+            " echo '[', __envelock_lit(4294967296), '|', __envelock_lit(4294967297), ']';")
+    out = package(native, tmp_path, {"index.php": code}, vault_strings=True)
+    result = php(native, out / "index.php")
+    assert result.returncode == 0, result.stderr
+    assert "ZZSECRETVALUEZZ" not in result.stdout
+    assert result.stdout == "[|]"
+
+
 def test_php_without_vault_flag_has_no_vault_function_effect(native, tmp_path):
     """A normal (non-vaulted) package keeps its literals inline and runs as before; the reserved
     __envelock_lit function existing in the process does not change anything."""
@@ -2663,6 +2677,111 @@ def test_secret_memory_primary_path_behaves(tmp_path):
     if result.returncode:
         pytest.fail("cannot build the secret-memory harness:\n" + result.stderr[-4000:])
     run = subprocess.run([str(built)], cwd=work, text=True, capture_output=True, check=False)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.strip() == "ok"
+
+
+SECRET_FORK_C = r"""
+/* External audit 2026-11-12, H-01. memfd_secret only maps MAP_SHARED, so every process forked after
+ * MINIT (PHP-FPM's daemonize fork, its workers, Apache's children) shares the arena's pages. Wiping
+ * them in MSHUTDOWN — which runs whenever one of those processes exits — zeroed the private keys of
+ * all the others, and every protected file failed until PHP restarted.
+ *
+ * The syscall is answered (-Wl,--wrap=syscall) with a descriptor that maps the same way: memfd_create,
+ * or, where the kernel lacks that too (WSL1), a deleted file. mode 1 takes that primary path; mode 0
+ * answers ENOSYS, so the private fallback mapping is used — the control, copy-on-write after fork. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#ifndef SYS_memfd_secret
+# define SYS_memfd_secret 447
+#endif
+
+extern long __real_syscall(long number, ...);
+static int mock_mode;
+
+long __wrap_syscall(long number, ...)
+{
+    if (number == SYS_memfd_secret) {
+        char path[] = "envelock-secret-XXXXXX";
+        int fd;
+        if (!mock_mode) { errno = ENOSYS; return -1; }
+        fd = memfd_create("envelock-secret-mock", 0);
+        if (fd >= 0) return fd;
+        fd = mkstemp(path);
+        if (fd >= 0) unlink(path);
+        return fd;
+    }
+    return __real_syscall(number);
+}
+
+#include "envelock_secret.c"
+
+static int run(int mode)
+{
+    unsigned char *keys;
+    pid_t child;
+    int status, i;
+
+    mock_mode = mode;
+    if (!envelock_secret_init(0)) { printf("FAIL init (mode %d)\n", mode); return 1; }
+    if (envelock_secret_is_secret() != mode) { printf("FAIL wrong path (mode %d)\n", mode); return 1; }
+    keys = envelock_secret_alloc(64);
+    if (!keys) { printf("FAIL alloc (mode %d)\n", mode); return 1; }
+    memset(keys, 0xAB, 64);
+    child = fork();
+    if (child < 0) { printf("FAIL fork\n"); return 1; }
+    if (child == 0) {
+        envelock_secret_shutdown();   /* a worker reaching pm.max_requests: its MSHUTDOWN */
+        _exit(0);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("FAIL child (mode %d)\n", mode);
+        return 1;
+    }
+    for (i = 0; i < 64; i++) {
+        if (keys[i] != 0xAB) {
+            printf("FAIL mode %d: an exiting child wiped the keys of its parent\n", mode);
+            return 1;
+        }
+    }
+    envelock_secret_shutdown();
+    return 0;
+}
+
+int main(void)
+{
+    if (run(1) || run(0)) return 1;
+    printf("ok\n");
+    return 0;
+}
+"""
+
+
+def test_secret_memory_survives_a_worker_exiting(tmp_path):
+    """External audit 2026-11-12, H-01: with envelock.secret_memory=1 on a kernel with memfd_secret,
+    the first FPM worker to be recycled (or the daemonize fork exiting) zeroed the keys of the master
+    and of every other worker, because the arena is shared and MSHUTDOWN wiped it. A child that runs
+    the shutdown must leave its parent's keys intact, on the shared path and on the private one."""
+    if not sys.platform.startswith("linux") or not shutil.which("cc"):
+        pytest.skip("needs a Linux C toolchain")
+    work = tmp_path / "secretfork"
+    work.mkdir()
+    for name in ("envelock_secret.c", "envelock_secret.h"):
+        shutil.copyfile(ROOT / "extension" / name, work / name)
+    (work / "fork.c").write_text(SECRET_FORK_C)
+    result = subprocess.run(
+        ["cc", "-I.", "-o", "fork", "fork.c", "-lcrypto", "-Wl,--wrap=syscall"],
+        cwd=work, text=True, capture_output=True, check=False)
+    if result.returncode:
+        pytest.fail("cannot build the secret-memory fork harness:\n" + result.stderr[-4000:])
+    run = subprocess.run([str(work / "fork")], cwd=work, text=True, capture_output=True, check=False)
     assert run.returncode == 0, run.stdout + run.stderr
     assert run.stdout.strip() == "ok"
 
@@ -3642,6 +3761,96 @@ def test_o8_watermark_persists_under_a_long_lived_worker(tmp_path):
     assert run.returncode == 0, "the on-disk watermark did not follow the advance (ENV-01)"
 
 
+HTTP_DATE_HARNESS_C = r"""
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "envelock_trusted_time.h"
+/* php.h maps snprintf to PHP's own ap_php_snprintf; outside PHP the C library's does the same job. */
+int ap_php_snprintf(char *buf, size_t len, const char *format, ...)
+{
+    va_list ap;
+    int n;
+    va_start(ap, format);
+    n = vsnprintf(buf, len, format, ap);
+    va_end(ap);
+    return n;
+}
+static int fails;
+static void ok(const char *s, uint64_t want)
+{
+    uint64_t v = 0;
+    if (envelock_http_date_parse(s, &v) != 1 || v != want) { printf("FAIL accept: [%s]\n", s); fails++; }
+}
+static void bad(const char *s)
+{
+    uint64_t v = 0;
+    if (envelock_http_date_parse(s, &v) != 0) { printf("FAIL refuse: [%s]\n", s); fails++; }
+}
+int main(void)
+{
+    ok("Sun, 06 Nov 1994 08:49:37 GMT", 784111777ULL);           /* RFC 9110's own example */
+    ok("Sun, 06 Nov 1994 08:49:37 GMT \t", 784111777ULL);        /* trailing blanks only */
+    ok("Thu, 29 Feb 2024 00:00:00 GMT", 1709164800ULL);          /* a real leap day */
+    bad("Sun, 06 Nov 1994 -8:49:37 GMT");                         /* a sign used to pass hour > 23 */
+    bad("Sun, 06 Nov 1994 08:-9:37 GMT");
+    bad("Sun, 06 Nov 1994 08:49:37");                             /* no zone */
+    bad("Sun, 06 Nov 1994 08:49:37 UTC");
+    bad("Sun, 06 Nov 1994 08:49:37 GMT trailing");               /* anything after the zone */
+    bad("Sun, 31 Feb 2026 08:49:37 GMT");                         /* timegm would normalise these */
+    bad("Sun, 29 Feb 2026 08:49:37 GMT");
+    bad("Sun, 31 Apr 2026 08:49:37 GMT");
+    bad("Xyz, 06 Nov 1994 08:49:37 GMT");                         /* weekday not a weekday */
+    bad("Sun, 06 Nox 1994 08:49:37 GMT");
+    bad("Sun, 6 Nov 1994 08:49:37 GMT");                          /* the day has two digits */
+    bad("Sunday, 06-Nov-94 08:49:37 GMT");                        /* obsolete RFC 850 form */
+    bad("Sun Nov  6 08:49:37 1994");                              /* obsolete asctime form */
+    bad("Sun, 06 Nov 1969 08:49:37 GMT");                         /* before the epoch */
+    bad("Sun, 06 Nov 2101 08:49:37 GMT");                         /* past 2100 */
+    bad("Sun, 06 Nov 1994 24:00:00 GMT");
+    bad("");
+    if (!fails) printf("ok\n");
+    return fails != 0;
+}
+"""
+
+
+def test_o8_http_date_is_parsed_strictly(tmp_path):
+    """External audit 2026-11-12, H-06: the trusted-time Date header was read with sscanf("%2d"), which
+    took a sign ("-5" passed `hour > 23`), skipped the weekday, ignored what followed the seconds, and
+    let timegm() normalise an impossible date (31 Feb) into a plausible one. Only the exact RFC 9110
+    form is accepted now, every position checked."""
+    cc = shutil.which("cc") or shutil.which("gcc")
+    phpcfg = shutil.which("php-config")
+    if not sys.platform.startswith("linux") or not cc or not phpcfg:
+        pytest.skip("needs a Linux C compiler and php-config for the date harness")
+    harness = tmp_path / "date_harness.c"
+    harness.write_text(HTTP_DATE_HARNESS_C)
+    includes = subprocess.run([phpcfg, "--includes"], capture_output=True, text=True).stdout.split()
+    binp = tmp_path / "date_harness"
+    build = subprocess.run([cc, "-O2", "-I", str(ROOT / "extension"), *includes, str(harness),
+                            str(ROOT / "extension" / "envelock_trusted_time.c"), "-lssl", "-lcrypto",
+                            "-o", str(binp)], capture_output=True, text=True)
+    if build.returncode != 0:
+        if "openssl/ssl.h" in build.stderr:
+            pytest.skip("OpenSSL headers are not installed")
+        pytest.fail("date harness did not build: " + build.stderr[-2000:])
+    run = subprocess.run([str(binp)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.strip() == "ok"
+
+
+def test_key_unlock_never_unlocks_a_shared_page():
+    """ENV-AUD-01, completed by the external audit 2026-11-12 (H-07): munlock() and VirtualUnlock() work
+    on whole pages, so unlocking one 32-byte cache key unlocked every key sharing its page. The fix had
+    reached Linux and macOS only; Windows still called VirtualUnlock(p, len). No branch may unlock now."""
+    source = (ROOT / "extension" / "envelock.c").read_text(encoding="utf-8")
+    body = source.split("static void envelock_unprotect_bytes(void *p, size_t len)\n{", 1)[1]
+    code = re.sub(r"/\*.*?\*/", "", body.split("\n}\n", 1)[0], flags=re.S)   # calls, not comments
+    assert "VirtualUnlock" not in code and "munlock" not in code
+
+
 def test_o8_running_records_the_time(native, tmp_path):
     """A clean run has to leave a record behind, or the next one has nothing to compare against and
     the whole check is inert. The state file is created by the worker itself."""
@@ -4377,14 +4586,34 @@ def test_vm_negative_float_zero_matches_php(native):
     assert actual.returncode == 0 and actual.stdout == expected.stdout
 
 
+def _legacy_prebuilt_loader():
+    """The bundled Linux PHP 8.4 NTS loader when it is a LEGACY one: it loads here and has no v2 VM
+    entry point. These tests were written while prebuilt/ held a loader older than the v2 VM. Since
+    prebuilt/ is rebuilt from the current source it has the v2 VM, and before that it did not even
+    load on an older glibc, so the tests passed without testing anything — as they did in CI, where
+    prebuilt/ holds no binaries. Now they run only against a loader that really is legacy."""
+    legacy = ROOT / "prebuilt/loader/linux-x86_64/php-8.4-nts/envelock.so"
+    if not sys.platform.startswith("linux") or not legacy.is_file():
+        return None
+    probe = subprocess.run(["php", "-n", "-d", f"extension={legacy}", "-r",
+                            'echo extension_loaded("envelock") ? (function_exists("__envelock_vm_v2") '
+                            '? "current" : "legacy") : "unloadable";'],
+                           capture_output=True, text=True, check=False, timeout=60)
+    return legacy if probe.stdout.strip() == "legacy" else None
+
+
 @pytest.mark.parametrize("loader", [None, "prebuilt", "missing"])
 def test_vm_pack_requires_a_verified_v2_loader_and_rejects_atomically(native, tmp_path, loader):
     src = tmp_path / "src"
     src.mkdir()
     (src / "main.php").write_text("<?php function f(){return 1;} echo f();")
     destination = tmp_path / "packed"
-    selected = (ROOT / "prebuilt/loader/linux-x86_64/php-8.4-nts/envelock.so" if loader == "prebuilt"
-                else tmp_path / "missing.so" if loader == "missing" else None)
+    if loader == "prebuilt":
+        selected = _legacy_prebuilt_loader()
+        if selected is None:
+            pytest.skip("no loadable pre-v2 loader here (prebuilt/ is current, absent or for another system)")
+    else:
+        selected = tmp_path / "missing.so" if loader == "missing" else None
     with pytest.raises(ValueError, match="virtualize.*loader|loader.*virtualize"):
         a.pack_tree(src, destination, [a.recipient_public(native[3])], native[2], str(uuid.uuid4()),
                     virtualize=["f"], virtualize_loader=selected, unsafe_vm_laboratory=True)
@@ -4392,7 +4621,9 @@ def test_vm_pack_requires_a_verified_v2_loader_and_rejects_atomically(native, tm
 
 
 def test_vm_v2_program_refuses_legacy_prebuilt_loader(native):
-    legacy = ROOT / "prebuilt/loader/linux-x86_64/php-8.4-nts/envelock.so"
+    legacy = _legacy_prebuilt_loader()
+    if legacy is None:
+        pytest.skip("no loadable pre-v2 loader here (prebuilt/ is current, absent or for another system)")
     program, error = _virtualize("f", "<?php function f(){return 1;}")
     assert program is not None, error
     assert base64.b64decode(program).startswith(b"ENVVM3")

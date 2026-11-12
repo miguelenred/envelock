@@ -131,9 +131,22 @@ const char *envelock_secret_kind(void)
 void envelock_secret_shutdown(void)
 {
     if (envelock_secret_base == NULL) return;
-    /* Wipe before releasing: the pages are about to go back to the kernel (and, in the fallback,
-     * they may have been swapped before being locked). */
-    OPENSSL_cleanse(envelock_secret_base, envelock_secret_size);
+    /* Wipe before releasing ONLY a mapping that belongs to this process alone. The fallback (and
+     * macOS, and Windows) is private: after a fork it is copy-on-write, so wiping it touches this
+     * process's copy and nobody else's, and its pages may have been swapped before being locked.
+     *
+     * The memfd_secret arena is different: memfd_secret only maps MAP_SHARED, and every process
+     * forked after MINIT shares those very pages — PHP-FPM's daemonize fork, every FPM worker, every
+     * Apache child. MSHUTDOWN runs whenever one of them exits (the pre-daemon process, a worker that
+     * reaches pm.max_requests or is scaled down), so wiping here zeroed the private keys of the
+     * master and of every live worker, and every protected file failed until PHP was restarted
+     * (external audit 2026-11-12, H-01). Nothing is lost by not wiping: the kernel clears secretmem
+     * pages itself when it frees them, after the last mapping and descriptor are gone
+     * (mm/secretmem.c), and until then no other process and not even the kernel's direct map can
+     * read them. So this process only lets go of its own mapping and descriptor. */
+    if (!envelock_secret_real) {
+        OPENSSL_cleanse(envelock_secret_base, envelock_secret_size);
+    }
 #if defined(__linux__) || defined(__APPLE__)
     (void)munmap(envelock_secret_base, envelock_secret_size);
 #elif defined(_WIN32)

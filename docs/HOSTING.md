@@ -250,7 +250,9 @@ was already above Envelock when PHP finished starting, even if OPcache later cov
 The blacklist file holds one path prefix per line, e.g. `/var/www/myapp-protected/` (OPcache
 documentation: <https://www.php.net/manual/en/opcache.configuration.php#ini.opcache.blacklist-filename>).
 If the protected folder is missing from it, the loader refuses the file instead of letting OPcache
-cache it.
+cache it. List the **folder**, not each protected file: for a package built with `--sealed` it is
+what keeps a plain `.php` planted in the tree from being served out of OPcache's shared memory,
+where the loader never sees it (external audit 2026-11-12, H-02; `docs/MANUAL.md` §14, `--sealed`).
 
 ### 3.4 Extensions that make the loader refuse protected files
 

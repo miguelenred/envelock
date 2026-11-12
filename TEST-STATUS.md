@@ -6,6 +6,72 @@ binaries under `prebuilt/` are a convenience and are reproducible from `docs/BUI
 
 Date: 2026-11-12.
 
+## External audit fixes and rebuild (2026-11-12, `docs/AUDITORIA.md` Pass 34)
+
+The loader and encoder changed for findings H-01…H-08 of an external audit (`CHANGELOG.md`). Every
+binary in `prebuilt/` was rebuilt from that source: the 13 loaders and both assistants (the assistants
+bundle the encoder).
+
+**New regression tests, each run first against the unchanged source, where it failed:**
+- the fork harness of H-01 (an exiting child wiped its parent's keys);
+- the HTTP-date harness of H-06 (the old parser accepted 10 malformed dates).
+
+Then run against the new source: both pass.
+
+**Linux** (AlmaLinux 8, glibc 2.28, static OpenSSL 3.5.9; WSL1). Loaders:
+
+| Loader | Hash |
+|---|---|
+| 8.2 | `76c32562` |
+| 8.3 | `7418641d` |
+| 8.4 NTS | `8eebea19` |
+| 8.4 ZTS | `225b2e02` |
+| 8.5 | `5ee20ca7` |
+
+All five have highest symbol GLIBC_2.25, need only libc, libdl and libpthread, and export only
+`get_module`.
+
+| Run | Result |
+|---|---|
+| `tests/test_native.py`, fixture build, PHP 8.4 NTS | 993 passed, 14 skipped, 3 failed — see below |
+| Same, the 3 again after the fix | 84 passed, 3 skipped, 0 failed (in a run of the failing and new tests) |
+| Targeted (OPcache, pre-flight, O3, identity, manifest, sealed, licence, clock, include protection, tampering, debuggers, hooks, hardening, trusted time, secret memory, vault, VM loader checks), PHP 8.2 / 8.3 / 8.5 NTS | 105 passed, 8 skipped, 0 failed each |
+| Same, PHP 8.4 ZTS | 102 passed, 11 skipped, 0 failed |
+| `scripts/fpm_smoke.py` with the **release** loaders, PHP 8.4 (real OPcache) and 8.5 | ALL PASS |
+| Linux assistant `dcf59758` (glibc 2.28; needs `libxcb.so.1`) | `--selftest` and `--e2e` OK |
+
+The three failures of the first run:
+- One was WSL1's `fork: Invalid argument` under memory pressure; the test passes on its own.
+- Two were stale tests. They treated the loader in `prebuilt/` as one older than the v2 VM. Since
+  `prebuilt/` is rebuilt from the current source it is not. Before, they passed without testing
+  anything: that loader did not load on glibc 2.28, and CI has no `prebuilt/` binaries. They now run
+  only against a loadable pre-v2 loader, and skip with that reason otherwise.
+
+**Windows** (official PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12; same toolchain as below). All eight DLLs
+passed the `build-windows.ps1` gates.
+
+| Run | Result |
+|---|---|
+| `tests/test_native.py`, 8.4 NTS | 946 passed, 64 skipped, 0 failed |
+| Targeted (the Linux areas minus hooks, hardening and the VM loader checks), 8.2 NTS/TS, 8.3 NTS/TS, 8.4 TS, 8.5 NTS/TS | 84 passed, 21 skipped, 0 failed each |
+| **Real `--bytecode` flow** (first time on Windows), PHP 8.4 NTS | see below |
+| Windows assistant `c310e737` | `--selftest` and `--e2e` OK |
+
+The real `--bytecode` flow: a pack-time emitter DLL (`--enable-envelock-bcemit`, never shipped)
+packs a small app — classes, an enum, readonly properties, a generator, closures with static state,
+exceptions, `match`, `__DIR__`. The **production** DLL serves it; that DLL exposes neither
+`envelock_bc_emit` nor `envelock_bc_run`. The output is identical to the plain source run by the same
+PHP. A copy moved away from its deploy root fails, as documented.
+
+The executable scan finds no build-machine string: the only hits are text inside Python's and
+Tcl/Tk's own libraries.
+
+**Not run in this round:**
+- The whole `pytest tests` tree on Windows. Only `tests/test_native.py` ran, plus the encoder,
+  assistant, PIE and `prebuilt` tests, which pass.
+- `tests/test_bytecode_guard.py` with the Windows test-only DLLs. The bytecode layer did not change
+  in this round, and CI runs that file on Linux and macOS.
+
 ## GitHub CI — green on every platform (2026-11-12)
 
 The source was pushed to a private GitHub repository and the full workflow (`.github/workflows/checks.yml`)
@@ -19,7 +85,7 @@ What the CI runs found (all test-harness or platform matters, with the loader be
 each reproduced before changing a test):
 - **macOS build:** the vendored bytecode layers used `madvise(MADV_DONTDUMP)`, which macOS lacks; they
   now go through one `ENVELOCK_DONTDUMP` macro (a no-op where the flag is absent). Line counts are
-  unchanged, and a rebuilt Linux 8.4 NTS loader is byte-identical to `prebuilt/` (`a8ced333…`).
+  unchanged, and a rebuilt Linux 8.4 NTS loader is byte-identical to the one then in `prebuilt/` (`a8ced333…`; rebuilt since for Pass 34).
 - **Anti-debugger and trusted-time tests on Linux:** both rely on ptrace (the second through `strace`).
   GitHub runners restrict ptrace, and the loader turns the process non-dumpable at startup, so `strace`
   loses visibility of the later `connect()`. The anti-debugger test skips under restricted ptrace; the

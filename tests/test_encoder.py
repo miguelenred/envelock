@@ -884,6 +884,84 @@ def test_recommend_turns_include_protection_off_for_a_cleartext_console_entry_po
     assert "LICENSE" not in rec["off"]["--include-protection"]
 
 
+def test_recommend_turns_include_protection_off_when_it_leaves_vendor_out(tmp_path):
+    """External audit 2026-11-12, H-03: the recommendation excluded vendor/ AND enabled include
+    protection, which do not mix. Library code that PHP calls back with no protected file on the stack
+    (an exception handler registered from vendor/) autoloads a protected class and is refused, so the
+    app's error path died with "include protection: it can only be loaded by its own application"."""
+    ext = {".php"}
+    app = tmp_path / "app"
+    (app / "vendor").mkdir(parents=True)
+    (app / "vendor" / "autoload.php").write_text("<?php")
+    (app / "src").mkdir()
+    (app / "src" / "Formatter.php").write_text("<?php class Formatter { function f() { return 1; } }")
+    (app / "index.php").write_text("<?php require 'vendor/autoload.php';")
+    rec = a.recommend_options(app, ext)
+    assert "vendor/*" in rec["exclude_patterns"]
+    assert "--include-protection" not in rec["on"] and "--include-protection" not in rec["verify"]
+    assert "vendor/" in rec["off"]["--include-protection"]
+    assert "error" in rec["off"]["--include-protection"]
+    assert "--include-protection" not in a.format_recommendation(rec).split("DO NOT enable")[0]
+    # Without Composer's autoloader nothing is left out, and it is recommended (to check) again.
+    (app / "vendor" / "autoload.php").unlink()
+    rec = a.recommend_options(app, ext)
+    assert "--include-protection" in rec["on"] and "--include-protection" in rec["verify"]
+
+
+def test_pack_reports_each_asset_it_did_not_copy(tmp_path, material):
+    """External audit 2026-11-12, H-08: `--asset .netrc` (a path pack never copies) ended with
+    copied_assets 0, exit 0 and not a word. Every --asset that copied nothing is now reported with the
+    reason, to the caller only: the names are not written into the package's envelock-package.json."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "index.php").write_text("<?php echo 1;")
+    (src / ".netrc").write_text("machine example.invalid login u password p\n")
+    (src / "style.css").write_text("body{}")
+    (src / "skip.txt").write_text("x")
+    info = a.pack_tree(src, tmp_path / "out", [a.recipient_public(material[1])], material[0],
+                       str(uuid.uuid4()), assets=[".netrc", "style.css", "skip.txt", "missing/*.json"],
+                       exclude=["skip.txt"])
+    reasons = {m["asset"]: m["reason"] for m in info["assets_not_copied"]}
+    assert set(reasons) == {".netrc", "skip.txt", "missing/*.json"}
+    assert "never copies" in reasons[".netrc"]
+    assert "--exclude" in reasons["skip.txt"]
+    assert "no file" in reasons["missing/*.json"]
+    assert info["copied_assets"] == 1
+    meta = (tmp_path / "out" / "envelock-package.json").read_text()
+    assert "assets_not_copied" not in meta and ".netrc" not in meta
+    clean = a.pack_tree(src, tmp_path / "out2", [a.recipient_public(material[1])], material[0],
+                        str(uuid.uuid4()), assets=["style.css"])
+    assert clean["assets_not_copied"] == []
+
+
+def test_cli_pack_warns_about_lost_assets_and_what_sealed_does_not_cover(tmp_path):
+    """The CLI says it out loud: a WARNING for each --asset not copied (H-08), and with --sealed a note
+    on what sealing does not reach — a fresh process, OPcache's shared memory — and the folder
+    blacklist that closes the second (H-02, external audit 2026-11-12)."""
+    enc = str(ROOT / "encoder/envelock.py")
+
+    def run(*argv):
+        return subprocess.run([sys.executable, enc, *map(str, argv)], capture_output=True, text=True)
+
+    owner, rcpt = tmp_path / "owner.json", tmp_path / "rcpt.json"
+    assert run("keygen", "owner", "--out", owner, "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", rcpt, "--label", "c1", "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", rcpt, "--out", tmp_path / "pub.json").returncode == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "i.php").write_text("<?php echo 1;")
+    (tmp_path / "src" / ".netrc").write_text("machine example.invalid login u password p\n")
+    common = ["pack", "--owner", owner, "--recipient", tmp_path / "pub.json", "--project",
+              str(uuid.uuid4()), "--source", tmp_path / "src"]
+    lost = run(*common, "--output", tmp_path / "lost", "--asset", ".netrc")
+    assert lost.returncode == 0, lost.stderr
+    assert "WARNING: --asset .netrc was not copied" in lost.stderr
+    assert "--sealed refuses" not in lost.stderr
+    sealed = run(*common, "--output", tmp_path / "sealed", "--sealed")
+    assert sealed.returncode == 0, sealed.stderr
+    assert "opcache.blacklist_filename" in sealed.stderr and "FOLDER" in sealed.stderr
+    assert "WARNING: --asset" not in sealed.stderr
+
+
 def test_recommend_no_ffi_states_its_php_ini_requirement_and_respects_ffi_users(tmp_path):
     """Measured: with PHP's built-in enable_dl=On (no php.ini, or one that does not set it) a --no-ffi
     package refuses every request. The recommendation must say what php.ini needs, and must not enable

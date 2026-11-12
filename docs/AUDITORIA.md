@@ -911,6 +911,39 @@ Measured and documented as **not** affecting the loader: `disable_functions` (in
 `exec`, `proc_open`), `open_basedir` beyond the usual rule that the protected files lie inside it,
 `auto_prepend_file` for packages without `--no-prepend`.
 
+## Pass 34: external code audit and beta test (November 12)
+
+An independent review — the full C extension, encoder, assistant and scripts — plus a beta test on
+Debian 13 with PHP 8.4.27: FPM, CGI and the built-in server, real OPcache, an emitter build for
+`--bytecode`, ASan/UBSan/libFuzzer and `clang --analyze`. The project's own suite passed there
+(1674 passed, 28 skipped). It confirmed the cryptographic core and every fail-closed path it attacked:
+1-bit tampering, truncation, mixing releases, the manifest, anti-rollback, licences and asset
+secret detection. It reported ten findings at the boundaries. Each one was checked against the code
+here before anything changed. Where a finding was reproducible on this side, the regression test was
+first run against the unchanged code and failed there.
+
+| ID | Finding (as reported) | Checked here | Status |
+|---|---|---|---|
+| H-01 (high) | `envelock.secret_memory=1` + FPM/Apache: one process exiting zeroes everyone's keys | **Confirmed in code.** `memfd_secret` maps `MAP_SHARED` only (`envelock_secret.c`), and `envelock_secret_shutdown()` wiped it unconditionally from MSHUTDOWN. A fork harness reproduces it on the old source ("an exiting child wiped the keys of its parent"). | **Fixed.** Only the private fallback is wiped; the shared region is unmapped and closed, and the kernel clears secretmem pages on free. `test_secret_memory_survives_a_worker_exiting` covers both paths. The report's suggested fix (`MAP_PRIVATE`) would not work: `memfd_secret` refuses private mappings. |
+| H-02 (high) | `--sealed` does not stop a planted plain PHP in a fresh process or one served from OPcache SHM | **Confirmed.** The detailed manual text already said "once a protected file of the package has loaded in a request", but the option table promised "refuse any plain PHP under the package folder". The SHM case was not documented. | **Documented** (MANUAL table and §14, SEGURIDAD, HOSTING §3.3), and `pack --sealed` prints the limits and the fix: blacklist the whole package folder. Rated **medium** here: it needs write access to the tree, which the threat model already treats as the boundary, and `--sealed` is defence in depth. No code fix: the loader cannot see an SHM hit (OPcache serves it without calling the compile hook). |
+| H-03 (medium) | `--include-protection` with `vendor/` excluded kills the error path | **Confirmed, and self-inflicted.** `recommend_options` added `vendor/*` to the exclusions *and* enabled the option. The loader already accepts any protected frame anywhere on the stack; the failing case has none, because PHP itself calls a handler registered from `vendor/`. | **Fixed in the recommender** (option off, with the reason, whenever it excludes `vendor/`; test added) and documented (MANUAL `--include-protection`). |
+| H-04 (medium) | The runtime manifest proves presence, not content | Confirmed; consistent with the documented posture (write access = game over). | **Documented** (MANUAL `--enforce-manifest`, SEGURIDAD): `verify` after each deployment, an unwritable tree, and `--sealed` with its limits. |
+| H-05 (low) | Plain-vault path returns a shared string wiped at RSHUTDOWN; `(uint32_t)idx` wraps | **Confirmed in code** (`RETURN_STR_COPY`; the wrap is real but only ever returns another literal of the same file). | **Fixed.** Independent copy; index above `UINT32_MAX` out of range. Test for the index (the plain-vault path cannot be produced by the encoder). |
+| H-06 (low) | Trusted time: an immediate `connect()==0` leaves the socket non-blocking and the fetch fails silently; lax `Date` parsing | **Confirmed in code.** The immediate-success branch skipped the "back to blocking" block. A date harness shows the old parser accepted 10 malformed inputs (signs, 31 Feb, a missing or wrong zone, trailing text). On Linux, loopback returns `EINPROGRESS`, so the connect bug is latent there. | **Fixed.** Both connect paths go back to blocking with `SO_*TIMEO`. Strict 29-character RFC 9110 parse (`test_o8_http_date_is_parsed_strictly`). A failed fetch is logged, never shown on a page. |
+| H-07 (low) | Windows: identity opened with `_wfopen` (follows reparse points); `VirtualUnlock` unlocks whole pages | **Half confirmed.** `envelock_unprotect_bytes` still called `VirtualUnlock(p, len)`: the ENV-AUD-01 fix had reached POSIX only. The `_wfopen` behaviour is an accepted design noted in the code: the `FILE_TYPE_DISK` and ACL checks run on the handle actually opened, and the path is the administrator's. | **Fixed** (no branch unlocks; source check `test_key_unlock_never_unlocks_a_shared_page`). `_wfopen`: unchanged, by design. |
+| H-08 (low) | `--asset .netrc` silently not copied | Confirmed. | **Fixed.** Every `--asset` that copies nothing is reported with the reason (CLI `WARNING`, `pack_tree` → `assets_not_copied`, assistant summary), and the names are kept out of the package metadata. Test added. |
+| H-09 (info) | Bytecode images not reproducible (6 of 4168 bytes differ) | Not investigated here. | **Documented** (MANUAL `--bytecode`: do not compare builds by hash). |
+| H-10 (info) | The docs can be read as promising isolation against a local writer | Agreed. | **Documented** together with H-02 and H-04. |
+
+**Not done in this pass:**
+- The report's `clang --analyze` notes (`envelock_vm.c`, `envelock_persist.c`,
+  `envelock_file_cache.c`, `envelock_arena.c`). The report itself calls none of them immediately
+  exploitable; they are left for a separate review.
+- Reproducible bytecode images.
+- The report's suggestion to add `secret_memory` with worker recycling, and sealed with OPcache, to
+  `scripts/fpm_smoke.py`. Instead, H-01 is covered by the fork harness, which runs on any Linux
+  (`memfd_secret` is rarely available on CI kernels). H-02 has no code change to test.
+
 ## Open risks and necessary work
 
 - Extraction of the decrypted source and instrumentation by the administrator/root: a **known design limit**, not resolved. O1 bytecode stops decrypted *source* from ever being in the package or in process memory, which raises the cost markedly; but root can still dump the deserialized op_array, literals and runtime data, so this limit stands.
