@@ -3306,12 +3306,15 @@ def test_o8_trusted_time_is_fetched_at_startup(native, tmp_path):
     attempts the connection at startup. Without the fix there is no connect() at all."""
     if shutil.which("strace") is None:
         pytest.skip("strace not available")
-    # strace needs ptrace. Some CI runners (GitHub-hosted among them) restrict ptrace under seccomp
-    # so strace attaches but records no syscalls, leaving a trace file that exists yet is empty — the
-    # `trace.exists()` guard below would not catch that and the assertion would fail for the
-    # environment, not the loader. Probe first with a connect we know happens (php's own fsockopen to
-    # the same host:port); if strace cannot observe even that, it cannot observe the loader's either,
-    # so skip. The loader's startup fetch is verified directly on a kernel that allows ptrace.
+    # envelock.harden_memory is off here ON PURPOSE, for the same reason as the O3 tracer test: the
+    # hardening calls prctl(PR_SET_DUMPABLE, 0) at MINIT, BEFORE the trusted-time block. On a kernel
+    # that enforces that flag (GitHub-hosted runners), a strace whose process lacks CAP_SYS_PTRACE
+    # loses visibility of every syscall once the traced process turns non-dumpable — so the connect(),
+    # which happens after the prctl, was recorded on a permissive kernel (WSL1) yet invisible on the
+    # runners, and the test failed for the observer, not the loader. With hardening off the process
+    # stays dumpable and strace sees the connect. The MINIT ordering under test is independent of
+    # memory hardening. Verified on AlmaLinux 8 that the published loader does make this connect.
+    # A probe still guards the fully-restricted case (strace cannot trace even a plain child).
     probe = tmp_path / "strace-probe.txt"
     probe_php = tmp_path / "probe.php"
     probe_php.write_text('<?php @fsockopen("127.0.0.1", 443, $e, $s, 1); echo "P";')
@@ -3333,6 +3336,7 @@ def test_o8_trusted_time_is_fetched_at_startup(native, tmp_path):
          "-d", f"envelock.licence={licence}",
          "-d", "envelock.trusted_time=127.0.0.1",
          "-d", "envelock.trusted_time_timeout=1",
+         "-d", "envelock.harden_memory=0",
          "-d", "opcache.enable=0", "-d", "opcache.enable_cli=0",
          str(out / "index.php")],
         capture_output=True, text=True, env=php_environment(), timeout=30, check=False,

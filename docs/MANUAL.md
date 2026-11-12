@@ -642,7 +642,7 @@ Two limits worth stating plainly:
 
 - The fingerprint is computed independently by the encoder (when issuing) and by the loader (when checking). If the two ever disagreed, **every** machine-bound license would be refused, and it would look like a bad license rather than a mismatch — so the pair is compared directly in the test suite on the machine running the tests.
 - Expiry is compared against the **local clock**, so on its own it is a commercial term rather than a security boundary. `envelock.clock_state` closes the cheap bypass — see below — but it does not turn expiry into a boundary either.
-- On Windows the loader reports no machine identity, so a machine-bound license is refused there. An unbound license works.
+- On Windows and macOS the loader reports no machine identity (the fingerprint reads Linux-only sources — `/etc/machine-id` and `/sys/class/net`), so a machine-bound license is refused there. An unbound license works. Machine binding is a Linux-only feature.
 - A host with more than 256 MAC addresses (or IPv4 addresses, for `--ip`) cannot be bound: both the encoder and the loader take every entry, sorted, and refuse rather than silently use a subset.
 - A clock at or before 1970 (an unsynchronised container, or a shim freezing `time()` at 0) refuses an expiring license instead of passing it.
 
