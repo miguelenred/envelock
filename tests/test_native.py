@@ -43,6 +43,10 @@ def _php_os_family():
 
 
 PHP_WINDOWS = _php_os_family() == "Windows"
+# macOS, like Windows, has no machine-fingerprint source wired up in the loader (envelock_licence.c
+# reads Linux-only paths: /etc/machine-id and /sys/class/net). There a machine-bound licence is
+# refused for want of any identity, not for a mismatch — fail-closed, the same as Windows.
+PHP_MACOS = _php_os_family() == "Darwin"
 # The identity-file refusal is worded after each system's permission model.
 LAX_IDENTITY = ("accessible by other accounts or groups" if PHP_WINDOWS
                 else "identity file rejected: must be a regular file with mode 0600 or 0400")
@@ -2958,6 +2962,12 @@ def test_o3_a_tracer_attached_while_a_protected_file_loads_is_refused(
     stdout, stderr = process.communicate(timeout=60)
     if tracer.returncode != 0 and "PTRACE_SEIZE: Invalid argument" in tracer.stderr:
         pytest.skip("this kernel does not support PTRACE_SEIZE (e.g. WSL1)")
+    # A restricted environment (kernel.yama.ptrace_scope >= 1, no CAP_SYS_PTRACE — the default on
+    # GitHub-hosted runners) forbids attaching to a process that is not our own child. The scenario
+    # this test needs then cannot be set up; the TracerPid parser itself is covered by
+    # test_o3_tracer_pid_reads_a_real_status_file, which needs no live tracer.
+    if tracer.returncode != 0 and "PTRACE_SEIZE: Operation not permitted" in tracer.stderr:
+        pytest.skip("this environment forbids ptrace of a non-child (ptrace_scope / no CAP_SYS_PTRACE)")
     assert "TracerPid:" in tracer.stdout, (tracer.stdout, tracer.stderr)
     assert tracer.stdout.split(":")[1].strip() != "0", "the tracer never attached"
     assert process.returncode != 0
@@ -3296,6 +3306,21 @@ def test_o8_trusted_time_is_fetched_at_startup(native, tmp_path):
     attempts the connection at startup. Without the fix there is no connect() at all."""
     if shutil.which("strace") is None:
         pytest.skip("strace not available")
+    # strace needs ptrace. Some CI runners (GitHub-hosted among them) restrict ptrace under seccomp
+    # so strace attaches but records no syscalls, leaving a trace file that exists yet is empty — the
+    # `trace.exists()` guard below would not catch that and the assertion would fail for the
+    # environment, not the loader. Probe first with a connect we know happens (php's own fsockopen to
+    # the same host:port); if strace cannot observe even that, it cannot observe the loader's either,
+    # so skip. The loader's startup fetch is verified directly on a kernel that allows ptrace.
+    probe = tmp_path / "strace-probe.txt"
+    probe_php = tmp_path / "probe.php"
+    probe_php.write_text('<?php @fsockopen("127.0.0.1", 443, $e, $s, 1); echo "P";')
+    probe_run = subprocess.run(
+        ["strace", "-f", "-e", "trace=connect", "-o", str(probe), "php", "-n", str(probe_php)],
+        capture_output=True, text=True, env=php_environment(), timeout=30, check=False)
+    if not probe.exists() or "htons(443)" not in probe.read_text(errors="replace"):
+        pytest.skip("strace cannot observe connect() syscalls here (restricted ptrace): "
+                    f"probe stderr {probe_run.stderr[:200]!r}")
     out = package(native, tmp_path, {"index.php": "<?php echo 'TT';"})
     licence = out.parent / "licence.bin"
     licence.write_bytes(a.issue_licence(native[2], expires=int(time.time()) + 3600))
@@ -3339,8 +3364,9 @@ def test_o8_licence_bound_to_another_machine_is_refused(native, tmp_path):
     result = _licence_php(native, out,
                           a.issue_licence(native[2], machine=b"\x11" * 32))
     assert result.returncode != 0
-    # Windows loader: no machine identity at all, so every machine-bound licence is refused.
-    expected = "reports no machine identity" if PHP_WINDOWS else "different machine"
+    # Windows and macOS loaders: no machine identity at all (the fingerprint reads Linux-only
+    # sources), so every machine-bound licence is refused for want of an identity, not a mismatch.
+    expected = "reports no machine identity" if (PHP_WINDOWS or PHP_MACOS) else "different machine"
     assert expected in result.stderr, result.stderr
 
 

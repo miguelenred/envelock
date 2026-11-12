@@ -70,6 +70,51 @@ PIE 1.5.5 source build was checked on AlmaLinux 8.
 - **Tests:** the OPcache tests of `tests/test_native.py` skipped on every Windows PHP 8.2–8.4 (the
   helper looked for `php_opcache.dll` in `C:\php\ext`, HOST-3); they now run and pass.
 - **CI:** the macOS job moved from the retired `macos-14` runner to `macos-15`.
+- **First two GitHub CI runs (private repository) — what they found and the fixes.** The first run
+  built on every platform and surfaced the lint, macOS-build and Linux/Windows test issues below; the
+  second, with those fixed, left only three failures, all environment or platform limits of the test
+  harness, not the loader, confirmed by reproducing the loader's behaviour on a kernel that allows
+  ptrace:
+  - **Anti-debugger test (`test_o3_a_tracer_attached…`), Linux x86-64 and ARM64.** The test attaches
+    a real tracer to a *separate* process; GitHub-hosted runners restrict ptrace
+    (`kernel.yama.ptrace_scope`, no `CAP_SYS_PTRACE`), so `PTRACE_SEIZE` returns `EPERM` and the
+    scenario cannot be set up. It now skips on `EPERM` as it already did on WSL1's `EINVAL`; the
+    TracerPid parser itself stays covered by `test_o3_tracer_pid_reads_a_real_status_file`, which
+    needs no live tracer.
+  - **Startup trusted-time fetch (`test_o8_trusted_time_is_fetched_at_startup`), Linux.** The test
+    uses `strace` (which also needs ptrace) to see the loader's `connect()` to the time host at
+    startup. Under the runners' restricted ptrace `strace` records nothing and the trace is empty.
+    Verified on AlmaLinux 8 that the **published** PHP 8.4 NTS loader (`a8ced333…`) does attempt the
+    connection — `connect(…, htons(443), 127.0.0.1) = EINPROGRESS` — and the protected file runs. The
+    test now probes once whether `strace` can observe a known `connect()` here and skips when it
+    cannot, rather than asserting against an empty trace.
+  - **Machine-bound licence on macOS (`test_o8_licence_bound_to_another_machine_is_refused`).** The
+    loader's machine fingerprint reads Linux-only sources (`/etc/machine-id`, `/sys/class/net`), so on
+    macOS — as on Windows — it reports no identity and every machine-bound licence is refused for want
+    of one (fail-closed). The test now expects that message on macOS too. **Machine binding is a
+    Linux-only feature; a licence bound to a machine will not run on macOS or Windows.**
+  - **macOS:** the loader did not compile. The vendored bytecode layers called
+    `madvise(MADV_DONTDUMP)`, which macOS lacks. They now call one `ENVELOCK_DONTDUMP` macro from
+    `envelock_accel_shim.h`, a no-op where `MADV_DONTDUMP` does not exist. Each caller keeps its
+    line count (`__LINE__` is part of the bailouts). A rebuilt Linux PHP 8.4 NTS loader is
+    byte-identical to `prebuilt/` (`a8ced333…`). For Windows the preprocessed code is unchanged
+    (that branch never called `madvise`).
+  - **Tests that assumed Linux or Windows:**
+    - `_identity_check` now sets the owner only. macOS refuses a group the user is not in.
+    - The TracerPid parser test runs only on Linux, where the parser exists.
+    - The ENC-25 case-collision test probes the file system instead of checking `os.name`.
+    - The release-guard test strips the `/private/var/…` temporary root before looking for
+      `private/`.
+  - **`tests/test_virtualize_resolution.py`** ran `php -n`. On Debian/Ubuntu PHP the tokenizer is a
+    shared module, so it was missing (`T_THROW` undefined). The test now loads it when it is not
+    built in. The encoder itself never runs with `-n`.
+  - **Lint:** Ruff is clean (import order, unused imports, one statement per line). Bandit's
+    findings were all intended and are annotated with the reason.
+  - **Jobs:**
+    - The FPM job runs on `ubuntu-24.04`, where `php8.3-fpm` exists.
+    - The bench job builds the loader with the bytecode emitter it needs.
+    - The Windows job runs the native suite with a throwaway identity made in the job. The encoder
+      refuses the public demo keys by design (ENV-AUD-07).
 - **Release tree:** the 55 files that `SHA256SUMS` lists but the previous complete ZIP lacked
   (Makefiles, `configure`, test archives, `.o` files of the portable Pythons, …) were restored from the
   official upstream archives, each matching its listed hash.
