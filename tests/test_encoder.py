@@ -785,7 +785,8 @@ def test_recommend_options_is_conservative_and_matches_the_cms_matrix(tmp_path):
     # A clean tree with no file that needs its own source: the full safe set, plus --bytecode (the
     # strongest option, now part of the production toolchain). --bytecode ships no source, so --sealed
     # is superseded and moves to off; the high-risk ones stay off.
-    clean = tmp_path / "clean"; clean.mkdir()
+    clean = tmp_path / "clean"
+    clean.mkdir()
     (clean / "a.php").write_text("<?php class A { function f(){ return 1; } }\n")
     rec = a.recommend_options(clean, ext)
     for flag in ("--encode-strings", "--obfuscate", "--obfuscate-flow", "--obfuscate-methods",
@@ -803,7 +804,8 @@ def test_recommend_options_is_conservative_and_matches_the_cms_matrix(tmp_path):
     assert True
 
     # A tree that reads its own docblocks: strip-comments/compact must be OFF (PrestaShop class).
-    dbk = tmp_path / "dbk"; dbk.mkdir()
+    dbk = tmp_path / "dbk"
+    dbk.mkdir()
     (dbk / "l.php").write_text("<?php class L { /** @arrayAccess */ function g(){}"
                                " function h(){ $m=new ReflectionMethod($this,'g'); return $m->getDocComment(); } }\n")
     rdb = a.recommend_options(dbk, ext)
@@ -811,14 +813,16 @@ def test_recommend_options_is_conservative_and_matches_the_cms_matrix(tmp_path):
     assert "--strip-comments" not in rdb["on"] and "--compact" not in rdb["on"]
 
     # A tree that eval()s: --sealed must be OFF (sealed refuses eval at run time).
-    ev = tmp_path / "ev"; ev.mkdir()
+    ev = tmp_path / "ev"
+    ev.mkdir()
     (ev / "e.php").write_text("<?php function x($c){ return eval($c); }\n")
     rev = a.recommend_options(ev, ext)
     assert "--sealed" in rev["off"] and "--sealed" not in rev["on"]
 
     # A tree that tokenizes its own source: the file must be listed to keep CLEARTEXT, and the
     # suggested command excludes it exactly once (deduplicated across categories).
-    tok = tmp_path / "tok"; tok.mkdir()
+    tok = tmp_path / "tok"
+    tok.mkdir()
     (tok / "t.php").write_text("<?php $t = token_get_all(file_get_contents(__FILE__));\n")
     rtk = a.recommend_options(tok, ext)
     assert any("t.php" in files for files in rtk["exclude"].values())
@@ -856,7 +860,8 @@ def test_recommend_leaves_composer_vendor_caches_and_blade_templates_in_the_clea
     assert "--exclude resources/views/welcome.blade.php" in cmd
     assert "--bytecode-loader" in cmd and "--bytecode-php" in cmd       # a production loader cannot emit
     # Without Composer's autoloader there is no vendor/ rule and everything is the project's own code.
-    plain = tmp_path / "plain"; (plain / "lib").mkdir(parents=True)
+    plain = tmp_path / "plain"
+    (plain / "lib").mkdir(parents=True)
     (plain / "lib" / "x.php").write_text("<?php function x(){}")
     assert a.recommend_options(plain, ext)["exclude_patterns"] == []
 
@@ -866,7 +871,8 @@ def test_recommend_turns_include_protection_off_for_a_cleartext_console_entry_po
     and, with --include-protection, `php artisan route:list` was refused ("it can only be loaded by its
     own application") while the web routes ran. The recommender must not enable it then."""
     ext = {".php"}
-    app = tmp_path / "app"; (app / "bin").mkdir(parents=True)
+    app = tmp_path / "app"
+    (app / "bin").mkdir(parents=True)
     (app / "src.php").write_text("<?php function f(){}")
     plain = a.recommend_options(app, ext)
     assert "--include-protection" in plain["on"]
@@ -883,18 +889,21 @@ def test_recommend_no_ffi_states_its_php_ini_requirement_and_respects_ffi_users(
     package refuses every request. The recommendation must say what php.ini needs, and must not enable
     --no-ffi for a project that uses FFI or dl() itself."""
     ext = {".php"}
-    clean = tmp_path / "clean"; clean.mkdir()
+    clean = tmp_path / "clean"
+    clean.mkdir()
     (clean / "a.php").write_text("<?php $o->dl('x'); Foo::dl(1);")         # methods named dl are not dl()
     rec = a.recommend_options(clean, ext)
     assert "--no-ffi" in rec["on"]
     # Server-side conditions the analysis cannot see: recommended, but listed as "check first".
     assert "enable_dl = Off" in rec["verify"]["--no-ffi"] and "ffi.enable = 0" in rec["verify"]["--no-ffi"]
     assert "auto_prepend_file" in rec["verify"]["--no-prepend"]
-    ffi = tmp_path / "ffi"; ffi.mkdir()
+    ffi = tmp_path / "ffi"
+    ffi.mkdir()
     (ffi / "f.php").write_text("<?php $c = \\FFI::cdef('int abs(int);');")
     rec = a.recommend_options(ffi, ext)
     assert "--no-ffi" not in rec["on"] and "f.php" in rec["off"]["--no-ffi"]
-    dl = tmp_path / "dl"; dl.mkdir()
+    dl = tmp_path / "dl"
+    dl.mkdir()
     (dl / "d.php").write_text("<?php if (!extension_loaded('x')) { dl('x.so'); }")
     assert "--no-ffi" in a.recommend_options(dl, ext)["off"]
 
@@ -908,12 +917,15 @@ def test_recommend_explains_every_option_and_says_when_it_is_unsure(tmp_path):
                   "--obfuscate-properties", "--obfuscate-flatten", "--obfuscate-flow", "--obfuscate-names",
                   "--virtualize", "--vault-strings", "--bytecode", "--include-protection", "--no-prepend",
                   "--no-ffi", "--sealed"]
-    clean = tmp_path / "clean"; clean.mkdir()
+    clean = tmp_path / "clean"
+    clean.mkdir()
     (clean / "index.php").write_text("<?php class A { private function f() { return 1; } }")
-    app = tmp_path / "app"; (app / "vendor" / "symfony" / "property-info").mkdir(parents=True)
+    app = tmp_path / "app"
+    (app / "vendor" / "symfony" / "property-info").mkdir(parents=True)
     (app / "vendor" / "autoload.php").write_text("<?php")
     (app / "index.php").write_text("<?php require 'vendor/autoload.php';")
-    (app / "bin").mkdir(); (app / "bin" / "console").write_text("#!/usr/bin/env php\n<?php\n")
+    (app / "bin").mkdir()
+    (app / "bin" / "console").write_text("#!/usr/bin/env php\n<?php\n")
     for tree in (clean, app):
         rec = a.recommend_options(tree, ext)
         for flag in protection:
@@ -954,14 +966,17 @@ def test_recommend_robust_against_evasion_and_shell_metachars(tmp_path):
     """ENV-2026-13: method/function detection is case-insensitive (PHP is) and matches `eval` split
     across lines; the suggested command shell-quotes and glob-escapes excluded paths."""
     ext = {".php"}
-    up = tmp_path / "up"; up.mkdir()
+    up = tmp_path / "up"
+    up.mkdir()
     (up / "u.php").write_text("<?php class L { function h(){ return (new ReflectionClass($this))"
                               "->GETDOCCOMMENT(); } }\n")
     assert "reads-own-docblock" in a.compatibility_findings(up, ext)       # UPPERCASE still caught
-    ev = tmp_path / "ev"; ev.mkdir()
+    ev = tmp_path / "ev"
+    ev.mkdir()
     (ev / "e.php").write_text("<?php $r = eval\n(\n'return 1;'\n);\n")      # eval ( on separate lines
     assert a._tree_uses_runtime_compile(ev, ext)                          # still caught
-    br = tmp_path / "br"; br.mkdir()
+    br = tmp_path / "br"
+    br.mkdir()
     (br / "[id].php").write_text("<?php token_get_all(file_get_contents(__FILE__));\n")
     cmd = a.format_recommendation(a.recommend_options(br, ext))
     assert "'[[]id].php'" in cmd                                          # glob-escaped + shell-quoted
@@ -1062,7 +1077,6 @@ def test_server_install_allows_rootless_for_current_user(tmp_path):
 def test_verify_package_flags_added_symlink(tmp_path):
     """ENV-2026-19: verify must report an ADDED symlink/FIFO, not skip it because it is not a plain
     file. Builds a minimal signed manifest, then plants a symlink and checks it shows as 'added'."""
-    import os
     owner = a.make_owner("t")
     pkg = tmp_path / "pkg"
     pkg.mkdir()

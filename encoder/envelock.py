@@ -603,7 +603,7 @@ def write_public(path: Path, data: bytes) -> None:
     # the parent, make it traversable (0755). A pre-existing parent is left as the admin set it.
     if os.name != "nt" and not parent_existed:
         try:
-            os.chmod(path.parent, 0o755)
+            os.chmod(path.parent, 0o755)  # nosec B103 - must be traversable by the PHP user (ENV-2026-20)
         except OSError:
             pass
 
@@ -4234,7 +4234,7 @@ def pack_tree(
         if os.name != "nt":
             # mkdir's mode is filtered by the umask, and the CLI runs under umask 077 (main), which
             # left the package root 0700: the web server user could not enter it (ENC-12).
-            os.chmod(destination, 0o755)
+            os.chmod(destination, 0o755)  # nosec B103 - the web server must enter the encrypted package (ENC-12)
         for child in staging.iterdir():
             child.rename(destination / child.name)
         staging.rmdir()

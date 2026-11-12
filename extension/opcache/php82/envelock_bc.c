@@ -968,7 +968,7 @@ void envelock_bc_keep(unsigned char *image, size_t length)
     /* Round the start down and the length up: madvise() rejects an unaligned start with EINVAL. */
     span = (((uintptr_t) image & ((uintptr_t) page - 1)) + length + (size_t) page - 1)
         & ~((size_t) page - 1);
-    (void) madvise((void *) ((uintptr_t) image & ~((uintptr_t) page - 1)), span, MADV_DONTDUMP);
+    ENVELOCK_DONTDUMP((void *) ((uintptr_t) image & ~((uintptr_t) page - 1)), span);
 #else
     (void) image;
     (void) length;

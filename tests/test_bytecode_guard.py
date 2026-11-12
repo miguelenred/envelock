@@ -15,17 +15,18 @@ import zlib
 from pathlib import Path
 
 import pytest
-
 from test_native import (  # noqa: F401  (native is a pytest fixture)
     BYTECODE_ASSERTIONS,
     BYTECODE_SOURCE,
-    ENVELOCK_BC_HEADER_SIZE as H,
     _bytecode_available,
     crashed,
     describe_rc,
     native,
     php,
     php_environment,
+)
+from test_native import (
+    ENVELOCK_BC_HEADER_SIZE as H,
 )
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -63,7 +63,7 @@ def main() -> int:
     }
     loaders = {"php": None, "old-v1": args.old_loader.resolve(), "new-v2": args.new_loader.resolve()}
     results: dict[str, list[float]] = {name: [] for name in calls}
-    rng = random.Random(7319)
+    rng = random.Random(7319)  # nosec B311 - fixed seed for a reproducible benchmark order, not crypto
     for pair in range(args.pairs + 1):  # one warm-up triplet, excluded
         order = list(calls)
         rng.shuffle(order)

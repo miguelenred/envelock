@@ -17,6 +17,11 @@ import pytest
 from test_encoder import ROOT
 
 PHP = shutil.which("php")
+# php-parser needs ext/tokenizer; under -n a distribution PHP (tokenizer as a shared module, as on
+# Debian/Ubuntu) loads none, so load it explicitly when it is not built in.
+TOKENIZER = ([] if PHP is None or subprocess.run(
+    [PHP, "-n", "-r", "echo defined('T_THROW') ? 1 : 0;"], capture_output=True, text=True,
+    timeout=30).stdout.strip() == "1" else ["-d", "extension=tokenizer"])
 pytestmark = pytest.mark.skipif(PHP is None, reason="no php on PATH")
 COMPILER = ROOT / "encoder" / "virtualize.php"
 
@@ -25,7 +30,7 @@ def compile_files(files, marked, *ini):
     """Run the compiler on {path: source}. Returns (programs, None) or (None, refusal)."""
     payload = {"files": {p: base64.b64encode(s.encode()).decode() for p, s in files.items()},
                "marked": marked}
-    result = subprocess.run([PHP, "-n", "-d", "display_errors=stderr", "-d", "memory_limit=-1",
+    result = subprocess.run([PHP, "-n", *TOKENIZER, "-d", "display_errors=stderr", "-d", "memory_limit=-1",
                              *ini, str(COMPILER)],
                             input=json.dumps(payload).encode(), capture_output=True, timeout=120)
     if result.returncode != 0:

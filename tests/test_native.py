@@ -1475,7 +1475,8 @@ def test_php_sealed_cleartext_trailing_slash_and_multiple_entries(native, tmp_pa
     out = package(native, tmp_path,
                   {"index.php": "<?php echo 'A'; include __DIR__.'/a/x.php'; include __DIR__.'/b/y.php';"
                                 " echo 'Z';"}, sealed=True)
-    (out / "a").mkdir(); (out / "b").mkdir()
+    (out / "a").mkdir()
+    (out / "b").mkdir()
     (out / "a" / "x.php").write_text("<?php echo 'X';", encoding="utf-8")
     (out / "b" / "y.php").write_text("<?php echo 'Y';", encoding="utf-8")
     sep = ";" if PHP_WINDOWS else ":"                    # PHP's PATH_SEPARATOR
@@ -2869,6 +2870,8 @@ def test_o3_tracer_pid_parsing(integrity_lib, tmp_path):
 def test_o3_tracer_pid_reads_a_real_status_file(integrity_lib, tmp_path):
     """The parser against a file on disk rather than a buffer, including the "not a status file"
     case, which must come back as unknown and not as clean."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("TracerPid is a Linux /proc field; elsewhere the parser is compiled out")
     captured = tmp_path / "status"
     captured.write_text("Name:\tphp\nTracerPid:\t999\nUid:\t1000\n")
     assert integrity_lib.envelock_tracer_pid_from(str(captured).encode()) == 999
@@ -2988,7 +2991,7 @@ def _identity_check(lib, path, mode, uid=None):
         if mode is not None:
             os.chmod(path, mode)
         if uid is not None:
-            os.chown(path, uid, uid)
+            os.chown(path, uid, -1)
         libc = ctypes.CDLL(None)
         libc.fdopen.restype = ctypes.c_void_p
         libc.fdopen.argtypes = [ctypes.c_int, ctypes.c_char_p]

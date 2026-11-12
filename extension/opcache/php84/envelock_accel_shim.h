@@ -275,4 +275,16 @@ void envelock_pending_ce_cache_commit(void);
 void envelock_pending_ce_cache_discard(void);
 void envelock_get_class_name_map_ptr(zend_string *type_name);
 
+/* Keep a mapping out of core dumps where the system can: Linux has MADV_DONTDUMP; macOS has no
+ * equivalent, and there the process-wide hardening (no core dumps, no tracing) still applies. A
+ * macro, so its callers keep their line count (__LINE__ is part of their bailouts). */
+#if defined(__linux__) || defined(__APPLE__)
+# include <sys/mman.h>
+#endif
+#ifdef MADV_DONTDUMP
+# define ENVELOCK_DONTDUMP(addr, len) ((void) madvise((addr), (len), MADV_DONTDUMP))
+#else
+# define ENVELOCK_DONTDUMP(addr, len) ((void) (addr), (void) (len))
+#endif
+
 #endif /* ENVELOCK_ACCEL_SHIM_H */

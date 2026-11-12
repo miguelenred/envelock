@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from test_encoder import ROOT, a, dir_link, symlink_or_skip, windows_dacl
+from test_encoder import ROOT, a, dir_link, windows_dacl
 from test_transform import PHP, needs_php
 
 ENCODER = str(ROOT / "encoder" / "envelock.py")
@@ -715,7 +715,9 @@ def test_enc25_excluded_folder_pattern_prunes_its_content(tmp_path, material):
 
 def test_enc25_file_versus_folder_case_collision(tmp_path, material):
     files = {"main.php": b"<?php echo 1;", "lib/x.php": b"<?php echo 2;"}
-    if os.name == "nt":
+    probe = tmp_path / "case-probe"
+    probe.write_text("x")
+    if (tmp_path / "CASE-PROBE").exists():
         pytest.skip("this file system cannot hold both 'Lib' and 'lib'")
     src = source_tree(tmp_path, files)
     (src / "LIB").write_text("not a folder")

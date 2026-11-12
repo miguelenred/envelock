@@ -73,7 +73,7 @@ void envelock_arena_init(size_t size_hint)
             (void) munmap((void *) arena_base, mapped);
             arena_base = NULL;
         } else {
-            (void) madvise((void *) arena_base, usable, MADV_DONTDUMP);
+            ENVELOCK_DONTDUMP((void *) arena_base, usable);
             arena_capacity = usable;
             arena_mapped = mapped;
             ZCG(mem) = arena_base;

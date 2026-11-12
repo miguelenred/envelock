@@ -133,7 +133,8 @@ jobs:
         run: ENVELOCK_REQUIRE_NATIVE=1 python -m pytest -q tests
 
   fpm:
-    runs-on: ubuntu-22.04
+    # php8.3-fpm is in Ubuntu 24.04's archive (22.04 ships PHP 8.1 only).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -178,13 +179,20 @@ jobs:
           ref: 5f63433eb2bda2ca8d0d970fe487be84f7ab195c
           path: _builder
       - run: python -m pip install --require-hashes -r requirements.lock
-      - name: Build DLL and run native PHP integration tests (DEMO identity)
+      - name: Build DLL and run native PHP integration tests (throwaway identity)
         shell: pwsh
         run: |
           python scripts/demo_material.py --output "$env:RUNNER_TEMP/demo"
           if ($LASTEXITCODE -ne 0) { throw 'Demo setup failed' }
+          # The encoder refuses the PUBLIC demo keys (ENV-AUD-07), so the native suite runs with a
+          # throwaway identity made for this job and discarded with the runner.
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/keys" | Out-Null
+          python encoder/envelock.py init-owner --no-encrypt --out "$env:RUNNER_TEMP/keys/owner.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Throwaway owner failed' }
+          python encoder/envelock.py init-recipient --no-encrypt --label ci-throwaway --out "$env:RUNNER_TEMP/keys/recipient.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Throwaway recipient failed' }
           Import-Module "$env:GITHUB_WORKSPACE/_builder/extension/BuildPhpExtension/BuildPhpExtension.psm1" -Force
-          ./scripts/build-windows.ps1 -Owner "$env:RUNNER_TEMP/demo/owner.json" -Recipient "$env:RUNNER_TEMP/demo/recipient.json" -PhpVersion '${{ matrix.php }}' -ThreadSafety '${{ matrix.thread }}' -OutputDirectory "$env:GITHUB_WORKSPACE/release"
+          ./scripts/build-windows.ps1 -Owner "$env:RUNNER_TEMP/keys/owner.json" -Recipient "$env:RUNNER_TEMP/keys/recipient.json" -PhpVersion '${{ matrix.php }}' -ThreadSafety '${{ matrix.thread }}' -OutputDirectory "$env:GITHUB_WORKSPACE/release"
           Copy-Item "$env:RUNNER_TEMP/demo/DEMO_ONLY.txt" release/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -287,9 +295,12 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
       - run: python -m pip install --require-hashes -r requirements.lock
       - name: Build a bytecode-capable loader and report per-file cost
+        # bench.py packs bytecode with the same loader it measures, so it needs the pack-time emitter
+        # (--enable-envelock-bcemit; never in a server loader, which build-unix.sh builds).
         run: |
-          bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
-          python scripts/bench.py "$RUNNER_TEMP/envelock.so" "$(command -v php)"
+          cp -R extension "$RUNNER_TEMP/ext"
+          ( cd "$RUNNER_TEMP/ext" && phpize && ./configure --enable-envelock --enable-envelock-bcemit && make -j2 )
+          python scripts/bench.py "$RUNNER_TEMP/ext/modules/envelock.so" "$(command -v php)"
 
 # DO NOT inject production keys into public pull-request builds. DEMO material is public by design.
 # Download each artifact and inspect logs/tests before announcing support for any platform;

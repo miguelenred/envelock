@@ -62,7 +62,7 @@ BRANCH_INPUTS = ((0.0, 0), (1.5, -2), (3, 1), (0, None), (None, [1]), ("0", "x")
 
 
 def _virtualize(source: str) -> tuple[str | None, str]:
-    result = subprocess.run(  # nosec B603 - fixed command, no shell
+    result = subprocess.run(  # nosec B603 B607 - fixed command, the developer's php, no shell
         ["php", "-d", "display_errors=stderr", str(VIRTUALIZE)],
         input=json.dumps({"files": {"a.php": base64.b64encode(source.encode()).decode()},
                           "marked": ["f"]}).encode(),
@@ -73,12 +73,12 @@ def _virtualize(source: str) -> tuple[str | None, str]:
 
 
 def _run_php(code: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["php", "-n", "-r", code],  # nosec B603 - fixed command
+    return subprocess.run(["php", "-n", "-r", code],  # nosec B603 B607 - fixed command, the developer's php
                           capture_output=True, text=True, errors="replace", timeout=60, check=False)
 
 
 def _run_vm(loader: Path, program: str, args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(  # nosec B603 - fixed command, no shell
+    return subprocess.run(  # nosec B603 B607 - fixed command, the developer's php, no shell
         ["php", "-n", "-d", f"extension={loader}", "-r",
          HANDLER + TAIL % f"__envelock_vm({program!r}, [{args}])"],
         capture_output=True, text=True, errors="replace", timeout=60, check=False)

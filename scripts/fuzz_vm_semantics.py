@@ -75,7 +75,7 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.count <= 3000 or not args.loader.is_file():
         parser.error("--count must be 1..3000 and --loader must be an existing extension")
-    rng = random.Random(args.seed)
+    rng = random.Random(args.seed)  # nosec B311 - seeded, reproducible fuzz inputs, not crypto
     expressions = []
     for i in range(args.count):
         if i % 7 == 0:

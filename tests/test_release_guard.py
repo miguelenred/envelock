@@ -307,7 +307,6 @@ def test_upstream_rules_human_coauthors_binaries_links_and_allowed_phrases(tmp_p
     """In hash-locked upstream folders: a human co-author line is not a marker, random bytes of a
     binary are not searched, BOM-less UTF-16 text is, a symbolic link is refused, and a "!"
     phrase in forbidden-terms.txt (e.g. a person's name) is not a finding."""
-    import os
     _fake_repository(tmp_path, [])
     lib = tmp_path / "third_party" / "lib-1.0"
     lib.mkdir(parents=True)
@@ -366,7 +365,6 @@ def test_text_with_a_stray_nul_or_in_utf32_is_still_searched(tmp_path):
 def test_prebuilt_areas_secrets_reports_and_linked_folders(tmp_path):
     """prebuilt/: each area holds only its kind of file and no key, password, backup or log even
     when listed; report formats (.xml, .cmd) are scanned; a linked top folder is refused."""
-    import os
     _fake_repository(tmp_path, [])
     for rel in ("loader/linux/envelock.so", "loader/linux/notes.txt", "python/x/tls.key",
                 "python/x/owner.enc.json", "python/x/build.log", "python/x/cacert.pem"):
@@ -526,6 +524,8 @@ def test_staged_tree_that_looks_like_the_repository_is_fully_checked(tmp_path):
     assert "leak.txt" not in out and ".venv/x.json" not in out   # reported as folders
     (tmp_path / ".git").mkdir()                                    # now a live working tree
     out = guard(tmp_path).stdout
+    for root in (str(tmp_path.resolve()), str(tmp_path)):          # macOS: /private/var/... root
+        out = out.replace(root, "<root>")
     for skipped in ("private/", "private:", "dist/", "dist:", ".venv", "app/.git", "__pycache__"):
         assert skipped not in out, (skipped, out)
     for expected in ("app/stray.pyc", "conf/server.conf:1", "conf/prod.json:2: encrypted private key"):
