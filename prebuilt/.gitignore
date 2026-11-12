@@ -1,0 +1,16 @@
+# Every file here is committed and listed in SHA256SUMS: override the repository-wide
+# ignore patterns for compiled files (*.so, *.dll, ...).
+!*
+!*/
+# ...except the caches the portable Python writes when it runs (never committed).
+__pycache__/
+*.pyc
+# ...but never Envelock keys, identities or passwords (also refused by scripts/check_release.py).
+*.enc.json
+owner*.json
+recipient*.json
+installation*.json
+identity*.bin
+generated_keys.h
+audit_keys.h
+*password*.txt

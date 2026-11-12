@@ -1,0 +1,25 @@
+{
+  "generated": "2026-11-02T12:24:01Z",
+  "format": "ENVLK02",
+  "identity": "ENVLKID2",
+  "environment": {
+    "python": "3.13.17",
+    "php": "8.3.6",
+    "openssl": "OpenSSL 3.0.13 30 Jan 2024",
+    "uname": "Linux-6.18.44-fc-v185-x86_64-with-glibc2.39"
+  },
+  "note": "Hashes of the exact sources audited/compiled on this machine. Multi-version matrix, libFuzzer and Windows/macOS come from CI.",
+  "targets": {
+    "extension/envelock.c": "sha256:02dac5ded8d805c8fd4debec7a1a0455412ae8ae7c0197e43f6959ca594d2722",
+    "extension/envelock_crypto.c": "sha256:eb5cb27356b9c1e58068775b0e35eb9cfe23cce9914f61430f9fcd193b38f7c4",
+    "extension/envelock_crypto.h": "sha256:a6e82cbae07b5463b05045069fc8ec329d406677a4aaea5d09d6131ae60a2cd4",
+    "extension/envelock_file.c": "sha256:e1c2f901e49ec0f358503fbc4391d81142d8ae8433371f33185d347e7bbb4d2e",
+    "extension/envelock_file.h": "sha256:4a403a2fa258990532dfffa36d867483f30993dbed5d37f2786cee94532ad472",
+    "extension/config.m4": "sha256:2684c636ceafb8f23b6d34cb1221a3a642d15ea09ca1f335cf0bcce5d32f7deb",
+    "extension/config.w32": "sha256:f521a81ff926270ce3fccd1d1f010013d92e9480d422749f7c3a4463c850b4b5",
+    "encoder/envelock.py": "sha256:081db23d037c97233e6bcb5349a75183bcc3e8029bfce1e97101d4c3b51c6485",
+    "scripts/build-unix.sh": "sha256:7a455d3751a551019d1797c67b7375f69dc4a03f45b63dcc3eff9332424a6a38",
+    "scripts/build-windows.ps1": "sha256:6cfb6bcec6e5253f99b70f45a1d116810a3935b230c90f77d18c7e8b47411447",
+    "CMakeLists.txt": "sha256:95b648548c56440a521ece18f189d23d9e36ca2b5f44701f2574b7ad752237a4"
+  }
+}

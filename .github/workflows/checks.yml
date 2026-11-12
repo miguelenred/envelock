@@ -1,0 +1,296 @@
+name: Native builds and regression tests (PUBLIC DEMO KEYS)
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+
+# This workflow runs on GitHub-hosted runners. It is NOT executed by the authoring
+# environment. All artifacts use PUBLIC DEMO keys (scripts/demo_material.py) and are
+# marked DEMO_ONLY; they must never be used to protect a real product.
+
+jobs:
+  static:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: Ruff / Bandit / pip-audit
+        # The assistant (gui/) handles owner keys and passwords and every script in scripts/ runs
+        # on the developer's machine: lint and audit all of them, not a hand-kept subset.
+        run: |
+          ruff check encoder tests gui scripts
+          bandit -q -r encoder gui scripts
+          pip-audit --require-hashes -r requirements.lock
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: phpize
+      - name: Clang static analyzer (fails the job on any diagnostic)
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
+          clang --analyze -Xclang -analyzer-werror -Xanalyzer -analyzer-output=text \
+            $(pkg-config --cflags libcrypto) extension/envelock_crypto.c -o /dev/null
+          clang --analyze -Xclang -analyzer-werror -Xanalyzer -analyzer-output=text \
+            extension/envelock_file.c -o /dev/null
+          clang --analyze -Xclang -analyzer-werror -Xanalyzer -analyzer-output=text \
+            $(php-config --includes) extension/envelock.c -o /dev/null
+      - name: Release guard (no private/personal/AI-attribution material)
+        run: python scripts/check_release.py .
+      - name: Bytecode layers keep every hardening construct (a regenerated layer must not drop them)
+        run: python scripts/check_bc_layers.py
+
+  fuzz:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: phpize
+      - run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config autoconf
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: libFuzzer + ASan/UBSan campaign (crypto core)
+        env:
+          ENVELOCK_FUZZ_RUNS: '2000000'
+        run: bash scripts/audit-native.sh "$RUNNER_TEMP/audit"
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 was retired on 2026-11-02; macos-15 is Apple silicon (arm64).
+        os: [ubuntu-22.04, macos-15]
+        php: ['8.2', '8.3', '8.4', '8.5']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: phpize
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 pkgconf autoconf >/dev/null 2>&1 || brew install openssl@3 pkgconf autoconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Full suite with real native build (incl. OPcache coexistence tests)
+        run: ENVELOCK_REQUIRE_NATIVE=1 python -m pytest -q tests
+      - name: Build generic DEMO module + hashes
+        run: |
+          python scripts/demo_material.py --output "$RUNNER_TEMP/demo"
+          bash scripts/build-unix.sh "release/envelock.so"
+          cp "$RUNNER_TEMP/demo/DEMO_ONLY.txt" release/
+          php -n -v > release/runtime.txt; uname -a >> release/runtime.txt
+          ( cd release && for f in *; do [ "$f" = SHA256SUMS.txt ] && continue; shasum -a 256 "$f"; done > SHA256SUMS.txt )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DEMO-${{ runner.os }}-${{ runner.arch }}-php-${{ matrix.php }}-nts
+          path: release/
+          if-no-files-found: error
+
+  linux-arm64:
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: phpize
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Full suite on ARM64 (CET flag is skipped automatically on non-x86-64)
+        run: ENVELOCK_REQUIRE_NATIVE=1 python -m pytest -q tests
+
+  fpm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: phpize
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf php8.3-fpm libfcgi-bin
+      - run: python -m pip install --require-hashes -r requirements.lock
+      # Real FPM SAPI test: php-fpm + FastCGI requests (protected, plain, tampered, OPcache
+      # refusal, opt-in + blacklist not cached, and a control proving the probe sees caching).
+      - name: FPM smoke (real requests)
+        run: |
+          bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
+          # As root: also covers the production layout (root master, unprivileged pool).
+          sudo -E env "PATH=$PATH" python scripts/fpm_smoke.py "$(command -v php-fpm8.3)" "$RUNNER_TEMP/envelock.so" "$(php-config --extension-dir)/opcache.so"
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+        thread: [nts, ts]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Fetch pinned official Windows builder
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          repository: php/php-windows-builder
+          ref: 5f63433eb2bda2ca8d0d970fe487be84f7ab195c
+          path: _builder
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Build DLL and run native PHP integration tests (DEMO identity)
+        shell: pwsh
+        run: |
+          python scripts/demo_material.py --output "$env:RUNNER_TEMP/demo"
+          if ($LASTEXITCODE -ne 0) { throw 'Demo setup failed' }
+          Import-Module "$env:GITHUB_WORKSPACE/_builder/extension/BuildPhpExtension/BuildPhpExtension.psm1" -Force
+          ./scripts/build-windows.ps1 -Owner "$env:RUNNER_TEMP/demo/owner.json" -Recipient "$env:RUNNER_TEMP/demo/recipient.json" -PhpVersion '${{ matrix.php }}' -ThreadSafety '${{ matrix.thread }}' -OutputDirectory "$env:GITHUB_WORKSPACE/release"
+          Copy-Item "$env:RUNNER_TEMP/demo/DEMO_ONLY.txt" release/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DEMO-Windows-X64-php-${{ matrix.php }}-${{ matrix.thread }}
+          path: release/
+          if-no-files-found: error
+  frameworks:
+    # Objective O11: real Laravel and Symfony apps, protected vs unprotected, byte for byte.
+    # This runs on GitHub-hosted runners (Composer + network), which the authoring sandbox lacks;
+    # it exercises PSR-4 autoloading of files whose source is gone, reflection over constructor
+    # parameters, PHP 8 attribute route discovery and Eloquent table resolution under the loader.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: phpize, composer
+          extensions: tokenizer, sqlite3, pdo_sqlite, mbstring, intl, dom, xml, curl, zip, gd, fileinfo, bcmath, ctype, session, simplexml
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - run: python -m pip install --require-hashes -r requirements.lock
+      # The served loader is a production build, which never has envelock_bc_emit (build-unix.sh
+      # refuses one that does); the bytecode is compiled by a separate pack-time emitter build of the
+      # same PHP. Neither is copied into prebuilt/.
+      - name: Build the 8.4 server loader and a pack-time bytecode emitter (never shipped)
+        run: |
+          bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
+          cp -R extension "$RUNNER_TEMP/emitter-src"
+          ( cd "$RUNNER_TEMP/emitter-src" && phpize && ./configure --enable-envelock --enable-envelock-bcemit && make -j2 )
+      - name: Create disposable Laravel and Symfony fixtures (Composer + network)
+        run: python scripts/create-framework-fixtures.py --root "$RUNNER_TEMP/fw"
+      - name: Protected vs unprotected must be identical (bytecode O1 + obfuscation defaults)
+        run: |
+          ENVELOCK_FW_LARAVEL="$RUNNER_TEMP/fw/laravel" \
+          ENVELOCK_FW_SYMFONY="$RUNNER_TEMP/fw/symfony" \
+          ENVELOCK_FW_LOADER="$RUNNER_TEMP/envelock.so" \
+          ENVELOCK_FW_EMITTER="$RUNNER_TEMP/emitter-src/modules/envelock.so" \
+          python -m pytest -q tests/test_frameworks.py
+
+  static-php:
+    # Objective O10: Envelock linked INTO a statically built CLI PHP (the engine half of a
+    # single-binary appliance; the FrankenPHP wrapper is a separate Go build, see docs/MANUAL.md).
+    # The PHP source is pinned to php.net's own published sha256 at run time, so no hash is baked
+    # into this file. For a production appliance, prefer GPG verification of the release signature.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: phpize
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config autoconf bison re2c
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Fetch the official PHP source and verify its php.net sha256
+        run: |
+          set -euo pipefail
+          curl -fsSL 'https://www.php.net/releases/?json&version=8.4&max=1' -o "$RUNNER_TEMP/meta.json"
+          read -r NAME SHA < <(python3 -c '
+          import json, sys
+          rel = next(iter(json.load(open(sys.argv[1])).values()))
+          tgz = [f for f in rel["source"] if f["filename"].endswith(".tar.gz")][0]
+          print(tgz["filename"], tgz["sha256"])' "$RUNNER_TEMP/meta.json")
+          curl -fsSLo "$RUNNER_TEMP/$NAME" "https://www.php.net/distributions/$NAME"
+          echo "$SHA  $RUNNER_TEMP/$NAME" | sha256sum -c -
+          echo "PHP_TARBALL=$RUNNER_TEMP/$NAME" >> "$GITHUB_ENV"
+      - name: Build a static CLI PHP with the loader compiled in
+        run: bash scripts/build-static-php.sh "$PHP_TARBALL" "$RUNNER_TEMP/php-static"
+      - name: O10 tests against the static build (loader present with no -d extension=)
+        run: ENVELOCK_STATIC_PHP="$RUNNER_TEMP/php-static" python -m pytest -q tests/test_native.py -k o10
+
+  bench:
+    # Performance reporting (docs/RENDIMIENTO.md). Prints plain vs protected vs bytecode us/file so a
+    # regression in the hot path is visible in the run log. Not a hard gate: runner speed varies, so
+    # absolute thresholds would be flaky; read the numbers, and compare across runs on the same runner.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: phpize
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Build a bytecode-capable loader and report per-file cost
+        run: |
+          bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
+          python scripts/bench.py "$RUNNER_TEMP/envelock.so" "$(command -v php)"
+
+# DO NOT inject production keys into public pull-request builds. DEMO material is public by design.
+# Download each artifact and inspect logs/tests before announcing support for any platform;
+# a green run with skipped combinations does not prove production readiness.

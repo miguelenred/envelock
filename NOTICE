@@ -1,0 +1,75 @@
+Envelock
+Copyright 2026 Miguel Sanchez
+
+This product includes software developed by Miguel Sanchez.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. A copy of the License
+is in the LICENSE file and at http://www.apache.org/licenses/LICENSE-2.0
+
+This project is directed by Miguel Sanchez and assisted by artificial
+intelligence. The concept, architecture, functional and technical
+specification, design decisions, priorities, acceptance criteria and review
+are the author's. The implementation -- source code, test suites, benchmarks
+and documentation -- is produced with the help of several AI models, working
+from that specification and under the author's direction, and reviewed by him
+before being kept. Every design decision and every trade-off was made by a
+human; no line ships without his review. See the AUTHORS file.
+
+Project page: https://miguelenred.es/envelock
+
+The Apache-2.0 license does not require it, but if you build on or ship
+Envelock, a visible acknowledgement such as "Powered by Envelock", linking
+https://miguelenred.es/envelock, is appreciated.
+
+------------------------------------------------------------------------------
+Third-party components
+
+This repository includes the source code of the third-party libraries Envelock
+uses (third_party/, unmodified except as listed in third_party/README.md) and
+compiled copies of them (prebuilt/python-wheels/, the official builds):
+
+  * OpenSSL 4.0.3 (https://www.openssl.org/) -- Apache License 2.0.
+    Bundled statically in the cryptography wheels. The native loader links
+    against the system's OpenSSL 3 (libcrypto) for X25519, HKDF, AES-256-GCM,
+    Ed25519 and SHA-256; that library is provided by the server, not shipped.
+
+  * Python "cryptography" 50.0.2 (https://cryptography.io/) -- Apache License
+    2.0 or BSD-3-Clause, and the 32 Rust crates it is built from
+    (third_party/cryptography-50.0.2/vendor/, each with its own license file:
+    MIT, Apache-2.0, BSD-3-Clause, Unicode-3.0 and dual-licensed
+    combinations; see third_party/README.md). Used by the encoder and the
+    assistant.
+
+  * cffi 2.1.1 (https://cffi.readthedocs.io/) -- MIT-0, including libffi
+    (MIT) for Windows.
+
+  * pycparser 3.11 and 3.12 (https://github.com/eliben/pycparser) --
+    BSD-3-Clause.
+
+  * nikic/php-parser (https://github.com/nikic/PHP-Parser) -- BSD-3-Clause,
+    copyright 2011 Nikita Popov. Source in third_party/php-parser/, used by the
+    encoder's AST obfuscator (objective O6). It runs at pack time only and is
+    not shipped in the loader.
+
+  * typing_extensions 4.16.0 (https://github.com/python/typing_extensions) --
+    Python Software Foundation License 2.0. Needed by cryptography on
+    Python 3.10 only.
+
+  * CPython 3.13.15 (https://www.python.org/) -- Python Software Foundation
+    License 2.0. Source in third_party/cpython-3.13.15/. The portable Python in
+    prebuilt/python/ (official python-build-standalone builds) also bundles
+    OpenSSL 3.5.8 (Apache-2.0), SQLite (public domain), zlib, bzip2, xz,
+    expat, libffi, mpdecimal, Tcl/Tk, and on Linux/macOS ncurses, libedit,
+    libuuid and Berkeley DB 6.0.19 (Sleepycat license; source link in
+    prebuilt/README.md), on Linux libX11/libXau/libxcb, on Windows the
+    Microsoft Visual C++ runtime, and pip. Their license texts are in
+    prebuilt/python/<system>/licenses/; versions and source links in
+    prebuilt/README.md.
+
+The assistant executables additionally bundle the Python runtime (Python
+Software Foundation License) and these libraries.
+
+Their licenses and notices apply to those components; each one's full license
+text is in its folder under third_party/ (libraries) or prebuilt/python/<system>/licenses/
+(portable Python).

@@ -1,0 +1,25 @@
+Envelock -- authorship
+=======================
+
+Author and director: Miguel Sanchez
+Project page: https://miguelenred.es/envelock
+
+This project is directed by Miguel Sanchez and assisted by artificial
+intelligence.
+
+The concept, the architecture, the functional and technical specification, the
+design decisions, the priorities, the acceptance criteria and the review are
+the author's. The implementation -- the source code (Python encoder, C loader
+extension and the graphical assistant), the test suites, the benchmarks and the
+documentation -- is produced with the help of several AI models, working from
+that specification and under the author's direction, and reviewed by him before
+being kept.
+
+Every design decision and every trade-off was made by a human. No line ships
+without his review.
+
+The Apache-2.0 license does not require it, but if you build on or ship Envelock,
+a visible acknowledgement such as "Powered by Envelock", linking
+https://miguelenred.es/envelock, is appreciated.
+
+See NOTICE for copyright and third-party components, and LICENSE for the terms.

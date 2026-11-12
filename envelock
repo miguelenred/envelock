@@ -1,0 +1,58 @@
+#!/bin/sh
+# Run the encoder with a separately supplied portable Python in prebuilt/python.
+# Usage: ./envelock <command> [options]      e.g.  ./envelock new-project
+# -E -s: ignore PYTHON* variables and the user's site-packages, so only the bundled libraries run.
+set -eu
+self=$0
+while [ -L "$self" ]; do                 # called through a link (e.g. one placed on PATH)
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname -- "$self")/$link ;;
+  esac
+done
+root=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd)
+script=$root/encoder/envelock.py
+os=$(uname -s)
+arch=$(uname -m)
+python=""
+why=""
+case $os in
+  Linux)
+    if ldd --version 2>&1 | grep -qi musl; then
+      why="musl C library; the portable Python needs glibc"
+    elif [ "$(getconf LONG_BIT 2>/dev/null || echo 64)" = 32 ]; then
+      why="32-bit system"
+    else
+      case $arch in
+        x86_64) python=$root/prebuilt/python/linux-x86_64/bin/python3.13 ;;
+        aarch64 | arm64) python=$root/prebuilt/python/linux-arm64/bin/python3.13 ;;
+      esac
+      glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+      major=${glibc%%.*}
+      minor=${glibc#*.}
+      minor=${minor%%.*}
+      if [ -n "$python" ] && [ -n "$glibc" ] && { [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 28 ]; }; }; then
+        python=""
+        why="glibc $glibc; 2.28 or newer is needed"
+      fi
+    fi ;;
+  Darwin)
+    [ "$arch" = arm64 ] && python=$root/prebuilt/python/macos-arm64/bin/python3.13 ;;
+  MINGW* | MSYS* | CYGWIN*)              # Git Bash, MSYS2, Cygwin on Windows
+    python=$root/prebuilt/python/windows-x64/python.exe
+    if command -v cygpath >/dev/null 2>&1; then script=$(cygpath -w "$script"); fi ;;
+esac
+# A platform may be supported but its bundle absent (e.g. a partial checkout, or a build that
+# shipped only some architectures): fall through to the same guided exit 2 rather than letting
+# exec fail with a cryptic "not found" 127 (L-10).
+if [ -n "$python" ] && [ ! -x "$python" ]; then
+  why="the bundled interpreter is missing at prebuilt/python"
+  python=""
+fi
+if [ -z "$python" ]; then
+  echo "No portable Python for $os $arch${why:+ ($why)}. Use Python 3.10+ with the" >&2
+  echo "encoder's requirements instead: see docs/MANUAL.md, section 4." >&2
+  exit 2
+fi
+exec "$python" -E -s "$script" "$@"

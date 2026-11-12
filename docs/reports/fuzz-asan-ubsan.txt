@@ -1,0 +1,12 @@
+Envelock crypto core — gcc AddressSanitizer + UndefinedBehaviorSanitizer exerciser
+date: 2026-11-02T12:24:01Z
+inputs: 1 valid small blob (all single-byte mutations + all truncations + 1 append),
+        1 valid 100 KiB blob, and 200000 pseudo-random inputs (seed 1234).
+paths: envelock_decrypt (signature first), envelock_verify, envelock_decrypt_verified,
+       envelock_decrypt_with_key, envelock_package_digest, and the loader path
+       envelock_unwrap_key + envelock_decrypt_with_key_into (into a caller buffer and in place)
+       (post-signature parsing/KEM/GCM reached even by mutated inputs).
+note: this is a bounded deterministic exerciser, NOT the libFuzzer campaign (CI).
+---
+exerciser completed
+result: no AddressSanitizer/UndefinedBehaviorSanitizer errors.

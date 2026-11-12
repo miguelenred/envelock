@@ -1,0 +1,3 @@
+# Upstream sources are stored byte for byte: no end-of-line conversion (the vendored Rust
+# crates are checked by cargo against per-file SHA-256 sums, and third_party/SHA256SUMS too).
+* -text

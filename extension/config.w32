@@ -1,0 +1,78 @@
+// PHP SDK build configuration (Windows). Must mirror config.m4. Native Windows validation still
+// required (CI job "windows" via scripts/build-windows.ps1 + php/php-windows-builder).
+ARG_ENABLE("envelock", "Offline Envelock loader", "no");
+// Pack/test-only PoC userland functions, split per config.m4 (ENV-2026-02): --enable-envelock-bcemit
+// builds the emitter (envelock_bc_emit); --enable-envelock-bcrun-unsafe builds the runner
+// (envelock_bc_run), which deserializes caller bytes through the OPcache unserializer and is INSECURE
+// on a server. Both default "no"; a server/production DLL enables NEITHER. (The old single
+// "envelock-bcpoc" flag defined ENVELOCK_BCPOC, a macro the C no longer reads, and is removed.)
+ARG_ENABLE("envelock-bcemit", "Envelock bytecode emitter PoC (pack/test only)", "no");
+// Keep semicolons out of the option help strings below, and never write the option-function names
+// in a comment: phpize copies every match of /ARG_(ENABLE|WITH)[^;]+;/ (comments included) into
+// configure.js, so a stray semicolon or name truncates it ("unterminated string constant").
+ARG_ENABLE("envelock-bcrun-unsafe", "Envelock bytecode runner PoC (INSECURE, do NOT ship on servers)", "no");
+if (PHP_ENVELOCK != "no") {
+    var envelock_openssl = SETUP_OPENSSL("envelock", PHP_ENVELOCK);
+    if (envelock_openssl >= 2) {
+        // Objective O1: the bytecode layer is vendored per PHP minor under opcache\php<MM>\ and is
+        // OPTIONAL, exactly as on POSIX (config.m4). When the matching copy exists it is compiled in
+        // and the loader runs bytecode packages; otherwise a source-only loader is built that refuses
+        // a FLAG_BYTECODE file at run time. Generate a layer with extension/opcache/gen_persist.py.
+        var mm = "php" + PHP_VERSION + PHP_MINOR_VERSION;        // e.g. "php84"
+        var extdir = configure_module_dirname;                  // directory holding this config.w32
+        var bcdir = extdir + "\\opcache\\" + mm;
+        // ENV-2026-03: the bytecode layer keeps its state in process globals and is not thread-safe,
+        // so a thread-safe (ZTS) loader is built source-only, exactly as config.m4 and
+        // scripts/build-windows-wine.sh do (envelock_accel_shim.h #errors on ZTS as a backstop).
+        var envelock_zts = (PHP_ZTS == "yes");
+        var have_bc = (!envelock_zts && FSO.FileExists(bcdir + "\\envelock_bc.c")) ? 1 : 0;
+
+        // Core loader + every 2.0 module (secret/integrity/licence/clock/trusted_time = O2/O3/O8,
+        // vm = O4). This list must stay in sync with PHP_NEW_EXTENSION in config.m4.
+        var sources = "envelock.c envelock_crypto.c envelock_file.c " +
+                      "envelock_secret.c envelock_integrity.c envelock_licence.c " +
+                      "envelock_clock.c envelock_trusted_time.c envelock_vm.c";
+        if (have_bc) {
+            sources += " envelock_bcpoc.c";
+        }
+        EXTENSION("envelock", sources);
+
+        if (have_bc) {
+            ADD_SOURCES(bcdir, "envelock_arena.c envelock_bc.c envelock_persist.c " +
+                        "envelock_file_cache.c envelock_script.c", "envelock");
+            ADD_FLAG("CFLAGS_ENVELOCK", "/I \"" + bcdir + "\"");
+        } else if (envelock_zts) {
+            WARNING("Envelock: thread-safe (ZTS) engine, building a source-only loader. The bytecode " +
+                    "layer is not ZTS-safe (ENV-2026-03) and is omitted, FLAG_BYTECODE files are refused at run time.");
+        } else {
+            WARNING("Envelock: no bytecode layer for PHP " + PHP_VERSION + "." + PHP_MINOR_VERSION +
+                    "; building a source-only loader (FLAG_BYTECODE refused at run time).");
+        }
+        // envelock.c reads ENVELOCK_HAVE_BYTECODE to guard the whole bytecode path.
+        ADD_FLAG("CFLAGS_ENVELOCK", "/D ENVELOCK_HAVE_BYTECODE=" + have_bc);
+        // Split emit/run gating, mirroring config.m4 (ENV-2026-02). A server/production DLL passes
+        // neither flag, so neither PoC function is compiled in.
+        if (PHP_ENVELOCK_BCEMIT == "yes") {
+            ADD_FLAG("CFLAGS_ENVELOCK", "/D ENVELOCK_BCEMIT=1");
+        }
+        if (PHP_ENVELOCK_BCRUN_UNSAFE == "yes") {
+            // As config.m4: the test runner round-trips emit -> run, so it defines the emitter too.
+            ADD_FLAG("CFLAGS_ENVELOCK", "/D ENVELOCK_BCEMIT=1 /D ENVELOCK_BCRUN=1");
+        }
+
+        // Match the hardening of the Wine build (scripts/build-windows-wine.sh): Control Flow Guard,
+        // ASLR/high-entropy, DEP and CET shadow stack. (M-01: build-windows.ps1 relied on the
+        // module's defaults and could ship an unhardened DLL.)
+        ADD_FLAG("CFLAGS_ENVELOCK", "/guard:cf");
+        ADD_FLAG("LDFLAGS_ENVELOCK", "/guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /CETCOMPAT");
+
+        // No build-machine paths in a shipped DLL (they leak the builder's user name through the
+        // TEMP build directory): OpenSSL's memory macros pass __FILE__ unless OPENSSL_NO_FILENAMES
+        // is defined, and the linker records the absolute .pdb path unless /PDBALTPATH names just
+        // the file (written out, not the linker's percent-sign token, which nmake mangles).
+        ADD_FLAG("CFLAGS_ENVELOCK", "/D OPENSSL_NO_FILENAMES");
+        ADD_FLAG("LDFLAGS_ENVELOCK", "/PDBALTPATH:php_envelock.pdb");
+    } else {
+        ERROR("Envelock requires the PHP SDK OpenSSL development dependencies (OpenSSL 3.x).");
+    }
+}

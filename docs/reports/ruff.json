@@ -1,0 +1,21 @@
+[
+  {
+    "cell": null,
+    "code": "E702",
+    "end_location": {
+      "column": 43,
+      "row": 657
+    },
+    "filename": "tests/test_hardening.py",
+    "fix": null,
+    "location": {
+      "column": 42,
+      "row": 657
+    },
+    "message": "Multiple statements on one line (semicolon)",
+    "name": "multiple-statements-on-one-line-semicolon",
+    "noqa_row": 657,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/multiple-statements-on-one-line-semicolon"
+  }
+]

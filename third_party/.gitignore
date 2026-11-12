@@ -1,0 +1,13 @@
+# Upstream sources are committed complete: override the repository-wide ignore patterns
+# (build/, *.obj, *.dll, ...) that would otherwise drop files the build needs.
+!*
+!*/
+# ...but never Envelock keys, identities or passwords (also refused by scripts/check_release.py).
+*.enc.json
+owner*.json
+recipient*.json
+installation*.json
+identity*.bin
+generated_keys.h
+audit_keys.h
+*password*.txt

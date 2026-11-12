@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(envelock_crypto_tests C)
+# Portable cryptographic core ONLY. Build PHP modules using phpize/PHP SDK.
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+add_library(envelock_crypto SHARED extension/envelock_crypto.c)
+target_link_libraries(envelock_crypto PRIVATE OpenSSL::Crypto)
+target_compile_features(envelock_crypto PRIVATE c_std_11)
+set_target_properties(envelock_crypto PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+if(MSVC)
+  target_compile_options(envelock_crypto PRIVATE /W4 /GS)
+else()
+  target_compile_options(envelock_crypto PRIVATE -Wall -Wextra -Werror -fstack-protector-strong)
+endif()
