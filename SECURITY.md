@@ -16,4 +16,4 @@ Include version, OS, architecture, PHP/ABI/TS, configuration, impact, minimal re
 
 ## Operation
 
-Keep PHP/OpenSSL/dependencies up to date, restrict permissions, isolate clients and protect the packaging machine. See `docs/SEGURIDAD.md`, `docs/AUDITORIA.md` and `docs/MANUAL.md` before commercializing.
+Keep PHP/OpenSSL/dependencies up to date, restrict permissions, isolate clients and protect the packaging machine. See `docs/SEGURIDAD.md`, `docs/AUDITORIA.md` and `docs/MANUAL.md` before relying on it in production.

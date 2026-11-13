@@ -1981,7 +1981,7 @@ PHP_RSHUTDOWN_FUNCTION(envelock)
 PHP_MINFO_FUNCTION(envelock)
 {
     php_info_print_table_start();
-    php_info_print_table_row(2, "Envelock", "1.0.0 experimental / offline");
+    php_info_print_table_row(2, "Envelock", "1.0.0 / offline");
     php_info_print_table_row(2, "Format", "X25519+HKDF-SHA256+AES-256-GCM + Ed25519 / v2");
     php_info_print_table_row(2, "Trust store",
         (envelock_identity.recipient_count > 0 && envelock_identity.signer_count > 0)

@@ -1,7 +1,7 @@
 # Envelock
 
 **Offline encoder and loader extension for PHP 8.2–8.5.**  
-Version **1.0.0 experimental** · Python + C + OpenSSL 3 · Apache-2.0 license.  
+Version **1.0.0** · Python + C + OpenSSL 3 · Apache-2.0 license.  
 Project page: **[miguelenred.es/envelock](https://miguelenred.es/envelock)** · Source: **[github.com/miguelenred/envelock](https://github.com/miguelenred/envelock)**
 
 Distribute PHP projects without shipping their files in readable text. A **generic** extension (with no embedded keys) verifies each file's signature, unwraps the content key with the recipient's private key, decrypts in memory and hands the result to PHP's normal compiler. The private key and the trusted signer are read from an external identity file pointed to by `envelock.identity` in `php.ini`. A single host can serve several projects from different folders, each encrypted with different keys.
@@ -12,6 +12,7 @@ Distribute PHP projects without shipping their files in readable text. A **gener
 
 A window-based **assistant** (Spanish/English) wraps the whole flow for less technical users: `python gui/envelock_gui.py`, or build a standalone executable with `bash scripts/build-gui.sh` (see the [assistant guide](docs/ASSISTANT.md), which also gives the equivalent command for every button).
 
+- **[Quick start: encrypt your PHP project, step by step](docs/QUICKSTART.md)**
 - **[Full manual: how it works, usage and installation](docs/MANUAL.md)**
 - [Assistant guide, tab by tab, with the equivalent commands](docs/ASSISTANT.md)
 - **[Server requirements and hosting compatibility: dependencies, php.ini, what each kind of hosting allows, pre-flight check](docs/HOSTING.md)**
@@ -49,7 +50,7 @@ The loader module is **generic**: the same binary (per ABI/OS/architecture/TS) s
 - OPcache coexistence: protected files refused by default when its SHM cache is on, with an explicit opt-in (`envelock.allow_opcache` + `opcache.blacklist_filename`); if the blacklist is missing or wrong the loader fails closed rather than cache decrypted opcodes. `file_cache`/preloading always refused. Tampered files and packages not addressed to the server's identity are rejected. `envelock.harden_memory` (on by default) locks the loaded keys into RAM and marks the process non-dumpable; set it to `0` to allow a profiler or core dump.
 - Exclusion of common secrets and rejection of assets with visible PHP, dangerous backups and non-portable paths.
 - At loader runtime, explicit source buffers are cleared after compiling and no temporary decrypted PHP files are written. Offline bytecode compilation separately uses temporary source files at the specified deploy path.
-- Experimental opt-in AST renaming for closed code can be restricted with a strict per-symbol allowlist; it is **not** suitable for frameworks or PSR-4/classmap applications. See [MANUAL.md §14](docs/MANUAL.md#14-frameworks-composer-and-assets).
+- Opt-in AST renaming for closed code can be restricted with a strict per-symbol allowlist; it is **not** suitable for frameworks or PSR-4/classmap applications. See [MANUAL.md §14](docs/MANUAL.md#14-frameworks-composer-and-assets).
 
 ## Quick start
 
@@ -112,11 +113,11 @@ Do not publish `owner*.json`, `recipient*.json`, identity files `identity*.bin`,
 
 ## Pending scope
 
-The experimental code includes signed licence constraints (including expiry and a machine fingerprint) and a quarantined mini-VM restricted to unsafe laboratory research (not production), but there is no general online revocation or TPM/DPAPI sealing of the server identity. Real control-flow flattening and constant mixing remain unfinished; the AST name pass and strict allowlist do not prove a closed application boundary. See [ROADMAP-PROTECCION.md](ROADMAP-PROTECCION.md) for the remaining objectives and measured limitations.
+The code includes signed licence constraints (including expiry and a machine fingerprint) and a quarantined mini-VM restricted to unsafe laboratory research (not production), but there is no general online revocation or TPM/DPAPI sealing of the server identity. Real control-flow flattening and constant mixing remain unfinished; the AST name pass and strict allowlist do not prove a closed application boundary. See [ROADMAP-PROTECCION.md](ROADMAP-PROTECCION.md) for the remaining objectives and measured limitations.
 
 Optional per-package protections include anti-rollback by serial, path binding, include protection, no-prepend, local-variable / private-method / private-property obfuscation, dead-branch flow obfuscation, string-literal encoding and a C-side string-literal vault, refusal of FFI/`dl()`, a sealed tree, refusal of debugging extensions, and runtime enforcement of a signed file manifest. Even so this is not a full deployment-integrity sandbox: without the signed manifest (enforced by default; opt out with `--no-manifest`) a file can be deleted or a whole package folder swapped, normal PHP is allowed alongside protected files, and none of these layers defeat the server administrator, who can read process memory. OPcache is refused for protected files unless the operator opts in and blacklists the protected tree (`envelock.allow_opcache`); preloading and `opcache.file_cache` are never allowed. PHAR, `__halt_compiler()` in the original source and code that reads its own file have no guaranteed compatibility.
 
-**Before commercializing:** independent audit, native tests on each target, FPM/Apache/ZTS evaluation, stress testing and validation with your real applications.
+**Before relying on it in production:** an independent review, native tests on each target, an FPM/Apache/ZTS evaluation, stress testing and validation with your real applications.
 
 ## Authorship
 
