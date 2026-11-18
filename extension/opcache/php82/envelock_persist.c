@@ -506,6 +506,13 @@ static void envelock_clear_unused_operands(zend_op *opline)
 	if (opline->opcode == ZEND_RECV_VARIADIC && opline->op2_type == IS_UNUSED) {
 		opline->op2.num = 0;
 	}
+	/* EXIT with no argument (`exit;`, `die;`): zend_compile_exit sets the operand's type to UNUSED but never
+	 * writes its value, so op1 holds what that stack slot held before (measured: the low half of a pointer,
+	 * different in every process). The handler reads op1 only when its type is not UNUSED (zend_vm_def.h of
+	 * 8.2 and 8.3; from 8.4 exit is a function and this opcode is gone). */
+	if (opline->opcode == ZEND_EXIT && opline->op1_type == IS_UNUSED) {
+		opline->op1.num = 0;
+	}
 }
 
 static void envelock_persist_op_array_ex(zend_op_array *op_array, envelock_persistent_script* main_persistent_script)

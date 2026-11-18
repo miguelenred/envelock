@@ -892,6 +892,16 @@ static void envelock_file_cache_serialize_class(zval                     *zv,
 		ZEND_ASSERT(ce->get_iterator == zend_hooked_object_get_iterator);
 		ce->get_iterator = HOOKED_ITERATOR_PLACEHOLDER;
 	}
+
+	/* Engine callbacks and the default handler table are addresses in this process: the loader
+	 * clears or relinks every one of them (envelock_fc_fix_class, unserialize_class), and with a
+	 * position-independent PHP binary they change from one process to the next. The image keeps
+	 * none, so one source always gives one image. */
+	ce->create_object = NULL;
+	ce->get_static_method = NULL;
+	ce->serialize = NULL;
+	ce->unserialize = NULL;
+	ce->default_object_handlers = NULL;
 }
 
 static void envelock_file_cache_serialize_warnings(

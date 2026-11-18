@@ -855,6 +855,16 @@ static void envelock_file_cache_serialize_class(zval                     *zv,
 	ZEND_MAP_PTR_INIT(ce->mutable_data, NULL);
 
 	ce->inheritance_cache = NULL;
+
+	/* Engine callbacks are addresses in this process: the loader clears every one of them
+	 * (envelock_fc_fix_class, unserialize_class), and with a position-independent PHP binary they
+	 * change from one process to the next. The image keeps none, so one source always gives one
+	 * image. */
+	ce->create_object = NULL;
+	ce->get_static_method = NULL;
+	ce->serialize = NULL;
+	ce->unserialize = NULL;
+	ce->get_iterator = NULL;
 }
 
 static void envelock_file_cache_serialize_warnings(

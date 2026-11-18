@@ -115,6 +115,21 @@ FILE_CACHE_REQUIRED = [
     ("ENVELOCK_FC_EXTENT(op_array, sizeof(zend_op_array));", 1),
     ("ENVELOCK_FC_EXTENT(script, sizeof(*script));", 1),
     ("envelock_fc_base = (const char *) script->mem;", 1),           # pack side bound
+    # Reproducible images: the pack side keeps no engine callback (process addresses that a
+    # position-independent PHP moves in every process; the loader clears them anyway). CI, 2026-11-18.
+    ("ce->create_object = NULL;", 1),
+    ("ce->get_static_method = NULL;", 1),
+    ("ce->serialize = NULL;", 1),
+    ("ce->unserialize = NULL;", 1),
+]
+
+# PHP 8.3+: the class's default object handler table is a process address too (std_object_handlers).
+FILE_CACHE_REQUIRED_83 = [
+    ("ce->default_object_handlers = NULL;", 1),
+]
+# PHP 8.2/8.3: get_iterator is cleared on both sides (8.4+ turns it into a placeholder constant).
+FILE_CACHE_REQUIRED_PRE84 = [
+    ("ce->get_iterator = NULL;", 2),
 ]
 
 # PHP 8.4+: property hooks. PHP 8.5: constant-expression closures and attributed constants (BC-14).
@@ -253,6 +268,10 @@ PERSIST_REQUIRED = [
     ("return (operand_flags & ZEND_VM_OP_SPEC) != 0", 1),
     ("if (opline->opcode == ZEND_RECV_VARIADIC && opline->op2_type == IS_UNUSED) {", 1),
 ]
+# PHP 8.2/8.3: `exit;` leaves its unused op1 unwritten (CI, 2026-11-18); 8.4+ has no EXIT opcode.
+PERSIST_REQUIRED_PRE84 = [
+    ("if (opline->opcode == ZEND_EXIT && opline->op1_type == IS_UNUSED) {", 1),
+]
 PERSIST_FORBIDDEN = [
     ("kind == 0 ||", "clears UNUSED operands the VM reads by hand (static::$x++ crashed, 2026-11-17)"),
 ]
@@ -289,6 +308,10 @@ def check_layer(layer):
         return [f"{version}: envelock_file_cache.c missing"]
     text = fc.read_text(encoding="utf-8", errors="replace")
     check_counts(text, FILE_CACHE_REQUIRED, f"{version}/envelock_file_cache.c", problems)
+    if minor >= 83:
+        check_counts(text, FILE_CACHE_REQUIRED_83, f"{version}/envelock_file_cache.c", problems)
+    if minor < 84:
+        check_counts(text, FILE_CACHE_REQUIRED_PRE84, f"{version}/envelock_file_cache.c", problems)
     if minor >= 84:
         check_counts(text, FILE_CACHE_REQUIRED_84, f"{version}/envelock_file_cache.c", problems)
     if minor >= 85:
@@ -326,6 +349,8 @@ def check_layer(layer):
             continue
         body = path.read_text(encoding="utf-8", errors="replace")
         check_counts(body, required, f"{version}/{name}", problems)
+        if name == "envelock_persist.c" and minor < 84:
+            check_counts(body, PERSIST_REQUIRED_PRE84, f"{version}/{name}", problems)
         for needle, why in list(forbidden) + EVERY_FILE_FORBIDDEN:
             if needle in body:
                 problems.append(f"{version}/{name}: forbidden {needle!r}: {why}")

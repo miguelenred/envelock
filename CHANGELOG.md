@@ -151,6 +151,13 @@ it could be, reproduced; each fix has a test that fails without it (checked by u
     the VM reads by hand and crashed `static::$x++`, which the new test caught. Valgrind finds no
     undefined byte, and every one of the 103 compilable `.php` files of PHP 8.4's own source tree gives
     the same image in separate processes and after another file.
+  - **Reproducible with a position-independent PHP too.** The CI's PHP binaries (PIE) load at another
+    address in every process, which the builds used here (not PIE) never do, and two more leftovers
+    showed: each class kept its default object handler table and engine callbacks as addresses of the
+    packing process (`std_object_handlers`, PHP 8.3+), and `exit;` without an argument kept a stack
+    leftover in its unused operand (PHP 8.2/8.3). The loader already ignored all of them; the packer
+    now clears them as well. Checked with a PIE PHP 8.3: the test target and all 105 compilable files
+    of PHP 8.3's source tree give one image in separate processes.
   - `scripts/check_bc_layers.py` checks every `php<NN>` layer (it globbed `php8*`), the `UNSERIALIZE_*`
     macros, the bodies of the hardening helpers, and every fix above.
   - `docs/MANUAL.md`: an OPcache JIT or an observer extension (APM agent) on the server changes the

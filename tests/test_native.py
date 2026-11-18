@@ -5,6 +5,7 @@ through the envelock.identity php.ini directive pointing at a server identity bu
 """
 
 import base64
+import contextlib
 import ctypes
 import hashlib
 import http.client
@@ -2130,6 +2131,7 @@ H09_TARGET = (
     "  public function setMode(int $mode, mixed ...$args): true { return true; }\n"
     "  public function pick(Base|Shape|null $x = null, Circle|Base|false $y = false, string ...$z): Base|Shape|null { return $x; }\n"
     "  public function rows(?array $p = null, int|string ...$q): Stmt|Circle|false { return false; } }\n"
+    "function bye(bool $now) { if ($now) { exit; } strlen('x'); die; }\n"
     "$o = new class { public $v = [1, true, null]; };\n"
     "$c = new Circle(); echo $c->label(), ' ', round($c->area(), 3), ' ', Suit::Hearts->color(), ' ',"
     " implode(',', iterator_to_array(gen(3))), ' ', maker('a')('b'), ' ', count($o->v), \"\\n\";\n")
@@ -2142,7 +2144,12 @@ def test_bytecode_images_are_reproducible(native, tmp_path):
     its runtime-definition keys. So two packs of one file differed (measured: 154 of 16 728 bytes, many
     of them stale pointers) and an image could hold bytes of the file packed before it. Now one source
     gives one image: in separate processes, after other files (one of them full of a marker string),
-    and emitted again and again in the same process. The image still runs."""
+    and emitted again and again in the same process. The image still runs.
+    Two more, found by CI on 2026-11-18 because a position-independent PHP binary loads at another
+    address in every process (the WSL1 builds here are not PIE): each class kept its default object
+    handler table and engine callbacks as process addresses (std_object_handlers, PHP 8.3+), and
+    `exit;` without an argument kept a stack leftover in its unused operand (PHP 8.2/8.3). The target
+    has classes, an enum and an `exit;` for that reason."""
     if _bytecode_available(native) != "yes":
         pytest.skip("no bytecode layer for this PHP version")
     target = tmp_path / "target.php"
@@ -3619,6 +3626,133 @@ def _windows_attach_and_detach(kernel, pid):
     return True
 
 
+def _windows_advapi32():
+    from ctypes import wintypes
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi.OpenProcessToken.restype = wintypes.BOOL
+    advapi.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p]
+    advapi.LookupPrivilegeValueW.restype = wintypes.BOOL
+    advapi.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD,
+                                             ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    advapi.AdjustTokenPrivileges.restype = wintypes.BOOL
+    advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                           ctypes.POINTER(wintypes.DWORD)]
+    advapi.GetTokenInformation.restype = wintypes.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                                       ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                       ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetSecurityInfo.restype = wintypes.DWORD
+    advapi.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetAce.restype = wintypes.BOOL
+    return advapi
+
+
+def _windows_self_kernel32():
+    """kernel32 with the calls the token helpers need (separate from _windows_kernel32's debug set)."""
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    return kernel
+
+
+def _windows_sid_string(advapi, kernel, sid):
+    from ctypes import wintypes
+    text = wintypes.LPWSTR()
+    assert advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)), ctypes.get_last_error()
+    try:
+        return text.value
+    finally:
+        kernel.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _windows_own_user_sid():
+    """The string SID of the account this test runs as (S-1-5-18 is SYSTEM)."""
+    from ctypes import wintypes
+    advapi, kernel = _windows_advapi32(), _windows_self_kernel32()
+    token = wintypes.HANDLE()
+    assert advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)), \
+        ctypes.get_last_error()                              # TOKEN_QUERY
+    try:
+        size = wintypes.DWORD()
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))   # TokenUser
+        buffer = ctypes.create_string_buffer(size.value)
+        assert advapi.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)), ctypes.get_last_error()
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]       # TOKEN_USER.User.Sid
+        return _windows_sid_string(advapi, kernel, sid)
+    finally:
+        kernel.CloseHandle(token)
+
+
+@contextlib.contextmanager
+def _windows_without_debug_privilege():
+    """SeDebugPrivilege opens any process whatever its access list says (an elevated administrator, as on
+    hosted CI runners, may hold it enabled). For the duration, this process's token has it disabled, so
+    what is measured is the access list; the previous state is put back after. Yields whether it was on."""
+    from ctypes import wintypes
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class OnePrivilege(ctypes.Structure):                    # TOKEN_PRIVILEGES with one entry
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", Luid), ("Attributes", wintypes.DWORD)]
+
+    advapi, kernel = _windows_advapi32(), _windows_self_kernel32()
+    token = wintypes.HANDLE()
+    assert advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0020 | 0x0008, ctypes.byref(token)), \
+        ctypes.get_last_error()                              # TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+    try:
+        luid = Luid()
+        assert advapi.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(luid)), ctypes.get_last_error()
+        disabled, previous, size = OnePrivilege(1, luid, 0), OnePrivilege(), wintypes.DWORD()
+        assert advapi.AdjustTokenPrivileges(token, False, ctypes.byref(disabled), ctypes.sizeof(previous),
+                                            ctypes.byref(previous), ctypes.byref(size)), ctypes.get_last_error()
+        # PreviousState lists only what the call changed: one entry when the privilege was enabled.
+        was_enabled = previous.PrivilegeCount == 1 and bool(previous.Attributes & 0x2)
+        try:
+            yield was_enabled
+        finally:
+            if was_enabled:
+                advapi.AdjustTokenPrivileges(token, False, ctypes.byref(previous), 0, None, None)
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _windows_access_list(opener, object_id):
+    """The access-allowed entries of a process's or thread's access list, as [(sid, mask)], read through a
+    READ_CONTROL handle (which the hardened list still grants to the account). None: there is no list."""
+    advapi, kernel = _windows_advapi32(), _windows_self_kernel32()
+    handle = opener(0x00020000, False, object_id)            # READ_CONTROL
+    assert handle, ("READ_CONTROL refused", ctypes.get_last_error())
+    try:
+        dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+        status = advapi.GetSecurityInfo(handle, 6, 0x4, None, None, ctypes.byref(dacl), None,
+                                        ctypes.byref(descriptor))    # SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION
+        assert status == 0, ("GetSecurityInfo", status)
+        try:
+            if not dacl.value:
+                return None
+            count = int.from_bytes(ctypes.string_at(dacl.value + 4, 2), "little")    # ACL.AceCount
+            entries = []
+            for index in range(count):
+                ace = ctypes.c_void_p()
+                assert advapi.GetAce(dacl, index, ctypes.byref(ace)), ctypes.get_last_error()
+                header = ctypes.string_at(ace.value, 8)              # ACE_HEADER + ACCESS_MASK
+                if header[0] == 0:                                   # ACCESS_ALLOWED_ACE_TYPE
+                    entries.append((_windows_sid_string(advapi, kernel, ace.value + 8),
+                                    int.from_bytes(header[4:8], "little")))
+            return entries
+        finally:
+            kernel.LocalFree(descriptor)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def test_windows_harden_memory_closes_the_process(native, tmp_path):
     """envelock.harden_memory on Windows, which only locked the keys in RAM until 2026-11-17 (the
     audit found ReadProcessMemory, a dump and a debugger open to the same account). From the first
@@ -3626,7 +3760,12 @@ def test_windows_harden_memory_closes_the_process(native, tmp_path):
     memory, write it, start a thread in it, duplicate a handle from it (which would hand back a full
     one), suspend it or change the list back; and the request thread cannot be suspended or have its
     context read or set. harden_memory=0 leaves the default list, which is what shows the test sees
-    the difference. PHP itself keeps working: it still starts a child process."""
+    the difference. PHP itself keeps working: it still starts a child process.
+    Two sides are checked. The list itself, read back from outside, whoever runs the test: only SYSTEM
+    keeps more than the limited rights. And what this account can actually do, measured with
+    SeDebugPrivilege disabled for the duration -- an elevated administrator holding it enabled (GitHub's
+    Windows runners, 2026-11-18) passes any list, by Windows' design and as the manual says. SYSTEM is
+    granted everything by the list on purpose, so for SYSTEM only the list is checked."""
     if os.name != "nt" or not PHP_WINDOWS:
         pytest.skip("Windows process access lists")
     kernel = _windows_kernel32()
@@ -3636,46 +3775,71 @@ def test_windows_harden_memory_closes_the_process(native, tmp_path):
     allowed = {"QUERY_LIMITED|SYNCHRONIZE": 0x00101000, "PROCESS_TERMINATE": 0x0001,
                "PROCESS_QUERY_INFORMATION": 0x0400, "READ_CONTROL": 0x00020000}
     thread_steer = 0x0008 | 0x0010 | 0x0002                  # GET_CONTEXT | SET_CONTEXT | SUSPEND_RESUME
-    seen = {}
-    for harden in ("1", "0"):
-        ready, go = tmp_path / f"ready-{harden}", tmp_path / f"go-{harden}"
-        script = tmp_path / f"probe-{harden}.php"
-        script.write_text(
-            "<?php\nfile_put_contents(" + php_literal(str(ready)) + ", (string)getmypid());\n"
-            "$end = microtime(true) + 30;\n"
-            "while (!file_exists(" + php_literal(str(go)) + ") && microtime(true) < $end) usleep(20000);\n"
-            "echo trim(shell_exec('cmd /c echo child-ran')), \"\\n\";\n")
-        process = subprocess.Popen(
-            ["php", "-n", "-d", f"extension={native[1]}", "-d", f"envelock.identity={native[4]}",
-             "-d", f"envelock.harden_memory={harden}", "-d", "display_errors=stderr", str(script)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=php_environment())
-        try:
-            deadline = time.time() + 20
-            while not ready.exists() and time.time() < deadline:
-                time.sleep(0.05)
-            assert ready.exists(), "the probe never started"
-            pid = int(ready.read_text())
-            result = {name: _windows_open(kernel, kernel.OpenProcess, mask, pid)
-                      for name, mask in {**denied, **allowed}.items()}
-            result["thread"] = _windows_open(kernel, kernel.OpenThread, thread_steer,
-                                             _windows_first_thread(kernel, pid))
-            result["debugger"] = _windows_attach_and_detach(kernel, pid)
-            seen[harden] = result
-        finally:
-            go.write_text("go")
-            stdout, stderr = process.communicate(timeout=60)
-        assert process.returncode == 0, stderr
-        assert stdout == "child-ran\n", (stdout, stderr)
+    # The limited sets envelock_restrict_process_access / _thread_access give every SID but SYSTEM.
+    process_limited = 0x00100000 | 0x00020000 | 0x0001 | 0x0400 | 0x1000
+    thread_limited = 0x00100000 | 0x00020000 | 0x0040 | 0x0800
+    system, owner_rights = "S-1-5-18", "S-1-3-4"
+    me = _windows_own_user_sid()
+    seen, lists = {}, {}
+    with _windows_without_debug_privilege() as had_debug_privilege:
+        for harden in ("1", "0"):
+            ready, go = tmp_path / f"ready-{harden}", tmp_path / f"go-{harden}"
+            script = tmp_path / f"probe-{harden}.php"
+            script.write_text(
+                "<?php\nfile_put_contents(" + php_literal(str(ready)) + ", (string)getmypid());\n"
+                "$end = microtime(true) + 30;\n"
+                "while (!file_exists(" + php_literal(str(go)) + ") && microtime(true) < $end) usleep(20000);\n"
+                "echo trim(shell_exec('cmd /c echo child-ran')), \"\\n\";\n")
+            process = subprocess.Popen(
+                ["php", "-n", "-d", f"extension={native[1]}", "-d", f"envelock.identity={native[4]}",
+                 "-d", f"envelock.harden_memory={harden}", "-d", "display_errors=stderr", str(script)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=php_environment())
+            try:
+                deadline = time.time() + 20
+                while not ready.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                assert ready.exists(), "the probe never started"
+                pid = int(ready.read_text())
+                tid = _windows_first_thread(kernel, pid)
+                lists[harden] = (_windows_access_list(kernel.OpenProcess, pid),
+                                 _windows_access_list(kernel.OpenThread, tid))
+                result = {name: _windows_open(kernel, kernel.OpenProcess, mask, pid)
+                          for name, mask in {**denied, **allowed}.items()}
+                result["thread"] = _windows_open(kernel, kernel.OpenThread, thread_steer, tid)
+                result["debugger"] = _windows_attach_and_detach(kernel, pid)
+                seen[harden] = result
+            finally:
+                go.write_text("go")
+                stdout, stderr = process.communicate(timeout=60)
+            assert process.returncode == 0, stderr
+            assert stdout == "child-ran\n", (stdout, stderr)
+    who = f"test runs as {me}, SeDebugPrivilege {'was on (disabled for the test)' if had_debug_privilege else 'off'}"
+    # 1. The list, read back from outside: only SYSTEM keeps more than the limited rights, the owner's
+    #    implicit rights are limited too (OWNER RIGHTS), and SYSTEM is still there.
+    process_list, thread_list = lists["1"]
+    assert process_list is not None and thread_list is not None, ("no access list", lists["1"], who)
+    for sid, mask in process_list:
+        assert sid == system or mask & ~process_limited == 0, ("process", sid, hex(mask), process_list, who)
+    for sid, mask in thread_list:
+        assert sid == system or mask & ~thread_limited == 0, ("thread", sid, hex(mask), thread_list, who)
+    assert {system, owner_rights} <= {sid for sid, _ in process_list}, (process_list, who)
+    # harden_memory=0 keeps Windows' default list, under which this account reads the process.
+    default_list = lists["0"][0]
+    assert default_list is None or any(sid != system and mask & (0x0010 | 0x10000000)
+                                       for sid, mask in default_list), (default_list, who)
+    # 2. What the account can do. SYSTEM is granted everything by the list, on purpose.
+    if me == system:
+        return
     on, off = seen["1"], seen["0"]
     for name in denied:
-        assert on[name] == 5, (name, on)                      # ERROR_ACCESS_DENIED
+        assert on[name] == 5, (name, on, who)                 # ERROR_ACCESS_DENIED
     for name in allowed:
-        assert on[name] is True, (name, on)
-    assert on["thread"] == 5, on
-    assert on["debugger"] == 5, on
+        assert on[name] is True, (name, on, who)
+    assert on["thread"] == 5, (on, who)
+    assert on["debugger"] == 5, (on, who)
     # The default list, for contrast: the same account may read, steer and debug the process.
-    assert off["PROCESS_VM_READ"] is True and off["PROCESS_DUP_HANDLE"] is True, off
-    assert off["thread"] is True and off["debugger"] is True, off
+    assert off["PROCESS_VM_READ"] is True and off["PROCESS_DUP_HANDLE"] is True, (off, who)
+    assert off["thread"] is True and off["debugger"] is True, (off, who)
 
 
 def _run_under_a_debugger(arguments, timeout=60):
