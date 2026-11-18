@@ -58,7 +58,10 @@ int envelock_secret_init(size_t size)
             if (ftruncate(fd, (off_t)size) == 0) {
                 p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             }
-            if (p == MAP_FAILED) {
+            /* p is still NULL when ftruncate failed: that is a failure too. Testing MAP_FAILED alone
+             * kept the descriptor, reported "memfd_secret" while the keys went to the anonymous
+             * fallback below, and skipped the fallback's wipe at MSHUTDOWN (audit 2026-11-17). */
+            if (p == NULL || p == MAP_FAILED) {
                 p = NULL;
                 close(fd);
             } else {
@@ -125,7 +128,15 @@ int envelock_secret_is_secret(void)
 const char *envelock_secret_kind(void)
 {
     if (envelock_secret_base == NULL) return "none";
+#if defined(__linux__)
     return envelock_secret_real ? "memfd_secret" : "mlock+MADV_DONTDUMP";
+#elif defined(_WIN32)
+    /* Locked in RAM (VirtualLock) and nothing more: Windows has no dump exclusion for it, and it
+     * reported the Linux fallback's name, which operators are told to rely on (audit 2026-11-17). */
+    return "VirtualLock";
+#else
+    return "mlock";
+#endif
 }
 
 void envelock_secret_shutdown(void)

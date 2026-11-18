@@ -38,6 +38,11 @@ HEADER_REQUIRED = [
     "envelock_fc_optype_ok(opline->op1_type)",
     "static void envelock_fc_set_handlers(zend_op_array *op_array)",
     "ZEND_VM_SET_OPCODE_HANDLER(",
+    # C-05: every call made generic before its handler is chosen (DO_UCALL on an internal callee crashed)
+    "static zend_always_inline void envelock_fc_generic_call(zend_op *opline)",
+    "opline->opcode == ZEND_DO_UCALL || opline->opcode == ZEND_DO_ICALL",
+    "opline->opcode = ZEND_DO_FCALL;",
+    "\t\tenvelock_fc_generic_call(opline);\n\t\tif (opline + 1 < end) {",
     "static zend_always_inline void envelock_fc_note_opline(zend_op *opline)",
     "Z_EXTRA_P(fname) = 0;",
     "static zend_always_inline void envelock_fc_check_arg_info(",
@@ -122,6 +127,10 @@ FILE_CACHE_REQUIRED_85 = [
     ("&& opline > op_array->opcodes", 1),
     ('"attributed constant without its attributes"', 2),
     ("ENVELOCK_FC_EXTENT(ast, sizeof(zend_ast_op_array));", 1),
+    # A closure default shared by a same-file subclass is walked twice: relocate its op_array once
+    # (audit 2026-11-17: valid PHP 8.5 code could not be packed).
+    ("if (!IS_SERIALIZED(zend_ast_get_op_array(ast)->op_array)) {", 1),
+    ("if (!IS_UNSERIALIZED(zend_ast_get_op_array(ast)->op_array)) {", 1),
 ]
 
 # Never allowed on the deserialization side (from the unserialize_hash definition to the end).
@@ -150,7 +159,12 @@ BC_REQUIRED = [
     ("*retain = 1;", 1),
     ("ZEND_COMPILE_IGNORE_INTERNAL_FUNCTIONS", 1),                   # BC-10
     ("ZEND_COMPILE_WITH_FILE_CACHE", 1),                             # BC-16
+    ("ZEND_COMPILE_NO_PERSISTENT_CONSTANT_SUBSTITUTION", 1),         # host constants not folded in
+    ("op_array = compile_file(file_handle, ZEND_INCLUDE);", 1),      # never through OPcache's hook
     ("zend_execute_internal = execute_internal;", 1),                # no frameless/specialised calls
+    ("static void envelock_bc_compile_execute_ex(zend_execute_data *execute_data)", 1),   # C-05
+    ("zend_execute_ex = envelock_bc_compile_execute_ex;", 1),        # C-05: no DO_UCALL in the image
+    ("zend_execute_ex = orig_execute_ex;", 1),
     ("envelock_bc_identity()", 3),
     ("mem_size > UINT32_MAX", 1),                                    # BC-18
     ("(uint64_t) script->size > UINT32_MAX", 1),
@@ -158,10 +172,19 @@ BC_REQUIRED = [
     ("slack < ENVELOCK_BC_SLACK", 1),
     ("envelock_arena_ok()", 1),                                      # BC-17
     ("envelock_file_cache_unserialize(script, image + ENVELOCK_BC_WIRE_SIZE, (size_t) mem_size);", 1),
+    # H-09: reproducible images, no leftover heap or stack bytes (2026-11-17)
+    ("(void) envelock_zero_begin();", 1),
+    ("envelock_zero_end();", 3),
+    ("memset(p, 0, size);", 1),
+    ("memset((char *) q + old, 0, size - old);", 1),
+    ("CG(rtd_key_counter) = 0;", 1),
+    ("CG(rtd_key_counter) = orig_rtd_key_counter;", 1),
 ]
 BC_FORBIDDEN = [
     ("__except (EXCEPTION_EXECUTE_HANDLER)", "catches every exception, stack overflow included (BC-13)"),
     ("memcmp(image + ENVELOCK_BC_OFF_SYSTEM_ID, zend_system_id", "SAPI-dependent gate (BC-16)"),
+    ("zend_compile_file(file_handle", "the emitter must not compile through the hook chain: with "
+                                      "OPcache caching it persists shared-memory op_arrays (2026-11-17)"),
 ]
 # Never allowed in any layer source: both expand __FILE__, i.e. the absolute path of the build
 # directory (and with it the builder's user name), into the shipped module.
@@ -175,14 +198,72 @@ ARENA_REQUIRED = [
     ("bool envelock_arena_ok(void)", 1),
     ("void envelock_arena_check(void)", 1),
     ("PAGE_NOACCESS", 1),
+    # no bytes of the previous file in the next image (2026-11-17, H-09)
+    ("memset(arena_base, 0, used < arena_capacity ? used : arena_capacity);", 1),
+    ("arena_base = (char *) calloc(1, want);", 1),
 ]
+# Hardening helpers whose BODY must still do something: a checker that matched only the signatures
+# passed a header whose fix_class/check_prop/finish had been emptied (audit 2026-11-17).
+HEADER_BODIES = [
+    "static zend_always_inline void envelock_fc_fix_class(",
+    "static zend_always_inline void envelock_fc_check_prop(",
+    "static zend_always_inline void envelock_fc_check_arg_info(",
+    "static void envelock_fc_check_op_array_arrays(",
+    "static void envelock_fc_finish(envelock_persistent_script *script)",
+    "static void envelock_fc_set_handlers(zend_op_array *op_array)",
+    "static zend_always_inline void envelock_fc_check_string(zend_string *s)",
+]
+HEADER_BODY_MIN_STATEMENTS = 3
+
+
+def function_body(text, signature):
+    """The body (between its braces) of the function whose definition starts with `signature`, or
+    None. Braces are counted; the helpers hold no brace inside a string or a comment."""
+    start = text.find(signature)
+    if start < 0:
+        return None
+    open_at = text.find("{", start)
+    if open_at < 0:
+        return None
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1:i]
+    return None
+
+
+def without_comments(code):
+    return re.sub(r"/\*.*?\*/|//[^\n]*", "", code, flags=re.S)
 PERSIST_REQUIRED = [
     ("HT_SET_DATA_ADDR(ht, envelock_alloc((hash_size * sizeof(uint32_t)) + (ht->nNumUsed * sizeof(Bucket))));", 1),
     ("data = envelock_alloc(HT_USED_SIZE(ht));", 1),
     ("envelock_arena_check();", 3),
+    # H-09: valueless zvals, zend_type padding and valueless UNUSED operands are cleared (2026-11-17)
+    ("if (Z_TYPE_P(z) <= IS_TRUE) {", 1),
+    ("memset(&z->value, 0, sizeof(z->value));", 1),
+    ("envelock_type_clear_padding(type);", 1),
+    ("envelock_type_clear_padding(single_type);", 1),
+    ("if (offsetof(zend_type_list, types) > offsetof(zend_type_list, num_types) + sizeof(list->num_types)) {", 1),
+    ("envelock_clear_unused_operands(opline);", 1),
+    ("&& (kind == ZEND_VM_OP_THIS || kind == ZEND_VM_OP_NEXT || kind == ZEND_VM_OP_CONSTRUCTOR);", 1),
+    ("return (operand_flags & ZEND_VM_OP_SPEC) != 0", 1),
+    ("if (opline->opcode == ZEND_RECV_VARIADIC && opline->op2_type == IS_UNUSED) {", 1),
+]
+PERSIST_FORBIDDEN = [
+    ("kind == 0 ||", "clears UNUSED operands the VM reads by hand (static::$x++ crashed, 2026-11-17)"),
 ]
 SCRIPT_REQUIRED = [
     ("early_binding->cache_slot <= op_array->cache_size - sizeof(void *)", 1),
+    # H-09: zend_early_binding's tail padding (2026-11-17)
+    ("ecalloc(persistent_script->num_early_bindings, sizeof(zend_early_binding));", 1),
+]
+SCRIPT_FORBIDDEN = [
+    ("emalloc(sizeof(zend_early_binding) * persistent_script->num_early_bindings)",
+     "leaves zend_early_binding's padding to the heap, which reaches the image (H-09)"),
 ]
 SHIM_REQUIRED = [
     ("void envelock_file_cache_unserialize(envelock_persistent_script *script, void *buf, size_t size);", 1),
@@ -219,7 +300,11 @@ def check_layer(layer):
     if marker < 0:
         problems.append(f"{version}/envelock_file_cache.c: unserialize_hash definition not found")
     else:
-        rest = text[marker:]
+        # The deserialization side: from unserialize_hash to the end, PLUS the UNSERIALIZE_* macros
+        # defined above it (upstream's UNSERIALIZE_STR reads script->corrupted, and a regenerated
+        # macro that went back to it passed when only the text below the marker was searched).
+        macros = re.findall(r"#define UNSERIALIZE_\w+\(.*?(?<!\\)\n", text[:marker], re.S)
+        rest = text[marker:] + without_comments("\n".join(macros))   # their comments may name it
         for needle, why in UNSERIALIZE_FORBIDDEN:
             if needle in rest:
                 problems.append(f"{version}/envelock_file_cache.c: forbidden on the unserialize side "
@@ -232,8 +317,8 @@ def check_layer(layer):
 
     for name, required, forbidden in (("envelock_bc.c", BC_REQUIRED, BC_FORBIDDEN),
                                       ("envelock_arena.c", ARENA_REQUIRED, []),
-                                      ("envelock_persist.c", PERSIST_REQUIRED, []),
-                                      ("envelock_script.c", SCRIPT_REQUIRED, []),
+                                      ("envelock_persist.c", PERSIST_REQUIRED, PERSIST_FORBIDDEN),
+                                      ("envelock_script.c", SCRIPT_REQUIRED, SCRIPT_FORBIDDEN),
                                       ("envelock_accel_shim.h", SHIM_REQUIRED, [])):
         path = layer / name
         if not path.exists():
@@ -259,10 +344,16 @@ def main(argv=None):
     if not header.exists():
         problems.append(f"{HARDEN} missing")
     else:
-        check_counts(header.read_text(encoding="utf-8", errors="replace"),
-                     [(n, 1) for n in HEADER_REQUIRED], HARDEN, problems)
+        header_text = header.read_text(encoding="utf-8", errors="replace")
+        check_counts(header_text, [(n, 1) for n in HEADER_REQUIRED], HARDEN, problems)
+        for signature in HEADER_BODIES:
+            body = function_body(header_text, signature)
+            if body is not None and without_comments(body).count(";") < HEADER_BODY_MIN_STATEMENTS:
+                problems.append(f"{HARDEN}: {signature.strip()}... has an (almost) empty body")
 
-    layers = sorted(p for p in root.glob("php8*") if p.is_dir())
+    # Every php<digits> layer: config.m4 builds any php<MM> folder, so a php90/ layer without the
+    # hardening would have been compiled while a php8* glob never looked at it (audit 2026-11-17).
+    layers = sorted(p for p in root.glob("php*") if p.is_dir() and re.fullmatch(r"php\d+", p.name))
     if not layers:
         problems.append(f"no php<MM> layer under {root}")
     for layer in layers:

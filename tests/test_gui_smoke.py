@@ -27,15 +27,37 @@ def _load():
     return module
 
 
+def _assistant(g, tries=6):
+    """Build the Assistant window, retrying the transient Tcl root-creation flake some Windows Tcl
+    installs show when many Tk interpreters are created in one run ("couldn't read file ...tk.tcl",
+    "tk wasn't installed properly"). It happens inside tk.Tk()'s own init, before any Envelock code
+    runs — an environment hiccup reading the stock ttk/*.tcl, not a fault in the window. Each retry
+    makes a fresh interpreter; the logic under test is unchanged."""
+    import time as _t
+    last = None
+    for attempt in range(tries):
+        try:
+            return g.Assistant()
+        except tkinter.TclError as error:          # only the init-time "can't read tk.tcl" flake
+            if "tk.tcl" not in str(error) and "wasn't installed" not in str(error) \
+                    and ".tcl" not in str(error):
+                raise
+            last = error
+            _t.sleep(0.25 * (attempt + 1))
+    raise last
+
+
 def test_window_builds_and_switches_language():
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         en = [app.nb.tab(i, "text") for i in range(len(app.nb.tabs()))]
-        assert en[0] == "Encrypt a project" and len(en) == 6 and "Recommend" in en
+        assert en[0] == "Encrypt a project" and len(en) == 8 and "Recommend" in en
+        assert "Verify" in en and "Licence" in en
         app._switch_language(1)
         es = [app.nb.tab(i, "text") for i in range(len(app.nb.tabs()))]
-        assert es[0] == "Cifrar un proyecto" and len(es) == 6 and "Recomendar" in es
+        assert es[0] == "Cifrar un proyecto" and len(es) == 8 and "Recomendar" in es
+        assert "Verificar" in es and "Licencia" in es
     finally:
         app.destroy()
 
@@ -46,10 +68,27 @@ def test_every_string_has_both_languages():
     assert bad == [], bad
 
 
+def test_key_saved_notices_format_in_both_languages():
+    """The emphatic 'back it up now' notices (the key-saving insistence) must carry the save PATH and
+    the password reminder in both languages, and the naming-examples help must mention the patterns."""
+    g = _load()
+    for key in ("owner_created", "recipient_created"):
+        for lang in (0, 1):
+            msg = g.STRINGS[key][lang].format(path="/keys/owner-acme.enc.json", pw="PWREMINDER")
+            assert "/keys/owner-acme.enc.json" in msg and "PWREMINDER" in msg
+    # Both password branches render without a leftover placeholder.
+    for lang in (0, 1):
+        for pwkey in ("pw_remember", "pw_none"):
+            out = g.STRINGS["owner_created"][lang].format(path="p", pw=g.STRINGS[pwkey][lang])
+            assert "{" not in out and "}" not in out
+    for lang in (0, 1):
+        assert ".pub.json" in g.STRINGS["keys_naming"][lang] and ".enc.json" in g.STRINGS["keys_naming"][lang]
+
+
 def test_wrong_kind_detection_and_name_suggestion(tmp_path):
     import json as _json
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         pub = tmp_path / "s.pub.json"
         pub.write_text(_json.dumps({"kind": "envelock-recipient-public", "format": 2,
@@ -72,6 +111,53 @@ def test_wrong_kind_detection_and_name_suggestion(tmp_path):
         app.destroy()
 
 
+def test_pack_summary_shows_what_the_cli_prints_to_stderr():
+    """Audit 2026-11-17: after a pack the assistant showed only the counts. The syntax errors pack
+    found (C-17), the files it could not obfuscate and the C-30 advisory went to stderr, which the
+    windowed executable has none of, so the user saw a plain success."""
+    g = _load()
+    app = _assistant(g)
+    try:
+        base = {"protected_files": 2, "copied_assets": 0, "project_id": "p", "serial": 1}
+        text, warned = app._pack_summary(dict(base), False)
+        assert not warned and "2" in text
+        info = dict(base, syntax_warnings=['broken.php: syntax error, unexpected token "{"'],
+                    files_not_token_transformed=["a.php", "b.php"])
+        text, warned = app._pack_summary(info, True)
+        assert warned
+        assert "broken.php: syntax error" in text and "a.php, b.php" in text
+        assert "auto_prepend_file" in text
+        # With --bytecode the halted files are still compiled (no source ships): no warning for them.
+        text, warned = app._pack_summary(dict(base, files_not_token_transformed=["a.php"],
+                                              bytecode=True), False)
+        assert not warned and "a.php" not in text
+    finally:
+        app.destroy()
+
+
+def test_files_to_write_are_made_absolute_before_use(tmp_path, monkeypatch):
+    """Audit 2026-11-17: a bare suggested name (owner.enc.json) was written to the process's current
+    folder and the notice named the bare file only. _need makes every save field absolute first, so
+    what is written and what is shown is the full path; read-only fields are left alone."""
+    g = _load()
+    app = _assistant(g)
+    try:
+        monkeypatch.chdir(tmp_path)
+        frame = g.ttk.Frame(app)
+        save = app._row(frame, "out_file", "savefile")
+        read = app._row(frame, "owner_file", "file")
+        save.set("owner.enc.json")
+        read.set("owner.enc.json")
+        assert app._need(out_file=save, owner_file=read)
+        assert save.get() == str(tmp_path / "owner.enc.json")
+        assert read.get() == "owner.enc.json"
+        chosen = str(tmp_path / "keys" / "x.enc.json")
+        save.set(chosen)
+        assert app._need(out_file=save) and save.get() == chosen
+    finally:
+        app.destroy()
+
+
 def _drain_until(app, done, seconds=10):
     import time
     end = time.time() + seconds
@@ -86,7 +172,7 @@ def test_missing_php_flows(tmp_path, monkeypatch):
     Linux/macOS: show the install command; declining leaves the normal error to the caller."""
     import sys as _sys
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     app._detector.join(60)                # the startup search must not run under the faked platform
     shown, retried = [], []
     monkeypatch.setattr(g.messagebox, "showinfo", lambda *a, **k: shown.append(a[1]))
@@ -124,7 +210,7 @@ def test_missing_php_flows(tmp_path, monkeypatch):
 def test_run_async_refuses_concurrent_operation(monkeypatch):
     """While one operation runs (_busy), a second is refused instead of racing (ENV-18)."""
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         shown = []
         monkeypatch.setattr(g.messagebox, "showinfo", lambda *a, **k: shown.append(a))
@@ -171,7 +257,7 @@ def test_every_action_handler_checks_busy_before_anything_else(tmp_path, monkeyp
     no PHP probe, no dialog, and no change to the output folder (the pack handler used to remove an
     empty output folder before the busy check)."""
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         app._detector.join(60)
         busy, other = [], []
@@ -208,7 +294,7 @@ def test_closing_while_busy_asks_and_workers_are_not_daemons(monkeypatch):
     the interpreter lets finish before the program exits."""
     import threading
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     closed = []
     try:
         app._detector.join(60)
@@ -236,7 +322,7 @@ def test_php_probe_and_inspect_run_off_the_ui_thread(tmp_path, monkeypatch):
     """T-14: the PHP probe (up to 30 s) and Inspect ran on Tk's thread and froze the window."""
     import threading
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         app._detector.join(60)
         threads, errors = [], []
@@ -262,7 +348,7 @@ def test_php_probe_and_inspect_run_off_the_ui_thread(tmp_path, monkeypatch):
         inspected = []
         monkeypatch.setattr(g.actions, "inspect", lambda path: inspected.append(
             threading.current_thread()) or {"kind": "inspected", "path": path.name})
-        inspect_tab = _tab(app, 5)
+        inspect_tab = _tab(app, 6)                 # 0 pack,1 recommend,2 keys,3 identity,4 rotate,5 licence,6 inspect,7 verify
         _set(app, _entries(inspect_tab)[0], str(tmp_path / "pkg.php"))
         _button(inspect_tab, app.t("inspect")).invoke()
         text = next(w for w in _widgets(inspect_tab) if w.winfo_class() == "Text")
@@ -273,11 +359,72 @@ def test_php_probe_and_inspect_run_off_the_ui_thread(tmp_path, monkeypatch):
         app.destroy()
 
 
+def test_verify_and_licence_tabs_drive_end_to_end(tmp_path, monkeypatch):
+    """The new Verify and Licence tabs wire the window to the actions layer: a signed package verifies
+    OK through the Verify tab, and the Licence tab issues a licence and then inspects it. An
+    unencrypted owner is used so no password dialog is needed."""
+    g = _load()
+    pw = b"a-long-enough-password"
+    owner = tmp_path / "owner.json"
+    g.actions.create_owner(owner, with_recovery=False, password=None, encrypt=False)
+    rcpt, pub = tmp_path / "r.enc.json", tmp_path / "r.pub.json"
+    g.actions.create_recipient(rcpt, "srv", pw)
+    g.actions.export_public(rcpt, pw, pub)
+    dev = tmp_path / "dev.json"
+    g.actions.export_developer(owner, None, dev)
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "i.php").write_text("<?php echo 1;")
+    pkg = tmp_path / "pkg"
+    g.actions.pack(owner, None, [pub], g.actions.new_project(), src, pkg, manifest=True)
+
+    app = _assistant(g)
+    # Record every error dialog instead of popping a REAL modal (which would block the headless run
+    # forever): a worker that touches Tk raises "main thread is not in main loop", and the handlers
+    # must read their widgets on the UI thread so this stays empty.
+    errors = []
+    monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: errors.append(a[1]))
+    try:
+        app._detector.join(60)
+        # Verify tab (index 7): package + developer descriptor -> OK
+        verify_tab = _tab(app, 7)
+        v_entries = _entries(verify_tab)
+        _set(app, v_entries[0], str(pkg))
+        _set(app, v_entries[1], str(dev))
+        _button(verify_tab, app.t("verify_btn")).invoke()
+        v_text = next(w for w in _widgets(verify_tab) if w.winfo_class() == "Text")
+        _drain_until(app, lambda: "OK" in v_text.get("1.0", "end") or errors)
+        assert not errors, errors
+        assert "OK" in v_text.get("1.0", "end") and '"ok": true' in v_text.get("1.0", "end")
+
+        # Licence tab (index 5): issue an unbound licence, then inspect it
+        shown = []
+        monkeypatch.setattr(g.messagebox, "showinfo", lambda *a, **k: shown.append(a[1]))
+        monkeypatch.setattr(g.messagebox, "showwarning", lambda *a, **k: shown.append(a[1]))
+        lic_tab = _tab(app, 5)
+        l_entries = _entries(lic_tab)
+        _set(app, l_entries[0], str(owner))                 # owner file
+        lic_path = tmp_path / "lic.bin"
+        _set(app, l_entries[1], str(lic_path))              # licence out
+        _button(lic_tab, app.t("lic_issue_btn")).invoke()
+        _drain_until(app, lambda: shown or errors)
+        assert not errors, errors                           # no off-thread Tk access, no failure
+        assert lic_path.exists() and shown                  # written, and the user told
+        _set(app, _entries(lic_tab)[-1], str(lic_path))     # licence_file field (last entry)
+        _button(lic_tab, app.t("lic_inspect_btn")).invoke()
+        l_text = next(w for w in _widgets(lic_tab) if w.winfo_class() == "Text")
+        _drain_until(app, lambda: "format" in l_text.get("1.0", "end") or errors)
+        assert not errors, errors
+        assert '"machine": "any"' in l_text.get("1.0", "end")
+    finally:
+        app.destroy()
+
+
 def test_drain_survives_a_throwing_callback(monkeypatch):
     """A callback that raises must not kill the drain loop (which would freeze the UI with _busy
     stuck True): _busy is cleared, the error is surfaced, and _drain still reschedules."""
     g = _load()
-    app = g.Assistant()
+    app = _assistant(g)
     try:
         errs = []
         monkeypatch.setattr(g.messagebox, "showerror", lambda *a, **k: errs.append(a))

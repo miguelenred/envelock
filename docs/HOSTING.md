@@ -31,7 +31,9 @@ options (`INFO`). It changes nothing.
 1. Upload it to the server, inside the site.
 2. Open it in the browser (it reports the PHP that serves the web: PHP-FPM, LiteSpeed, Apache…), and/or
    run `php envelock-preflight.php` over SSH (the command-line PHP often reads another `php.ini`).
-3. **Delete it** afterwards: it prints details of the server configuration.
+3. **Delete it** afterwards: it prints details of the server configuration. As a safeguard, over the
+   web it answers only during the hour after it was uploaded (re-upload it to run it again) and
+   shows file names, not full paths (the command line shows the paths).
 
 Before the loader is installed it tells you which loader file to use and whether the system has
 what that loader needs; after it is installed it confirms that the identity file was accepted and
@@ -296,7 +298,7 @@ like OPcache's.
 | `--no-ffi` | `enable_dl=Off` (it is `Off` in PHP's `php.ini-production` and `php.ini-development`, but the built-in default, used when no `php.ini` sets it, is `On`: <https://www.php.net/manual/en/info.configuration.php>) and FFI not enabled (`ffi.enable` not `On`). |
 | `--no-prepend` | No `auto_prepend_file`/`auto_append_file` — some security plugins use one (Wordfence's "Extended Protection" firewall mode, for instance: <https://www.wordfence.com/help/firewall/optimizing-the-firewall/>). |
 | `--sealed` | Every cleartext PHP file under the tree is refused unless its folder is listed in `envelock.sealed_cleartext` (`php.ini`), and `eval()` is refused while the package is active. |
-| `--bytecode` | NTS PHP; the **exact** PHP build the package was made for (a host's PHP patch update, e.g. 8.4.27 → 8.4.28, makes the loader refuse it until it is repacked); the absolute deploy path given at pack time (`--deploy-root`). |
+| `--bytecode` | NTS PHP; the **exact** PHP build the package was made for (a host's PHP patch update, e.g. 8.4.27 → 8.4.28, makes the loader refuse it until it is repacked); the absolute deploy path given at pack time (`--deploy-root`); on a host whose identity file trusts more than one developer, also `envelock.allow_bytecode=1` (the default `"auto"` allows bytecode only on single-developer hosts; C-16). |
 | `--include-protection` | Nothing on the server; protected files can only be included by other protected files of the same project or be the entry script. |
 | Licences | `envelock.licence` in `php.ini` pointing to the licence file. |
 | Anti clock rollback | `envelock.clock_state`: a file the PHP **worker** can write. |

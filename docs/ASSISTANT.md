@@ -74,16 +74,16 @@ Repeat *Create server key* and *Export public key* for every server (`servidor2`
 | Rename private methods (test the package) | optional; renames private methods reached only via `$this->`/`self::`/`static::`; skips anything dynamic or used as a string | `--obfuscate-methods` |
 | Rename private properties (HIGH RISK) | optional; renames private instance properties used only as `$this->name`; **breaks data serialized before obfuscation** (sessions/caches); skips classes that serialize or use Reflection | `--obfuscate-properties` |
 | Obfuscate control flow | optional; inserts an always-false opaque-predicate dead branch per function/method (modest; behaviour and line numbers unchanged; functions using `goto` skipped) | `--obfuscate-flow` |
-| Flatten control flow (O6) | optional; rewrites plain function/method bodies into a dispatch loop (`switch` in `while`); generators, `goto`, nested declarations, dynamic variables, `compact`/`extract`/`get_defined_vars`, `include`/`eval` left as written; not combinable with virtualization | `--obfuscate-flatten` |
 | Vault string literals | optional; moves runtime-position string literals into a per-file vault the loader resolves, so they are not kept as constants in the compiled code; literals in constant expressions stay inline | `--vault-strings` |
 | Include protection | optional; protected files run only as the entry point or from protected code of the same project | `--include-protection` |
 | Refuse auto_prepend/append | optional | `--no-prepend` |
 | Refuse FFI/dl() | optional; refuses to run while FFI or `dl()` is reachable (they can read the decrypted code from memory); only for apps that need neither | `--no-ffi` |
 | Sealed tree | optional; refuses any plain PHP under the package folder and `eval()` while the package is active; only when every `.php` in the tree is protected and the app does not use `eval()` | `--sealed` |
 | Signed manifest at runtime | **on by default** (checkbox checked); writes a signed binary manifest the loader checks on load, refusing to run if any listed file is missing (deletion detection) and enabling the ~5× manifest fast path (on servers that trust a single developer). Uncheck it to opt out | default; `--no-manifest` to opt out (explicit form: `--enforce-manifest`) |
+| Signed manifest for 'Verify' | optional; writes the signed JSON manifest (`envelock-manifest`) that the **Verify tab** (§9) and the command line's `verify` read to check a deployed package file by file. Off by default; it is separate from the runtime manifest above | `--manifest` |
 | Exclude | comma-separated patterns, e.g. `vendor/*, tests/*` | one `--exclude 'vendor/*'` per pattern |
 | Copy as-is | comma-separated patterns, e.g. `*.css, *.png` | one `--asset '*.css'` per pattern |
-| PHP 8 | needed only for the first two options (see §7) | `--php C:\php\php.exe` |
+| PHP 8 | needed only for the source-transformation options (see §10) | `--php C:\php\php.exe` |
 
 Press **Run**. The release number (serial) is the current time, as in the command line without
 `--serial`. Full command equivalent:
@@ -96,8 +96,9 @@ python encoder/envelock.py pack --owner owner.enc.json --recipient servidor1.pub
   --strip-comments --obfuscate --compact --encode-strings --obfuscate-methods --php php --no-prepend
 ```
 
-The command line also has `--php-ext .module` (extra PHP extensions) and `--serial <n>`, which the
-assistant does not show. Deploy the output folder; leave `vendor/` out of the encryption and
+The command line also has `--php-ext .module` (extra PHP extensions), `--serial <n>`, and the
+advanced transforms the assistant deliberately omits (`--obfuscate-flatten`, `--obfuscate-names`,
+`--virtualize`, `--bytecode`), which `recommend` never enables on its own. Deploy the output folder; leave `vendor/` out of the encryption and
 deploy it separately ([MANUAL](MANUAL.md) §14). With `vendor/` left out, keep **Include protection**
 off: an error or shutdown handler registered from `vendor/` would be refused when it loads one of your
 protected classes ([MANUAL](MANUAL.md) §14, `--include-protection`).
@@ -161,13 +162,47 @@ The command line also has `developer set --remove-recovery`, which the assistant
 After a rotation, export the new developer descriptor (Keys tab) and update every identity file
 (*Add/update trusted developer*). The full procedure is in [MANUAL](MANUAL.md) §15.
 
-## 7. Inspect tab
+## 7. Licence tab
+
+Issue and inspect signed **deployment licences**, and read this host's fingerprints. A licence is
+**not secret** — its integrity is the signature — so it is written world-readable; point
+`envelock.licence` at it in `php.ini` on the server and issue one per host.
+
+| Box | What to fill in | Command equivalent |
+|---|---|---|
+| **Issue a licence** | *Signing key (owner)* `owner.enc.json`; *Save licence to* `licence.bin`; optionally an expiry (*Expire in N days* **or** *…or expire YYYY-MM-DD*) and/or a binding (*Machine*, *Domain*, *IP* — each takes `this` for THIS host, or the hex/name value the server reported). Tick *Overwrite* to replace an existing file | `python encoder/envelock.py licence issue --owner owner.enc.json --out licence.bin` then `--days 365` **or** `--expires 2027-01-01`, and/or `--machine this`, `--domain app.example.com`, `--ip this` (`--force` to overwrite) |
+| **This host's fingerprints** | *Show machine id* / *Show domain / IP id* — run **on the server** to get the values to bind a licence to it | `python encoder/envelock.py licence machine-id` · `python encoder/envelock.py licence host-id` |
+| **Inspect a licence** | *Licence file* `licence.bin` — shows its constraints (expiry, machine/domain/IP) without checking the signature | `python encoder/envelock.py licence inspect licence.bin` |
+
+An expiry and a binding are optional: leave them empty for a licence that never expires and runs on
+any host. A **binding is refused by Windows loaders** (they have no machine/domain/IP fingerprint),
+and `this` as a domain binds THIS machine's own name — usually *not* a web server's `SERVER_NAME`;
+the assistant warns about both when you issue one. An all-zero fingerprint (which would silently mean
+"any") is refused. The loader checks the signature and the expiry at run time.
+
+## 8. Inspect tab
 
 Choose an encrypted file, an identity file (`.bin`) or a key/descriptor (`.json`) and press
 **Inspect**: it shows only non-secret metadata (project, release, recipients, developers,
 minimum releases). Command equivalent: `python encoder/envelock.py inspect <file>`.
 
-## 8. When PHP 8 is missing
+## 9. Verify tab
+
+Check a deployed package against its **signed manifest**: it confirms every file is present and
+unchanged and that your key signed it. Pack with **Signed manifest for 'Verify'** ticked (§3), or
+the command line's `--manifest`, to create the manifest this reads.
+
+| Field | What to fill in | Command option |
+|---|---|---|
+| Packaged folder | the encrypted output folder to check | `--package "./miapp cifrado"` |
+| Developer or owner descriptor | your `developer.json` (public) or `owner.enc.json` (asks for its password if encrypted) | `--developer developer.json` (or `--owner owner.enc.json`) |
+
+Press **Verify the package**: it reports `ok` plus any `missing`, `added` or `changed` files.
+Command equivalent:
+`python encoder/envelock.py verify --package "./miapp cifrado" --developer developer.json`
+(exit code 0 when intact, 1 otherwise).
+
+## 10. When PHP 8 is missing
 
 *Remove comments*, *Obfuscate local variables*, *Compact*, *Encode string literals*, *Rename private methods*, *Rename private properties*, *Obfuscate control flow* and *Vault string literals* run a PHP 8 CLI with the `tokenizer` extension.
 At start-up the assistant looks for one — a PHP it downloaded earlier, then the absolute folders of
@@ -201,7 +236,7 @@ Command-line equivalent: install PHP 8 yourself and pass it with `--php`:
 
 Check it with `php -r "echo PHP_VERSION, function_exists('token_get_all') ? ' ok' : ' no tokenizer';"`.
 
-## 9. Errors you may see
+## 11. Errors you may see
 
 | Message | Meaning |
 |---|---|

@@ -341,10 +341,24 @@ def test_php_plain_files_still_work(native, tmp_path):
 
 
 def test_php_without_loader_fails_closed(native, tmp_path):
+    """C-31: a protected file run WITHOUT the Envelock loader must fail closed with a NON-ZERO exit — the
+    pre-1.1 stub exited 0, so a cron/CLI run or a web health check read a loader-less server as success —
+    and must never run the real code. The 1.1 stub also sets HTTP 500 for a web SAPI (not visible here)."""
     output = package(native, tmp_path, {"index.php": '<?php echo "secret-output";'})
     result = subprocess.run(["php", "-n", str(output / "index.php")], capture_output=True, text=True)
-    assert result.stdout == "Envelock loader required\n"
-    assert "secret-output" not in result.stdout
+    assert result.returncode != 0, "C-31: the stub must exit non-zero without the loader"
+    assert "secret-output" not in result.stdout                 # the real code never runs
+
+
+def test_php_pre_1_1_stub_package_still_runs(native, tmp_path, monkeypatch):
+    """Backward compatibility (C-31): a package made BEFORE 1.1 (the old stub) must keep running on a
+    1.1+ loader — the loader recognises both stubs and derives the AAD from each file's own prefix. Pack
+    with the pre-1.1 stub and confirm it decrypts and runs unchanged."""
+    monkeypatch.setattr(a, "STUB", a.STUB_V2)                   # emulate the pre-1.1 encoder
+    output = package(native, tmp_path, {"index.php": '<?php echo "runs-old-stub";'})
+    assert output.joinpath("index.php").read_bytes().startswith(a.STUB_V2)
+    result = php(native, output / "index.php")
+    assert result.returncode == 0 and result.stdout == "runs-old-stub", result.stdout + result.stderr
 
 
 def test_php_no_identity_configured_fails_closed(native, tmp_path):
@@ -353,6 +367,34 @@ def test_php_no_identity_configured_fails_closed(native, tmp_path):
     assert result.returncode != 0
     assert "no identity configured" in result.stderr
     assert "secret-output" not in result.stdout
+
+
+def test_php_identity_checksum_catches_corruption_and_reads_old_format(native, tmp_path):
+    """C-29: a 1.1 identity file (ENVLKID4) carries a trailing SHA-256, so a bit flip — e.g. in a minimum
+    serial, which the pre-1.1 format accepted silently — is caught and the loader refuses to run with it.
+    A pre-1.1 identity (ENVLKID3, no checksum) is still read, so upgrading the loader does not break an
+    already-deployed identity file."""
+    out = package(native, tmp_path, {"index.php": '<?php echo "ok";'})
+    v4 = Path(native[4]).read_bytes()
+    assert v4[:8] == b"ENVLKID4", "write_identity should produce the 1.1 (checksummed) format"
+    assert php(native, out / "index.php").stdout == "ok"         # the fixture's ENVLKID4 identity runs
+    # (a) a corrupted ENVLKID4 is refused: the SHA-256 no longer matches.
+    corrupt = tmp_path / "corrupt.bin"
+    blob = bytearray(v4)
+    blob[20] ^= 1                                               # flip a byte inside the body
+    fd = os.open(corrupt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(bytes(blob))
+    bad = php(native, out / "index.php", identity=corrupt)
+    assert bad.returncode != 0 and "checksum does not match" in bad.stderr, bad.stderr
+    assert "ok" not in bad.stdout                               # fails closed
+    # (b) a pre-1.1 ENVLKID3 identity (the same body without the checksum) still loads and runs.
+    old = tmp_path / "v3.bin"
+    v3 = b"ENVLKID3" + v4[8:-32]                                # drop the checksum, restore the v3 magic
+    fd = os.open(old, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(v3)
+    assert php(native, out / "index.php", identity=old).stdout == "ok"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission check")
@@ -823,6 +865,60 @@ def test_preflight_accepts_a_configured_loader(native, tmp_path):
     assert opcache and opcache[0].startswith("OK"), result.stdout
 
 
+def _php_cgi():
+    """php-cgi of the PHP on PATH (next to it on Windows), or None."""
+    found = shutil.which("php-cgi")
+    if found:
+        return found
+    cli = shutil.which("php")
+    if cli:
+        sibling = Path(cli).with_name("php-cgi.exe" if os.name == "nt" else "php-cgi")
+        if sibling.is_file():
+            return str(sibling)
+    return None
+
+
+def test_preflight_over_the_web_hides_paths_and_expires(tmp_path):
+    """Audit 2026-11-17: left on a web server, the pre-flight page printed the full path of the
+    server's private identity file and of the prepend/blacklist files to anyone. Over the web it now
+    shows file names only and answers only during the hour after it was uploaded; the command line
+    still shows full paths."""
+    cgi = _php_cgi()
+    if cgi is None or shutil.which("php") is None:
+        pytest.skip("needs php and php-cgi")
+    page = tmp_path / "pf.php"
+    page.write_bytes(PREFLIGHT.read_bytes())
+    secret = tmp_path / "SECRETDIR-preflight"
+    secret.mkdir()
+    (secret / "prep.php").write_text("<?php\n")
+    ini = ("-n", "-d", f"auto_prepend_file={secret / 'prep.php'}")
+    web = subprocess.run([cgi, *ini, "-q", str(page)], capture_output=True, text=True, timeout=60)
+    assert "prep.php (full path hidden on the web)" in web.stdout, web.stdout + web.stderr
+    assert "SECRETDIR" not in web.stdout
+    cli = subprocess.run(["php", *ini, str(page)], capture_output=True, text=True, timeout=60)
+    assert "SECRETDIR" in cli.stdout, cli.stdout
+    if os.name != "nt":
+        return        # the change time cannot be set back on POSIX: the expiry is checked on Windows
+    old = time.time() - 2 * 3600
+    os.utime(page, (old, old))
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(old))
+    subprocess.run(["powershell", "-NoProfile", "-Command",
+                    f"(Get-Item -LiteralPath '{page}').CreationTime = '{stamp}'"], check=True)
+    expired = subprocess.run([cgi, *ini, "-q", str(page)], capture_output=True, text=True, timeout=60)
+    assert "has expired" in expired.stdout and "SECRETDIR" not in expired.stdout, expired.stdout
+    assert "prep.php" not in expired.stdout
+    still = subprocess.run(["php", *ini, str(page)], capture_output=True, text=True, timeout=60)
+    assert "SECRETDIR" in still.stdout                 # the command line is not limited
+
+
+def test_preflight_with_phpinfo_disabled_still_reports(native):
+    """Audit 2026-11-17: with phpinfo in disable_functions (common on shared hosting) the check was a
+    fatal error and produced no report; it now says what it could not check."""
+    result = php(native, PREFLIGHT, extra_ini=("-d", "disable_functions=phpinfo"))
+    assert "cannot be read here (phpinfo is disabled)" in result.stdout, result.stdout + result.stderr
+    assert "Result:" in result.stdout
+
+
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_opcache_switched_off_after_startup_runs_and_preflight_agrees(native, tmp_path, opt_in):
     """HOST-1. OPcache on in php.ini and switched off later — what a host's per-directory .user.ini,
@@ -1069,6 +1165,47 @@ def test_php_no_mixed_releases_in_one_folder(native, tmp_path):
     assert php(native, new / "main.php").stdout == "new"
     (new / "lib.php").write_bytes((old / "lib.php").read_bytes())
     assert refused(php(native, new / "main.php"), "files of different releases")
+
+
+def test_php_release_mixing_via_directory_symlink_is_refused(native, tmp_path):
+    """C-11: a subfolder swapped for a symlink to an OLD release of the SAME project+developer runs the
+    old file without copying anything into the new folder — each file is at the path it was packaged
+    with and its own folder is self-consistent, so the per-folder check (above) never sees a mix. The
+    loader now permits only one release per (project, developer) per request and refuses the second one.
+    A clean multi-folder package (main.php + lib/calc.php of the SAME release) must still load — that is
+    asserted first, so the fix cannot be a blanket 'no two folders' refusal."""
+    if os.name == "nt":
+        pytest.skip("POSIX directory symlink")
+    project = str(uuid.uuid4())
+    new_files = {"main.php": "<?php require __DIR__ . '/lib/calc.php'; echo calc();",
+                 "lib/calc.php": "<?php function calc() { return 'new'; }"}
+    new = package(native, tmp_path, new_files, project=project, serial=2)
+    old = package(native, tmp_path, dict(new_files, **{"lib/calc.php": "<?php function calc() { return 'old'; }"}),
+                  project=project, serial=1)
+    # Legitimate: main.php and lib/calc.php of ONE release (two sub-paths, one package root) load fine.
+    assert php(native, new / "main.php").stdout == "new"
+    # Attack: replace new/lib with a symlink to the OLD release's lib (same project, same developer).
+    shutil.rmtree(new / "lib")
+    os.symlink(old / "lib", new / "lib", target_is_directory=True)
+    result = php(native, new / "main.php")
+    assert result.stdout != "old", "C-11: the old release ran through a directory symlink"
+    assert refused(result, "a protected file was reached through a directory symlink"), \
+        result.stdout + result.stderr
+
+
+def test_php_whole_tree_symlink_deploy_still_loads(native, tmp_path):
+    """The C-11 guard must not break a legitimate whole-tree symlink deploy (Capistrano's
+    `current` -> `releases/N`): the entry point is reached through a symlink, but the whole tree is ONE
+    release, so there is no release to mix and the request must run."""
+    if os.name == "nt":
+        pytest.skip("POSIX directory symlink")
+    files = {"main.php": "<?php require __DIR__ . '/lib/calc.php'; echo calc();",
+             "lib/calc.php": "<?php function calc() { return 'ok'; }"}
+    release = package(native, tmp_path, files)
+    current = tmp_path / "current"
+    os.symlink(release, current, target_is_directory=True)
+    result = php(native, current / "main.php")
+    assert result.returncode == 0 and result.stdout == "ok", result.stdout + result.stderr
 
 
 def test_php_minimum_serial_refuses_old_releases(native, tmp_path):
@@ -1359,11 +1496,16 @@ def test_php_non_ascii_identity_and_clock_paths_from_a_utf8_php_ini(native, tmp_
 
 
 def _ffi_loaded():
-    """True iff this PHP can load the FFI extension (only then can the refusal be exercised)."""
-    probe = subprocess.run(
-        ["php", "-n", "-d", "extension=ffi", "-r", "echo extension_loaded('ffi')?'1':'0';"],
-        capture_output=True, text=True, check=False,
-    )
+    """True iff this PHP can load the FFI extension (only then can the refusal be exercised). It runs
+    when the module is imported (a skipif condition), so a host without any `php` must get False, not
+    an exception that aborts the collection of every native test (audit 2026-11-17, H-3)."""
+    try:
+        probe = subprocess.run(
+            ["php", "-n", "-d", "extension=ffi", "-r", "echo extension_loaded('ffi')?'1':'0';"],
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return probe.stdout.strip() == "1"
 
 
@@ -1969,6 +2111,240 @@ def test_bytecode_roundtrip_matches_source(native, tmp_path):
     assert run.stdout == plain.stdout
 
 
+H09_TARGET = (
+    "<?php\nnamespace App;\n"
+    "interface Shape { public function area(): float; }\n"
+    "abstract class Base implements Shape { protected string $name = 'base'; public static int $count = 0;\n"
+    "  public function __construct(public readonly int $id = 7) { static::$count++; }\n"
+    "  public function label(): string { return sprintf('%s#%d', $this->name, $this->id); } }\n"
+    "final class Circle extends Base { protected string $name = 'circle'; const TWO = 2;\n"
+    "  public function __construct(private ?float $r = null) { parent::__construct(3); }\n"
+    "  public function area(): float { return M_PI * ($this->r ?? 1.5) ** self::TWO; } }\n"
+    "enum Suit: string { case Hearts = 'H'; case Spades = 'S';\n"
+    "  public function color(): string { return match($this) { self::Hearts => 'Red', self::Spades => 'Black' }; } }\n"
+    "function gen(int $n) { for ($i = 0; $i < $n; $i++) { yield $i => $i * 2; } }\n"
+    "function maker(string|int $p, bool $flag = false, $none = null, int|float ...$rest) {"
+    " return fn($x) => $p . $x . ($flag ? '!' : ''); }\n"
+    "final class Stmt { const MODE = 3;\n"
+    "  public function fetchAll(int $mode = self::MODE, mixed ...$args): array { return [$mode, ...$args]; }\n"
+    "  public function setMode(int $mode, mixed ...$args): true { return true; }\n"
+    "  public function pick(Base|Shape|null $x = null, Circle|Base|false $y = false, string ...$z): Base|Shape|null { return $x; }\n"
+    "  public function rows(?array $p = null, int|string ...$q): Stmt|Circle|false { return false; } }\n"
+    "$o = new class { public $v = [1, true, null]; };\n"
+    "$c = new Circle(); echo $c->label(), ' ', round($c->area(), 3), ' ', Suit::Hearts->color(), ' ',"
+    " implode(',', iterator_to_array(gen(3))), ' ', maker('a')('b'), ' ', count($o->v), \"\\n\";\n")
+
+
+def test_bytecode_images_are_reproducible(native, tmp_path):
+    """H-09 (external audit 2026-11-12), fixed 2026-11-17. A bytecode image carried bytes the engine
+    never wrote -- structure padding, the value of a null/true/false zval, the operand of an UNUSED
+    operand, all copied from the request heap or the compiler's stack -- and a per-process counter in
+    its runtime-definition keys. So two packs of one file differed (measured: 154 of 16 728 bytes, many
+    of them stale pointers) and an image could hold bytes of the file packed before it. Now one source
+    gives one image: in separate processes, after other files (one of them full of a marker string),
+    and emitted again and again in the same process. The image still runs."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    target = tmp_path / "target.php"
+    target.write_text(H09_TARGET)
+    marker = tmp_path / "marker.php"
+    marker.write_text("<?php\n" + "\n".join(
+        f"$v{i} = 'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ{i:04d}'; function zf{i}(?int $a = null) {{ return [$a, true, '{i}']; }}"
+        for i in range(300)) + "\n")
+    other = tmp_path / "other.php"
+    other.write_text("<?php\n" + "\n".join(
+        f"class Q{i} {{ public ?int $p = null; function m($x) {{ return $this->p ?? $x; }} }}" for i in range(80)) + "\n")
+    emit_one = "file_put_contents($argv[2], envelock_bc_emit($argv[1]));"
+    after = "envelock_bc_emit($argv[3]); file_put_contents($argv[2], envelock_bc_emit($argv[1]));"
+    again = ("for ($i = 0; $i < 4; $i++) { envelock_bc_emit($argv[3]); envelock_bc_emit($argv[1]); }"
+             " file_put_contents($argv[2], envelock_bc_emit($argv[1]));")
+    runs = [("alone-1", emit_one, None), ("alone-2", emit_one, None), ("after-marker", after, marker),
+            ("after-classes", after, other), ("again", again, other)]
+    images = {}
+    for name, code, before in runs:
+        out = tmp_path / f"{name}.bin"
+        args = [str(target), str(out)] + ([str(before)] if before else [])
+        result = php(native, "-r", code, *args)
+        assert result.returncode == 0 and out.exists(), (name, result.stderr[-1500:])
+        images[name] = out.read_bytes()
+    reference = images["alone-1"]
+    for name, image in images.items():
+        differing = [i for i in range(min(len(image), len(reference))) if image[i] != reference[i]]
+        assert len(image) == len(reference) and not differing, \
+            f"{name}: {len(differing)} bytes differ from a lone pack, first at {differing[:12]}"
+    assert b"ZZZZ" not in images["after-marker"]
+    run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }",
+              str(tmp_path / "again.bin"))
+    assert run.returncode == 0, run.stderr[-1500:]
+    assert run.stdout.startswith("circle#3 7.069 Red 0,2,4 ab 3"), run.stdout
+
+
+def test_bytecode_image_holds_no_uninitialised_byte_under_valgrind(native, tmp_path):
+    """H-09 from the other side: rather than compare images, ask memcheck whether the image the emitter
+    writes holds a single byte nobody initialised. Run with the system allocator (USE_ZEND_ALLOC=0) so
+    memcheck sees every heap block; a leftover from the compiler's stack or the heap -- padding of any
+    structure, including ones a comparison of two runs cannot see because the leftover happens to be the
+    same both times (a union of classes' type list) -- is reported on the write() of the image."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    if PHP_WINDOWS or not shutil.which("valgrind") or os.getenv("ENVELOCK_PHP_PRELOAD"):
+        pytest.skip("needs valgrind (and no sanitizer preload)")
+    target = tmp_path / "target.php"
+    target.write_text(H09_TARGET)
+    image = tmp_path / "image.bin"
+    env = dict(php_environment(), USE_ZEND_ALLOC="0")
+    result = subprocess.run(
+        ["valgrind", "--tool=memcheck", "--track-origins=yes", "--num-callers=12",
+         "php", "-n", "-d", f"extension={native[1]}", "-r",
+         "file_put_contents($argv[2], envelock_bc_emit($argv[1]));", str(target), str(image)],
+        capture_output=True, text=True, check=False, env=env, timeout=900)
+    assert image.exists() and image.stat().st_size > ENVELOCK_BC_HEADER_SIZE, result.stderr[-3000:]
+    assert "points to uninitialised byte(s)" not in result.stderr, result.stderr[-6000:]
+    assert "ERROR SUMMARY: 0 errors" in result.stderr, result.stderr[-6000:]
+
+
+def test_bytecode_internal_static_methods_do_not_crash(native, tmp_path):
+    """C-05 regression (R1 A-01). A bytecode image that CALLS internal static methods
+    (DateTime::createFromFormat, DateTimeZone::listIdentifiers, SplFixedArray::fromArray,
+    Closure::fromCallable / Closure::bind, Fiber::suspend) used to leave ZEND_DO_UCALL in the op_array;
+    the engine then ran that internal call as a user call -> SIGSEGV (139), AT EXECUTION, not at
+    deserialize. Cause: under IGNORE_INTERNAL_FUNCTIONS (BC-10) zend_get_call_op() sends a resolved
+    INTERNAL callee down its user branch, and PHP 8.3.6 resolves a static call to an internal class
+    despite IGNORE_INTERNAL_CLASSES (8.2.35/8.3.36/8.4.27/8.5.12 do not, which is why this passed on
+    them while it crashed on Ubuntu 24.04's PHP). Fixed twice: the emitter compiles with a pass-through
+    zend_execute_ex, so the compiler emits only the generic DO_FCALL, and the loader rewrites any
+    DO_UCALL/DO_ICALL to DO_FCALL before choosing handlers (envelock_fc_generic_call). This proves those
+    exact cases run through the loader with no crash and behave like plain PHP."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    source = tmp_path / "c05.php"
+    source.write_text(
+        "<?php\n"
+        "function c05() {\n"
+        "    $o = [];\n"
+        "    $o[] = DateTime::createFromFormat('Y-m-d', '2020-01-02')->format('Y');\n"       # static, internal
+        "    $o[] = in_array('UTC', DateTimeZone::listIdentifiers(), true) ? 'tz' : 'no';\n"  # static, internal
+        "    $a = SplFixedArray::fromArray([10, 20, 30]);\n"                                  # static, internal
+        "    $o[] = (string) $a[1];\n"
+        "    $f = Closure::fromCallable('strlen');\n"                                          # static, internal
+        "    $o[] = (string) $f('hello');\n"
+        "    $g = Closure::bind(function () { return 'bound'; }, null);\n"                     # static, internal
+        "    $o[] = $g();\n"
+        "    $fiber = new Fiber(function () { $x = Fiber::suspend('s'); return 'f' . $x; });\n"  # Fiber::suspend
+        "    $o[] = $fiber->start();\n"
+        "    $o[] = $fiber->resume('r');\n"
+        "    return implode('|', $o);\n"
+        "}\n")
+    image = tmp_path / "c05.bin"
+    emit = php(native, "-r",
+               "$i = envelock_bc_emit($argv[1]); if ($i === false) { exit(3); }"
+               "file_put_contents($argv[2], $i);", str(source), str(image))
+    assert emit.returncode == 0, emit.stderr[-2000:]
+    assert image.stat().st_size > ENVELOCK_BC_HEADER_SIZE
+    # Oracle: the same program as plain source.
+    plain = subprocess.run(["php", "-n", "-r", "require $argv[1]; echo c05();", str(source)],
+                           capture_output=True, text=True, check=False, env=php_environment())
+    assert plain.returncode == 0, plain.stderr[-2000:]
+    # The image is loaded cold and the function is CALLED (where the DO_UCALL crash occurred).
+    run = php(native, "-r",
+              "$b = file_get_contents($argv[1]); if (!envelock_bc_run($b)) { exit(4); } echo c05();",
+              str(image))
+    assert run.returncode == 0, f"C-05: internal static call crashed under bytecode (rc={run.returncode})\n{run.stderr[-2000:]}"
+    assert run.stdout == plain.stdout, (run.stdout, plain.stdout)
+
+
+# C-05: internal static calls (and user calls) in EVERY kind of op_array an image carries — top-level
+# code, function, method, static method, closure, arrow function, generator, Fiber, destructor, a
+# subclass of an internal class — with named and spread arguments, a first-class callable, a false
+# return, parent::__construct of an internal class and static:: on a DateTime subclass. A call the
+# compiler hard-coded as a user call ANYWHERE in the image is exercised.
+C05_PROGRAM = r"""<?php
+function c05_fmt($d) { return $d instanceof DateTimeInterface ? $d->format('Y-m-d') : var_export($d, true); }
+function c05_fib(int $n): int { return $n < 2 ? $n : c05_fib($n - 1) + c05_fib($n - 2); }
+function c05_inc(int &$x): void { $x++; }
+function c05_gen() {
+    yield c05_fmt(DateTimeImmutable::createFromFormat('Y-m-d', '2021-03-04'));
+    yield (string) count(SplFixedArray::fromArray([1, 2, 3, 4]));
+}
+class C05Base { public static function make(): string { return c05_fmt(DateTime::createFromFormat('Y-m-d', '2022-05-06')); } }
+class C05 extends C05Base {
+    public function inst(): string { return (string) DateInterval::createFromDateString('3 days')->d; }
+    public static function stat(): string { return parent::make() . '/' . static::class; }
+    public function __destruct() { echo 'D:', c05_fmt(DateTime::createFromFormat('Y-m-d', '2023-07-08')), "\n"; }
+}
+class C05Obj extends ArrayObject { public function __construct(array $a) { parent::__construct($a); } }
+class C05Dt extends DateTime { public static function mk(): string { return c05_fmt(static::createFromFormat('Y-m-d', '2024-09-10')); } }
+$o = [];
+$o[] = c05_fmt(DateTime::createFromFormat('Y-m-d', '2020-01-02'));
+$o[] = c05_fmt(DateTime::createFromFormat(format: 'Y-m-d', datetime: '2020-02-03'));
+$o[] = c05_fmt(DateTime::createFromFormat(...['Y-m-d', '2020-03-04']));
+$o[] = c05_fmt(DateTime::createFromFormat('Y-m-d', 'not a date'));
+$o[] = in_array('UTC', DateTimeZone::listIdentifiers(), true) ? 'tz' : 'no';
+$o[] = (string) SplFixedArray::fromArray([7, 8, 9])[2];
+$f = Closure::fromCallable('strtoupper'); $o[] = $f('abc');
+$o[] = (Closure::bind(function () { return 'bound'; }, null))();
+$fc = DateTime::createFromFormat(...); $o[] = c05_fmt($fc('Y-m-d', '2020-04-05'));
+$keep = new stdClass; $o[] = WeakReference::create($keep)->get() === $keep ? 'weak' : 'x';
+$o[] = (function () { return c05_fmt(DateTime::createFromFormat('Y-m-d', '2020-05-06')); })();
+$o[] = (fn () => c05_fmt(DateTime::createFromFormat('Y-m-d', '2020-06-07')))();
+$o[] = (static fn () => count(DateTimeZone::listAbbreviations()) > 0 ? 'abbr' : 'x')();
+$o[] = implode(',', iterator_to_array(c05_gen(), false));
+$fiber = new Fiber(function (string $x): string { $y = Fiber::suspend($x . '1'); return $y . '2'; });
+$o[] = $fiber->start('s'); $fiber->resume('r'); $o[] = $fiber->getReturn();
+$o[] = (new C05)->inst(); $o[] = C05::stat(); $o[] = C05Dt::mk();
+$o[] = (string) count(new C05Obj([1, 2, 3]));
+$o[] = (string) c05_fib(12);
+$n = 41; c05_inc($n); $o[] = (string) $n;
+echo implode('|', $o), "\n";
+"""
+
+
+def _c05_roundtrip(native, tmp_path, emit_function):
+    """Emit C05_PROGRAM with `emit_function`, run the image through the loader and the same program as
+    plain PHP. Returns (run, plain)."""
+    source = tmp_path / "c05_all.php"
+    source.write_text(C05_PROGRAM, encoding="utf-8")
+    image = tmp_path / "c05_all.bin"
+    emit = php(native, "-r",
+               f"$i = {emit_function}($argv[1]); if ($i === false) {{ exit(3); }}"
+               "file_put_contents($argv[2], $i);", str(source), str(image))
+    assert emit.returncode == 0, emit.stderr[-2000:]
+    plain = subprocess.run(["php", "-n", "-r", "require $argv[1];", str(source)],
+                           capture_output=True, text=True, check=False, env=php_environment())
+    assert plain.returncode == 0, plain.stderr[-2000:]
+    assert plain.stdout.count("|") >= 20 and plain.stdout.startswith("D:2023-07-08\n"), plain.stdout
+    run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }", str(image))
+    return run, plain
+
+
+def test_bytecode_internal_calls_match_cleartext_in_every_context(native, tmp_path):
+    """C-05, differential and broader than the test above: every call of C05_PROGRAM — internal static
+    calls in every kind of op_array, plus user recursion and a by-reference user call (DO_UCALL in
+    the compiler's own output) — must run from the image with no crash and print byte for byte what
+    the plain program prints."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    run, plain = _c05_roundtrip(native, tmp_path, "envelock_bc_emit")
+    assert run.returncode == 0, f"C-05: crashed under bytecode (rc={run.returncode})\n{run.stderr[-2000:]}"
+    assert run.stdout == plain.stdout, (run.stdout, plain.stdout)
+
+
+def test_bytecode_loader_makes_legacy_call_opcodes_generic(native, tmp_path):
+    """C-05, the LOADER's own defence, independent of the emitter fix: an image emitted the way the
+    emitters before the fix did (the compiler's DO_UCALL kept, which on PHP 8.3.6 calls
+    DateTime::createFromFormat through the user-call path) must still run correctly, because the
+    deserializer rewrites DO_UCALL/DO_ICALL to the generic DO_FCALL before choosing handlers. Images
+    packed with an unfixed emitter are already deployed: this is what keeps them from crashing."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    probe = php(native, "-r", "echo function_exists('envelock_bc_emit_legacy_calls') ? 'y' : 'n';")
+    if probe.stdout.strip() != "y":
+        pytest.skip("test build without envelock_bc_emit_legacy_calls (--enable-envelock-bcrun-unsafe)")
+    run, plain = _c05_roundtrip(native, tmp_path, "envelock_bc_emit_legacy_calls")
+    assert run.returncode == 0, f"C-05: legacy image crashed (rc={run.returncode})\n{run.stderr[-2000:]}"
+    assert run.stdout == plain.stdout, (run.stdout, plain.stdout)
+
+
 def test_bytecode_image_carries_no_source_text(native, tmp_path):
     """The image holds the program's identifiers but none of its PHP source."""
     if _bytecode_available(native) != "yes":
@@ -2235,6 +2611,34 @@ def test_bytecode_package_runs_identically_to_source(native, tmp_path):
     assert result.stdout == BYTECODE_EXPECTED
 
 
+def test_bytecode_auto_off_on_a_multi_developer_host(native, tmp_path):
+    """C-16 hardening: a bytecode image runs in the engine right after deserialization, so a
+    malformed-but-signed image could crash the worker. On a host that trusts MORE THAN ONE developer,
+    bytecode is refused BY DEFAULT (one developer's image must not crash a shared server) unless the
+    operator sets envelock.allow_bytecode=1; on a single-developer host it still runs (that developer is
+    fully trusted). An explicit directive value always wins. The default ('auto') must not break the
+    common single-developer deployment."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    output, deploy = bytecode_pack(native, tmp_path, "multidev")
+    deploy.mkdir(parents=True, exist_ok=True)
+    for file in BYTECODE_APP:
+        shutil.copyfile(output / file, deploy / file)
+    # Single developer (the default identity): bytecode runs, default unchanged.
+    assert php(native, str(deploy / "use.php")).stdout == BYTECODE_EXPECTED
+    # A SECOND trusted (independent) developer on the host: the package is still signed by a trusted
+    # key, but bytecode is now refused by default.
+    owner_b = a.make_owner()
+    multi = tmp_path / "two-developers.bin"
+    write_identity(multi, [a.make_identity(native[3], native[2]), a.make_identity(native[3], owner_b)])
+    blocked = php(native, str(deploy / "use.php"), identity=multi)
+    assert blocked.returncode != 0 and "bytecode packages are refused here" in blocked.stderr
+    # The operator opts in explicitly: it runs again (explicit 1 overrides 'auto').
+    allowed = php(native, str(deploy / "use.php"), identity=multi,
+                  extra_ini=("-d", "envelock.allow_bytecode=1"))
+    assert allowed.returncode == 0 and allowed.stdout == BYTECODE_EXPECTED
+
+
 def test_bytecode_package_ships_no_php_source(native, tmp_path):
     """No PHP text in the package: neither syntax nor the program's own identifiers."""
     if _bytecode_available(native) != "yes":
@@ -2439,9 +2843,14 @@ def _build_loader_variant(tmp_path, subdir, configure_flags):
 
 def _exposes(module, func):
     r = subprocess.run(["php", "-n", "-d", f"extension={module}", "-r",
-                        f"echo function_exists('{func}') ? '1' : '0';"],
+                        f"echo extension_loaded('envelock') ? 'L' : '-', "
+                        f"function_exists('{func}') ? '1' : '0';"],
                        text=True, capture_output=True, check=False)
-    return r.stdout.strip() == "1"
+    out = r.stdout.strip()
+    # A module that did not load exposes nothing: without this, every "must not expose" below would
+    # pass for a build that cannot even be loaded.
+    assert out[:1] == "L", f"{module} did not load:\n{r.stdout}{r.stderr}"
+    return out[1:] == "1"
 
 
 def test_server_loader_exposes_no_bytecode_emit_or_run_surface(tmp_path):
@@ -2449,13 +2858,20 @@ def test_server_loader_exposes_no_bytecode_emit_or_run_surface(tmp_path):
     never by an inherited ENVELOCK_BCPOC environment variable, and -fvisibility=hidden (which hides them
     from nm -D) must not be mistaken for them being absent. A server loader (no bc flags) exposes
     NEITHER; the pack-side build (--enable-envelock-bcemit) exposes the emitter but NOT the runner (the
-    RCE surface); only the test build (--enable-envelock-bcrun-unsafe) exposes the runner."""
+    RCE surface); only the test build (--enable-envelock-bcrun-unsafe) exposes the runner.
+    On a thread-safe (ZTS) PHP the bytecode layer is left out of every build (ENV-2026-03: it is not
+    thread-safe), so there the pack-side build exposes neither: --bytecode packs need an NTS PHP."""
     server = _build_loader_variant(tmp_path, "srv", [])
     assert not _exposes(server, "envelock_bc_emit"), "server loader must not expose the emitter"
     assert not _exposes(server, "envelock_bc_run"), "server loader must not expose the runner"
 
     packer = _build_loader_variant(tmp_path, "packer", ["--enable-envelock-bcemit"])
-    assert _exposes(packer, "envelock_bc_emit"), "pack build must expose the emitter"
+    zts = subprocess.run(["php", "-n", "-r", "echo PHP_ZTS ? '1' : '0';"],
+                         text=True, capture_output=True, check=True).stdout.strip() == "1"
+    if zts:
+        assert not _exposes(packer, "envelock_bc_emit"), "ZTS: the bytecode layer must be left out"
+    else:
+        assert _exposes(packer, "envelock_bc_emit"), "pack build must expose the emitter"
     assert not _exposes(packer, "envelock_bc_run"), "pack build must NOT expose the RCE runner"
 
 
@@ -2492,6 +2908,12 @@ def test_bytecode_emitter_destroys_its_translation_table_inside_the_request(tmp_
     that was broken — the table must be destroyed by the emitter, inside the request."""
     if shutil.which("gdb") is None:
         pytest.skip("gdb is needed to read the call stack")
+    # A thread-safe PHP builds no bytecode layer (ENV-2026-03), so there is no emitter to follow; this
+    # test ran there only once gdb happened to be installed, and failed for that reason alone.
+    zts = subprocess.run(["php", "-n", "-r", "echo PHP_ZTS ? 1 : 0;"], capture_output=True, text=True,
+                         check=False, env=php_environment()).stdout.strip() == "1"
+    if zts:
+        pytest.skip("no bytecode layer on a thread-safe PHP")
     module = build_unstripped_extension(tmp_path)
     source = tmp_path / "app.php"
     source.write_text(BYTECODE_APP["app.php"])
@@ -2637,8 +3059,12 @@ def test_secret_memory_reports_what_the_kernel_actually_gave(native):
     assert on.returncode == 0
     kind = on.stdout.strip()
     # memfd_secret needs CONFIG_SECRETMEM *and* a small-page direct map; where the syscall is not
-    # registered the arena degrades to the locked mapping, and must say so rather than pass.
-    assert kind in ("memfd_secret", "mlock+MADV_DONTDUMP"), kind
+    # registered the arena degrades to the locked mapping, and must say so rather than pass. On
+    # Windows only VirtualLock applies, and it now says that instead of the Linux name.
+    if os.name == "nt":
+        assert kind == "VirtualLock", kind
+    else:
+        assert kind in ("memfd_secret", "mlock+MADV_DONTDUMP"), kind
 
 
 def test_secret_memory_keeps_decrypting_packages(native, tmp_path):
@@ -3092,6 +3518,220 @@ def test_o3_a_tracer_attached_while_a_protected_file_loads_is_refused(
     assert process.returncode != 0
     assert "being traced" in stderr, stderr
     assert "4242" not in stdout, "the protected code ran under a tracer"
+
+
+def _windows_kernel32():
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenThread.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.WaitForDebugEvent.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    kernel.WaitForDebugEvent.restype = wintypes.BOOL
+    kernel.ContinueDebugEvent.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+    kernel.ContinueDebugEvent.restype = wintypes.BOOL
+    kernel.DebugActiveProcess.argtypes = [wintypes.DWORD]
+    kernel.DebugActiveProcess.restype = wintypes.BOOL
+    kernel.DebugActiveProcessStop.argtypes = [wintypes.DWORD]
+    kernel.DebugActiveProcessStop.restype = wintypes.BOOL
+    kernel.DebugSetProcessKillOnExit.argtypes = [wintypes.BOOL]
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Thread32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel.GetThreadTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+    return kernel
+
+
+def _windows_open(kernel, opener, access, object_id):
+    """True when `opener` (OpenProcess / OpenThread) grants `access`, else the Windows error code."""
+    handle = opener(access, False, object_id)
+    error = ctypes.get_last_error()
+    if handle:
+        kernel.CloseHandle(handle)
+        return True
+    return error
+
+
+def _windows_first_thread(kernel, pid):
+    """The id of the oldest thread of `pid` -- php.exe's main thread, the one that serves the request."""
+    entry = ctypes.create_string_buffer(28)                 # THREADENTRY32: seven DWORDs
+    ctypes.memmove(entry, (28).to_bytes(4, "little"), 4)
+    snapshot = kernel.CreateToolhelp32Snapshot(0x4, 0)      # TH32CS_SNAPTHREAD
+    oldest = None
+    try:
+        more = kernel.Thread32First(snapshot, entry)
+        while more:
+            tid, owner = int.from_bytes(entry.raw[8:12], "little"), int.from_bytes(entry.raw[12:16], "little")
+            if owner == pid:
+                handle = kernel.OpenThread(0x0800, False, tid)  # THREAD_QUERY_LIMITED_INFORMATION
+                if handle:
+                    times = [ctypes.c_ulonglong() for _ in range(4)]
+                    if kernel.GetThreadTimes(handle, *map(ctypes.byref, times)):
+                        if oldest is None or times[0].value < oldest[0]:
+                            oldest = (times[0].value, tid)
+                    kernel.CloseHandle(handle)
+            more = kernel.Thread32Next(snapshot, entry)
+    finally:
+        kernel.CloseHandle(snapshot)
+    assert oldest is not None, f"no thread of {pid} found"
+    return oldest[1]
+
+
+def _windows_debug_continue(kernel, event):
+    """Continue one debug event the way a debugger that wants nothing should: the breakpoint the
+    loader or an attach raises is continued, any other first-chance exception passed back unhandled,
+    and the file handle that a CREATE_PROCESS or LOAD_DLL event carries closed. Returns the event code,
+    its process id and, for an exception, its code."""
+    code, pid, tid = (int.from_bytes(event.raw[i:i + 4], "little") for i in (0, 4, 8))
+    status, exception = 0x00010002, None                     # DBG_CONTINUE
+    if code == 1:                                            # EXCEPTION_DEBUG_EVENT
+        exception = int.from_bytes(event.raw[16:20], "little")
+        if exception not in (0x80000003, 0x4000001F):       # (WOW64) breakpoint
+            status = 0x80010001                              # DBG_EXCEPTION_NOT_HANDLED
+    elif code in (3, 6):                                     # CREATE_PROCESS / LOAD_DLL: hFile
+        handle = int.from_bytes(event.raw[16:24], "little")
+        if handle:
+            kernel.CloseHandle(handle)
+    kernel.ContinueDebugEvent(pid, tid, status)
+    return code, pid, exception
+
+
+def _windows_attach_and_detach(kernel, pid):
+    """Attach a debugger to `pid` and let go again: True, or the Windows error when it is refused.
+    The attach starts a thread in the target that breaks in; it is continued before detaching, or its
+    breakpoint could fire after the debugger has left and end the process."""
+    if not kernel.DebugActiveProcess(pid):
+        return ctypes.get_last_error()
+    kernel.DebugSetProcessKillOnExit(False)
+    event = ctypes.create_string_buffer(256)                 # DEBUG_EVENT is 176 bytes on x64
+    deadline = time.time() + 10
+    try:
+        while time.time() < deadline:
+            if kernel.WaitForDebugEvent(event, 500):
+                code, _, exception = _windows_debug_continue(kernel, event)
+                if code == 1 and exception == 0x80000003:
+                    break
+    finally:
+        kernel.DebugActiveProcessStop(pid)
+    return True
+
+
+def test_windows_harden_memory_closes_the_process(native, tmp_path):
+    """envelock.harden_memory on Windows, which only locked the keys in RAM until 2026-11-17 (the
+    audit found ReadProcessMemory, a dump and a debugger open to the same account). From the first
+    request the process's access list lets this account see, wait for and end PHP, but not read its
+    memory, write it, start a thread in it, duplicate a handle from it (which would hand back a full
+    one), suspend it or change the list back; and the request thread cannot be suspended or have its
+    context read or set. harden_memory=0 leaves the default list, which is what shows the test sees
+    the difference. PHP itself keeps working: it still starts a child process."""
+    if os.name != "nt" or not PHP_WINDOWS:
+        pytest.skip("Windows process access lists")
+    kernel = _windows_kernel32()
+    denied = {"PROCESS_VM_READ": 0x0010, "PROCESS_VM_WRITE|VM_OPERATION": 0x0028,
+              "PROCESS_CREATE_THREAD": 0x0002, "PROCESS_DUP_HANDLE": 0x0040,
+              "PROCESS_SUSPEND_RESUME": 0x0800, "WRITE_DAC": 0x00040000, "WRITE_OWNER": 0x00080000}
+    allowed = {"QUERY_LIMITED|SYNCHRONIZE": 0x00101000, "PROCESS_TERMINATE": 0x0001,
+               "PROCESS_QUERY_INFORMATION": 0x0400, "READ_CONTROL": 0x00020000}
+    thread_steer = 0x0008 | 0x0010 | 0x0002                  # GET_CONTEXT | SET_CONTEXT | SUSPEND_RESUME
+    seen = {}
+    for harden in ("1", "0"):
+        ready, go = tmp_path / f"ready-{harden}", tmp_path / f"go-{harden}"
+        script = tmp_path / f"probe-{harden}.php"
+        script.write_text(
+            "<?php\nfile_put_contents(" + php_literal(str(ready)) + ", (string)getmypid());\n"
+            "$end = microtime(true) + 30;\n"
+            "while (!file_exists(" + php_literal(str(go)) + ") && microtime(true) < $end) usleep(20000);\n"
+            "echo trim(shell_exec('cmd /c echo child-ran')), \"\\n\";\n")
+        process = subprocess.Popen(
+            ["php", "-n", "-d", f"extension={native[1]}", "-d", f"envelock.identity={native[4]}",
+             "-d", f"envelock.harden_memory={harden}", "-d", "display_errors=stderr", str(script)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=php_environment())
+        try:
+            deadline = time.time() + 20
+            while not ready.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            assert ready.exists(), "the probe never started"
+            pid = int(ready.read_text())
+            result = {name: _windows_open(kernel, kernel.OpenProcess, mask, pid)
+                      for name, mask in {**denied, **allowed}.items()}
+            result["thread"] = _windows_open(kernel, kernel.OpenThread, thread_steer,
+                                             _windows_first_thread(kernel, pid))
+            result["debugger"] = _windows_attach_and_detach(kernel, pid)
+            seen[harden] = result
+        finally:
+            go.write_text("go")
+            stdout, stderr = process.communicate(timeout=60)
+        assert process.returncode == 0, stderr
+        assert stdout == "child-ran\n", (stdout, stderr)
+    on, off = seen["1"], seen["0"]
+    for name in denied:
+        assert on[name] == 5, (name, on)                      # ERROR_ACCESS_DENIED
+    for name in allowed:
+        assert on[name] is True, (name, on)
+    assert on["thread"] == 5, on
+    assert on["debugger"] == 5, on
+    # The default list, for contrast: the same account may read, steer and debug the process.
+    assert off["PROCESS_VM_READ"] is True and off["PROCESS_DUP_HANDLE"] is True, off
+    assert off["thread"] is True and off["debugger"] is True, off
+
+
+def _run_under_a_debugger(arguments, timeout=60):
+    """Run `arguments` as a debuggee of this thread (DEBUG_ONLY_THIS_PROCESS) and be its debugger
+    until it exits: the loader breakpoint is continued, every other first-chance exception passed
+    back unhandled, the file handles that debug events carry closed. Output goes to files, since
+    nobody reads a pipe during the loop. Returns (returncode, stdout, stderr)."""
+    kernel = _windows_kernel32()
+    event = ctypes.create_string_buffer(256)                 # DEBUG_EVENT is 176 bytes on x64
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = subprocess.Popen(arguments, stdout=out, stderr=err, env=php_environment(),
+                                   creationflags=0x00000002)  # DEBUG_ONLY_THIS_PROCESS
+        finished = False
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not kernel.WaitForDebugEvent(event, 500):
+                    continue
+                code, pid, _ = _windows_debug_continue(kernel, event)
+                if code == 5 and pid == process.pid:          # EXIT_PROCESS_DEBUG_EVENT
+                    finished = True
+                    break
+        finally:
+            if not finished:
+                kernel.DebugActiveProcessStop(process.pid)
+                process.kill()
+        process.wait(timeout=30)
+        assert finished, "the debuggee did not finish"
+        out.seek(0)
+        err.seek(0)
+        return (process.returncode, out.read().decode(errors="replace"),
+                err.read().decode(errors="replace"))
+
+
+def test_o3_windows_a_debugger_attached_while_a_protected_file_loads_is_refused(native, tmp_path):
+    """envelock.paranoid on Windows. The tracer check answered "could not tell" there until
+    2026-11-17, so a protected package ran in a debugged php.exe with the mode on. Now a debugger
+    attached to the process (IsDebuggerPresent / CheckRemoteDebuggerPresent) is refused like a
+    ptrace tracer. The same debugger with the mode off runs it -- so the refusal is the check, not
+    the debugger breaking PHP -- and the mode on without a debugger runs it too."""
+    if os.name != "nt" or not PHP_WINDOWS:
+        pytest.skip("Windows debugger detection")
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        pytest.skip("the debug-event layout here is the x64 one")
+    path = o3_package(native, tmp_path)
+    base = ["php", "-n", "-d", f"extension={native[1]}", "-d", f"envelock.identity={native[4]}",
+            "-d", "display_errors=stderr"]
+    target = str(path / "index.php")
+    code, stdout, stderr = _run_under_a_debugger([*base, "-d", "envelock.paranoid=1", target])
+    assert code != 0 and "being traced" in stderr, (code, stdout, stderr)
+    assert "4242" not in stdout, "the protected code ran under a debugger"
+    code, stdout, stderr = _run_under_a_debugger([*base, "-d", "envelock.paranoid=0", target])
+    assert (code, stdout.strip()) == (0, "4242"), (code, stdout, stderr)
+    alone = subprocess.run([*base, "-d", "envelock.paranoid=1", target], capture_output=True,
+                           text=True, check=False, env=php_environment(), timeout=60)
+    assert (alone.returncode, alone.stdout.strip()) == (0, "4242"), alone.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -3734,11 +4374,17 @@ def test_o8_watermark_persists_under_a_long_lived_worker(tmp_path):
     ext = Path(__file__).resolve().parent.parent / "extension"
     harness = tmp_path / "clk_harness.c"
     harness.write_text(
+        "#include <stdarg.h>\n"
         "#include <stdint.h>\n#include <stdio.h>\n#include <time.h>\n#include <openssl/sha.h>\n"
         '#include "envelock_clock.h"\n'
         "static time_t g_now = 1700000000;\n"
         "time_t __wrap_time(time_t *t){ if(t)*t=g_now; return g_now; }\n"
         "int envelock_sha256(const unsigned char *b, size_t n, unsigned char o[32]){ return SHA256(b,n,o)!=NULL; }\n"
+        # php.h maps snprintf to PHP's ap_php_snprintf, and the clock logs an unwritable record with
+        # php_log_err: outside PHP the C library's snprintf and a silent log do the same job.
+        "int ap_php_snprintf(char *buf, size_t len, const char *format, ...){\n"
+        "  va_list ap; int n; va_start(ap, format); n = vsnprintf(buf, len, format, ap); va_end(ap); return n; }\n"
+        "void php_log_err_with_severity(const char *message, int severity){ (void)message; (void)severity; }\n"
         "int main(int argc, char **argv){\n"
         "  uint64_t live=0, disk=0; const char *p=argv[1]; remove(p);\n"
         "  envelock_clock_advance(p,&live,3600,1);\n"
@@ -3930,7 +4576,12 @@ def test_o8_trusted_time_is_not_a_userland_function(native):
 # ---------------------------------------------------------------------------
 
 def _virtualize(name, source):
-    """Compile one marked function to a mini-VM program. Returns (base64, None) or (None, reason)."""
+    """Compile one marked function to a mini-VM program. Returns (base64, None) or (None, reason).
+    The compiler is encoder/virtualize.php, so without a `php` CLI the caller is SKIPPED: several tests
+    that need no loader call this directly, and used to FAIL with FileNotFoundError on a host without
+    PHP (hidden until the collection itself stopped aborting there, audit 2026-11-17, H-3/H-4)."""
+    if shutil.which("php") is None:
+        pytest.skip("php CLI required: the mini-VM compiler is encoder/virtualize.php")
     result = subprocess.run(
         # memory_limit lifted as for any build step: the u16-header tests compile functions with tens of
         # thousands of constants/locals, which exceed the stock 128M with some official PHP builds.
@@ -4929,6 +5580,58 @@ def test_vm_stack_overflow_releases_rejected_value(native, tmp_path):
     assert int(run.stdout) < 200_000, run.stdout
 
 
+def _vm_constant_program(value):
+    """A hand-built v3 program that returns the integer `value`: one long constant, PUSH_CONST 0, RETURN."""
+    pool = b"\x02" + value.to_bytes(8, "big", signed=True)
+    code = b"\x01\x00\x00" + b"\x09"
+    blob = b"ENVVM3" + (1).to_bytes(2, "big") + (0).to_bytes(2, "big") + pool + len(code).to_bytes(4, "big") + code
+    return base64.b64encode(blob).decode()
+
+
+def test_vm_prepared_programs_are_shared_within_a_request(native, tmp_path):
+    """Since 2026-11-17 a program is decoded and validated once per request and reused by later calls
+    (it was redone on every call, with 64 KiB of zeroed stack each time). What must not change: a
+    recursive virtualized function -- every level runs the SAME prepared program -- computes what PHP
+    computes, call after call; a malformed program is refused on every call, not remembered as good;
+    and past the 1 024 programs a request keeps, the rest still run (prepared for their call and
+    dropped). A stack that grows past its first 16 slots keeps every value."""
+    program, error = _virtualize(
+        "f", "<?php\nfunction f($n) { if ($n <= 0) { return 0; } return $n * 2 + f($n - 1); }\n")
+    assert program is not None, error
+    width, width_error = _virtualize(
+        "g", "<?php\nfunction g($a) { return [" + ", ".join(f"$a + {i}" for i in range(40)) + "]; }\n")
+    assert width is not None, width_error
+    constants = {str(i): _vm_constant_program(i * 7 - 3) for i in range(1100)}
+    (tmp_path / "constants.json").write_text(json.dumps(constants))
+    bad = base64.b64encode(b"ENVVM3" + b"\x00\x00\x00\x00" + (2).to_bytes(4, "big") + b"\x0e\x01").decode()
+    script = tmp_path / "vm_cache.php"
+    script.write_text(
+        "<?php\nfunction f($n) { return __envelock_vm(" + repr(program) + ", [$n]); }\n"
+        "function g($a) { return __envelock_vm(" + repr(width) + ", [$a]); }\n"
+        "$out = [];\n"
+        "for ($round = 0; $round < 3; $round++) { foreach ([0, 1, 5, 30] as $n) { $out[] = f($n); } }\n"
+        "$out[] = array_sum(g(3)); $out[] = count(g(1));\n"
+        "$refused = 0;\n"
+        "for ($i = 0; $i < 3; $i++) { try { __envelock_vm(" + repr(bad) + ", []); }"
+        " catch (Error $e) { if (str_contains($e->getMessage(), 'truncated instruction')) $refused++; } }\n"
+        "$out[] = $refused;\n"
+        "$programs = json_decode(file_get_contents(" + php_literal(str(tmp_path / "constants.json")) + "), true);\n"
+        "$sum = 0; for ($pass = 0; $pass < 2; $pass++) { foreach ($programs as $p) { $sum += __envelock_vm($p, []); } }\n"
+        "$out[] = $sum;\n"
+        "echo json_encode($out);\n", encoding="utf-8")
+    run = php(native, script)
+    assert run.returncode == 0, run.stderr
+    expected = subprocess.run(
+        ["php", "-n", "-r", "function f($n) { if ($n <= 0) { return 0; } return $n * 2 + f($n - 1); }"
+         "$o = []; for ($r = 0; $r < 3; $r++) { foreach ([0, 1, 5, 30] as $n) { $o[] = f($n); } }"
+         "echo json_encode($o);"], capture_output=True, text=True, check=True).stdout
+    values = json.loads(run.stdout)
+    assert values[:12] == json.loads(expected), values[:12]
+    assert values[12:14] == [sum(3 + i for i in range(40)), 40], values[12:14]
+    assert values[14] == 3, "a malformed program was not refused on every call"
+    assert values[15] == 2 * sum(i * 7 - 3 for i in range(1100)), values[15]
+
+
 @pytest.mark.parametrize('pool', [b'\x01', b'\x02\x00', b'\x03\x00', b'\x04\x00\x00',
                                   b'\x04\x00\x00\x10short'])
 def test_vm_rejects_truncated_constant_payload(native, pool):
@@ -4979,6 +5682,8 @@ def test_vm_oversized_nested_stack_refuses_pack_atomically(native, tmp_path):
 ])
 def test_vm_compiler_stack_analyzer_rejects_invalid_internal_code(code, expected):
     """Defend against accidental emitter bugs, not only currently reachable PHP syntax."""
+    if shutil.which("php") is None:
+        pytest.skip("php CLI required: the analyzer under test is PHP code in encoder/virtualize.php")
     path = ROOT / 'encoder' / 'virtualize.php'
     script = ("function envelock_fail($s){throw new Exception($s);} "
               "$s=file_get_contents(" + json.dumps(str(path)) + "); "
@@ -5518,6 +6223,10 @@ def test_identity_with_a_small_order_signing_key_is_refused(native, tmp_path):
     at = blob.find(public)
     assert at > 0
     blob[at:at + 32] = (1).to_bytes(32, "little")
+    # C-29: the identity now ends in a SHA-256; recompute it over the edited body so the file is
+    # well-formed and the loader REACHES the small-order check (rather than stopping at the checksum).
+    import hashlib
+    blob[-32:] = hashlib.sha256(bytes(blob[:-32])).digest()
     identity = tmp_path / "small-order.bin"
     fd = os.open(identity, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -5526,3 +6235,290 @@ def test_identity_with_a_small_order_signing_key_is_refused(native, tmp_path):
     run = php(native, out / "index.php", identity=identity)
     assert "SMALL-ORDER-RAN" not in run.stdout
     assert run.returncode != 0 and "small-order" in run.stderr, run.stderr
+
+
+# ---------------------------------------------------------------------------
+# Code audit of 2026-11-17: loader fixes.
+# ---------------------------------------------------------------------------
+
+def php_cgi_requests(native, script, requests, extra_ini=(), identity=None):
+    """Serve `script` `requests` times from ONE php-cgi process (-T): request 1 starts cold, the
+    later ones see what a long-lived FPM worker sees. Skips without php-cgi next to php."""
+    cgi = _php_cgi()
+    if cgi is None:
+        pytest.skip("needs php-cgi next to php")
+    identity_path = native[4] if identity is None else identity
+    return subprocess.run(
+        [cgi, "-n", "-q", "-T", str(requests), "-d", f"extension={native[1]}",
+         "-d", f"envelock.identity={identity_path}", "-d", "display_errors=stderr",
+         "-d", "opcache.enable=0", "-d", "opcache.enable_cli=0", *extra_ini, str(script)],
+        capture_output=True, text=True, check=False, env=php_environment(), timeout=120)
+
+
+def test_allow_opcache_does_not_excuse_a_foreign_hook(native, tmp_path):
+    """With envelock.allow_opcache=1 and OPcache caching -- the recommended production setup -- the
+    compile-hook check was skipped altogether, so ANY hook above Envelock's (ionCube, SourceGuardian,
+    one installed after start-up) received the decrypted handle. Only OPcache's and Phar's own code is
+    accepted there now."""
+    path = o3_package(native, tmp_path)
+    blacklist = tmp_path / "bl.txt"
+    blacklist.write_text(str(path) + "\n")
+    settings = (*_opcache_settings(), "-d", "envelock.allow_opcache=1",
+                "-d", f"opcache.blacklist_filename={blacklist}")
+    clean = o3_run(native, path, extra_ini=settings)
+    assert clean.returncode == 0 and clean.stdout == "4242\n", clean.stderr     # OPcache's own hook
+    hook = build_hook(tmp_path, "rehook_compile", source_dir="rehook",
+                      cflags="-DREHOOK_MODE=REHOOK_COMPILE_FILE")
+    result = o3_run(native, path, extra_extension=hook, extra_ini=settings)
+    assert result.returncode != 0 and "4242" not in result.stdout
+    assert "compile hook above Envelock" in result.stderr, result.stderr
+
+
+def test_session_save_handler_runs_with_the_request_state_intact(native, tmp_path):
+    """Envelock's RSHUTDOWN ran BEFORE the session module's, whose save handler is user code: there a
+    sealed package's eval() was accepted again and a vaulted literal read as "". The request state now
+    outlives every RSHUTDOWN (it is torn down in post-deactivate)."""
+    if php(native, "-r", "echo extension_loaded('session') ? 'yes' : 'no';").stdout != "yes":
+        pytest.skip("this PHP is built without the session extension")
+    literal_out = tmp_path / "literal.txt"
+    evaled = tmp_path / "evaled.txt"
+    source = (
+        "<?php\n"
+        "function t_open($p, $n) { return true; }\n"
+        "function t_close() { return true; }\n"
+        "function t_read($id) { return ''; }\n"
+        "function t_write($id, $data) {\n"
+        f"    file_put_contents({php_literal(str(literal_out))}, 'lit=' . 'SECRET-SESSION-LITERAL-4242' . ';');\n"
+        f"    eval('file_put_contents(' . var_export({php_literal(str(evaled))}, true) . ', \"x\");');\n"
+        "    return true;\n"
+        "}\n"
+        "function t_destroy($id) { return true; }\n"
+        "function t_gc($m) { return 0; }\n"
+        "session_set_save_handler('t_open', 't_close', 't_read', 't_write', 't_destroy', 't_gc');\n"
+        "session_id('envelocktest');\n"
+        "session_start();\n"
+        "$_SESSION['a'] = 1;\n"
+        "echo 'started';\n"
+    )
+    out = package(native, tmp_path, {"index.php": source}, sealed=True, vault_strings=True)
+    result = php(native, out / "index.php", extra_ini=("-d", "session.save_path=" + str(tmp_path)))
+    assert "started" in result.stdout, result.stdout + result.stderr
+    assert literal_out.is_file(), result.stderr
+    assert literal_out.read_text() == "lit=SECRET-SESSION-LITERAL-4242;", literal_out.read_text()
+    assert not evaled.exists(), "eval() ran during a sealed request (in the session save handler)"
+    assert "eval() is refused" in result.stderr, result.stderr
+
+
+def test_release_check_accepts_a_hotfix_reached_through_dotdot(native, tmp_path):
+    """C-11 took ANY difference between the requested name and the resolved path for a directory
+    symlink, so a second release of the same project+developer reached by a '..' path (Composer's
+    __DIR__ . '/../...', the ENV-AUD-17 hotfix module) was refused as release-mixing. Only a real
+    link counts now (the symlink attack is still refused: test_php_release_mixing_via_...)."""
+    project = str(uuid.uuid4())
+    hotfix = package(native, tmp_path, {"h.php": "<?php function hot() { return 'hotfix'; }"},
+                     project=project, serial=1)
+    app = package(native, tmp_path, {
+        "main.php": f"<?php require __DIR__ . '/../{hotfix.name}/h.php'; echo 'app+', hot();"},
+        project=project, serial=2)
+    result = php(native, app / "main.php")
+    assert result.returncode == 0 and result.stdout == "app+hotfix", result.stdout + result.stderr
+
+
+def test_clock_record_saved_by_another_process_is_honoured(native, tmp_path):
+    """The anti-rollback record was loaded once, at MINIT (the FPM master), and a worker judged the
+    clock against that value only, ignoring what other workers had saved since -- for up to the
+    tolerance, and always for its first file. Request 1 here saves a record a month ahead (as another
+    worker running a month ago, before the clock was set back, would have); request 2 of the SAME
+    process must see it and refuse."""
+    state = tmp_path / "clock.state"
+    licence = tmp_path / "licence.bin"
+    licence.write_bytes(a.issue_licence(native[2], expires=int(time.time()) + 86400 * 365))
+    out = package(native, tmp_path, {"index.php": (
+        "<?php $w = time() + 86400 * 30;"
+        " $body = \"ENVLKCLK\\x01\\x00\\x00\\x00\" . pack('J', $w);"
+        " $chk = substr(hash('sha256', \"envelock-clock-1\\n\" . $body, true), 0, 8);"
+        f" file_put_contents({php_literal(str(state))}, $body . $chk);"
+        " echo 'served;';")})
+    result = php_cgi_requests(native, out / "index.php", 2, extra_ini=(
+        "-d", f"envelock.licence={licence}", "-d", f"envelock.clock_state={state}",
+        "-d", "envelock.clock_tolerance=3600"))
+    assert result.stdout.count("served;") == 1, result.stdout + result.stderr
+    # php-cgi prints a start-up or compile error into the response body, not to stderr.
+    assert "clock is behind" in result.stdout + result.stderr, result.stdout + result.stderr
+
+
+def test_clock_record_locked_by_another_process_does_not_stall_a_request(native, tmp_path):
+    """The anti-rollback record was locked with a blocking flock(LOCK_EX) (and, on Windows, read and
+    written with no lock at all): any process running as the PHP user that held the record's lock
+    stalled every protected request until it let go. Now the lock is tried for about 20 ms and the
+    request goes on without it (reading anyway, skipping the save). Here another process holds the
+    lock for the whole run; the request must finish quickly and serve the file."""
+    state = tmp_path / "clock.state"
+    _write_clock_state(state, int(time.time()) - 60)
+    out = package(native, tmp_path, {"index.php": "<?php echo 'CLOCK-LOCK-OK';"})
+    with open(state, "r+b") as held:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 28)
+        else:
+            import fcntl
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        started = time.time()
+        lic = out.parent / "licence-clock.bin"
+        lic.write_bytes(a.issue_licence(native[2], expires=int(time.time()) + 3600))
+        try:
+            # A timeout, not a bare wait: with the old blocking lock this request never returns while
+            # the lock is held, and the test must fail rather than hang with it.
+            result = php(native, out / "index.php", timeout=30, extra_ini=(
+                f"-denvelock.licence={lic}", f"-denvelock.clock_state={state}",
+                "-denvelock.clock_tolerance=3600"))
+        except subprocess.TimeoutExpired:
+            result = None
+        finally:
+            elapsed = time.time() - started
+            if os.name == "nt":
+                held.seek(0)
+                msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 28)
+            else:
+                fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    assert result is not None, f"the request was still waiting for the lock after {elapsed:.0f} s"
+    assert result.returncode == 0 and result.stdout == "CLOCK-LOCK-OK", result.stdout + result.stderr
+    assert elapsed < 5, f"the request waited {elapsed:.1f} s for a lock another process held"
+    again = _clock_php(native, out, state)                     # and once released, as before
+    assert again.returncode == 0 and again.stdout == "CLOCK-LOCK-OK", again.stderr
+
+
+def test_debugger_loaded_by_dl_mid_request_is_still_refused(native, tmp_path):
+    """The debugger check is now remembered for the request, keyed by the number of loaded modules.
+    A module loaded mid-request with dl() changes that number, so the next protected file looks
+    again: a debugger loaded after the first protected file must not reach the second one."""
+    if PHP_WINDOWS:
+        pytest.skip("needs the local PHP build tools")
+    hook = build_hook(tmp_path, "vld")                 # skips by itself without phpize and a compiler
+    out = package(native, tmp_path, {"first.php": "<?php echo 'first;';",
+                                     "second.php": "<?php echo 'second;';"})
+    script = tmp_path / "probe.php"
+    script.write_text(
+        "<?php\nrequire " + php_literal(str(out / "first.php")) + ";\n"
+        "dl(" + php_literal(hook.name) + ");\n"
+        "echo extension_loaded('vld') ? 'vld-loaded;' : 'vld-missing;';\n"
+        "require " + php_literal(str(out / "second.php")) + ";\n")
+    result = php(native, script, extra_ini=("-d", f"extension_dir={hook.parent}", "-d", "enable_dl=1"))
+    assert result.stdout.startswith("first;vld-loaded;"), result.stdout + result.stderr
+    assert "second;" not in result.stdout, "a protected file ran after a debugger was loaded"
+    assert "Envelock: vld is loaded" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("source", ["x", ""])
+def test_encrypted_vault_accepts_a_source_under_four_bytes(native, tmp_path, source):
+    """The encrypted vault required at least 4 bytes of source after its table (`total - 8`), so an
+    empty or tiny file packed with --vault-strings failed at run time."""
+    out = package(native, tmp_path, {"tiny.php": source}, vault_strings=True)
+    result = php(native, out / "tiny.php")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == source
+
+
+def test_cached_manifest_verification_still_refuses_a_changed_manifest(native, tmp_path):
+    """The runtime manifest's signature is now verified once per worker instead of on every request.
+    The cache is keyed by the manifest's bytes: request 1 below corrupts the signature, and request 2
+    of the same process must re-verify and refuse; an unchanged manifest keeps working."""
+    out = package(native, tmp_path, {"index.php": "<?php echo 'ok;';"}, enforce_manifest=True)
+    assert php_cgi_requests(native, out / "index.php", 3).stdout == "ok;ok;ok;"
+    out2 = package(native, tmp_path, {"index.php": "<?php echo 'ok;';"}, enforce_manifest=True)
+    manifest = out2 / "envelock-manifest.bin"
+    flip = tmp_path / "flip.php"
+    flip.write_text(f"<?php if (!getenv('ENVELOCK_FLIPPED')) {{ putenv('ENVELOCK_FLIPPED=1');"
+                    f" $m = {php_literal(str(manifest))}; $b = file_get_contents($m);"
+                    " $b[strlen($b) - 1] = chr(ord($b[strlen($b) - 1]) ^ 1); file_put_contents($m, $b); }")
+    result = php_cgi_requests(native, out2 / "index.php", 2,
+                              extra_ini=("-d", f"auto_append_file={flip}"))
+    assert result.stdout.count("ok;") == 1, result.stdout + result.stderr
+    assert "not signed by the package's own developer" in result.stdout + result.stderr, result.stdout
+
+
+@pytest.mark.parametrize("field, bit, slot_set", [("domain", 0x04, False), ("ip", 0x08, False),
+                                                  ("domain", 0x04, True), ("ip", 0x08, True)])
+def test_licence_with_a_flag_and_an_empty_slot_is_refused(native, tmp_path, field, bit, slot_set):
+    """The parser checked that the flag and the slot agree for the machine and expiry constraints
+    only, although its comment said all of them. A licence whose domain or IP slot disagrees with its
+    flag is malformed and refused. The slot-without-flag case is the one only the parser catches: the
+    run-time check looks at the flag, so such a licence used to run unbound."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    slots = {"domain": a.ZERO32, "ip": a.ZERO32}
+    if slot_set:
+        slots[field] = b"\x11" * 32
+    body = bytearray(a.licence_body(int(time.time()) + 3600, a.ZERO32, slots["domain"], slots["ip"]))
+    if slot_set:
+        body[9] &= ~bit & 0xFF                           # slot filled, flag cleared
+    else:
+        body[9] |= bit                                   # flag set, slot left all-zero
+    signer = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(native[2]["signing_private"]))
+    out = package(native, tmp_path, {"index.php": "<?php echo 'LIC-RAN';"})
+    result = _licence_php(native, out, bytes(body) + signer.sign(bytes(body)))
+    assert "LIC-RAN" not in result.stdout and result.returncode != 0, (field, result.stdout)
+    assert "license rejected" in result.stderr, result.stderr
+
+
+def _php_version_id():
+    return int(subprocess.run(["php", "-n", "-r", "echo PHP_VERSION_ID;"], capture_output=True,
+                              text=True, check=True, env=php_environment()).stdout)
+
+
+def _emit(native, source_path, image_path, extra_ini=()):
+    return php(native, "-r", "$i = envelock_bc_emit($argv[1]); if ($i === false) { exit(3); }"
+                             " file_put_contents($argv[2], $i);",
+               str(source_path), str(image_path), extra_ini=extra_ini)
+
+
+def test_bytecode_inherited_closure_property_default_packs_and_runs(native, tmp_path):
+    """PHP 8.5 allows a closure as a property default. A same-file subclass inherits it, persist shares
+    the expression between the two classes, and the serializer walked it twice: packing valid code
+    failed ("pointer out of range")."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    if _php_version_id() < 80500:
+        pytest.skip("closures in constant expressions are PHP 8.5+")
+    source = tmp_path / "closure_default.php"
+    source.write_text("<?php class EnvA { public $f = static function () { return 'closure'; }; }\n"
+                      "class EnvB extends EnvA {}\n"
+                      "echo (new EnvB)->f->__invoke(), '|', (new EnvA)->f->__invoke();\n")
+    image = tmp_path / "closure_default.bin"
+    emit = _emit(native, source, image)
+    assert emit.returncode == 0, emit.stderr[-2000:]
+    run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }", str(image))
+    assert run.returncode == 0 and run.stdout == "closure|closure", run.stdout + run.stderr[-2000:]
+
+
+def test_bytecode_leaves_persistent_constants_to_the_host(native, tmp_path):
+    """The emitter folded every persistent constant at pack time, so code read the PACKER's values on
+    the server (PHP_OS_FAMILY packed on macOS and run on Linux, the host libraries' versions...). The
+    image now names the constant and the server resolves it."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    source = tmp_path / "constants.php"
+    source.write_text("<?php echo \\PHP_OS_FAMILY, '|', PHP_INT_SIZE, '|', \\PHP_EOL === \"\\n\" ? 'lf' : 'crlf';\n")
+    image = tmp_path / "constants.bin"
+    emit = _emit(native, source, image)
+    assert emit.returncode == 0, emit.stderr[-2000:]
+    data = image.read_bytes()
+    assert b"PHP_OS_FAMILY" in data and b"PHP_INT_SIZE" in data, "constant folded into the image"
+    run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }", str(image))
+    plain = subprocess.run(["php", "-n", str(source)], capture_output=True, text=True, env=php_environment())
+    assert run.returncode == 0 and run.stdout == plain.stdout, run.stdout + run.stderr[-2000:]
+
+
+def test_bytecode_emits_with_opcache_caching_in_the_packing_php(native, tmp_path):
+    """With OPcache caching in the packing CLI (opcache.enable_cli=1) the emitter compiled through
+    OPcache's hook, got op_arrays living in its shared memory and freed them as request memory: heap
+    corruption or a crash for every file. It compiles with the engine's own compile_file now."""
+    if _bytecode_available(native) != "yes":
+        pytest.skip("no bytecode layer for this PHP version")
+    source = tmp_path / "oc.php"
+    source.write_text("<?php function oc_f($x) { return $x * 2; } class OcK { const V = 3; }"
+                      " echo oc_f(21), '|', OcK::V;\n")
+    image = tmp_path / "oc.bin"
+    emit = _emit(native, source, image, extra_ini=(*_opcache_settings(), "-d", "opcache.enable_cli=1"))
+    assert emit.returncode == 0, emit.stderr[-2000:]
+    run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }", str(image))
+    assert run.returncode == 0 and run.stdout == "42|3", run.stdout + run.stderr[-2000:]

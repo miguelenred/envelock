@@ -108,6 +108,99 @@ def test_layer_checker_flags_drift_between_version_copies(tmp_path):
     assert r.returncode == 1 and "envelock_bc.c differs between layers" in r.stdout, r.stdout
 
 
+@pytest.mark.parametrize("target, cut, reported", [
+    # the loader no longer makes calls generic before choosing their handler
+    ("envelock_bc_harden.h", "\t\tenvelock_fc_generic_call(opline);\n", "envelock_fc_generic_call(opline);"),
+    ("envelock_bc_harden.h", "\t\topline->opcode = ZEND_DO_FCALL;\n", "opline->opcode = ZEND_DO_FCALL;"),
+    # the emitter compiles with the engine's execute_ex again (DO_UCALL back in the image)
+    ("php83/envelock_bc.c", "        zend_execute_ex = envelock_bc_compile_execute_ex;\n",
+     "zend_execute_ex = envelock_bc_compile_execute_ex;"),
+])
+def test_layer_checker_refuses_a_tree_without_the_c05_call_defence(tmp_path, target, cut, reported):
+    """C-05: both halves of the call-opcode defence sit where a mechanical layer regeneration (or a
+    careless edit) can drop them. The checker must refuse the tree and name what is gone."""
+    copy = tmp_path / "opcache"
+    shutil.copytree(ROOT / "extension" / "opcache", copy)
+    path = copy / target
+    text = path.read_text(encoding="utf-8")
+    assert cut in text, f"{target} no longer contains {cut!r}"
+    path.write_text(text.replace(cut, ""), encoding="utf-8")
+    r = subprocess.run([sys.executable, str(CHECKER), "--root", str(copy)],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 1, r.stdout
+    assert reported in r.stdout, r.stdout
+
+
+def _checker_on_copy(tmp_path, edit):
+    copy = tmp_path / "opcache"
+    shutil.copytree(ROOT / "extension" / "opcache", copy)
+    edit(copy)
+    return subprocess.run([sys.executable, str(CHECKER), "--root", str(copy)],
+                          capture_output=True, text=True, check=False)
+
+
+def _replace(path, old, new):
+    text = path.read_text(encoding="utf-8")
+    assert old in text, f"{path.name} no longer contains {old!r}"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+@pytest.mark.parametrize("target, old, new, reported", [
+    # host constants folded into the image again
+    ("php84/envelock_bc.c", "    CG(compiler_options) |= ZEND_COMPILE_NO_PERSISTENT_CONSTANT_SUBSTITUTION;\n", "",
+     "ZEND_COMPILE_NO_PERSISTENT_CONSTANT_SUBSTITUTION"),
+    # the emitter compiles through the hook chain (OPcache's SHM op_arrays) again
+    ("php84/envelock_bc.c", "op_array = compile_file(file_handle, ZEND_INCLUDE);",
+     "op_array = zend_compile_file(file_handle, ZEND_INCLUDE);", "zend_compile_file(file_handle"),
+    # stale bytes of the previous file in the next image again
+    ("php82/envelock_arena.c", "        memset(arena_base, 0, used < arena_capacity ? used : arena_capacity);\n", "",
+     "memset(arena_base, 0,"),
+    # PHP 8.5: the shared closure default serialized twice again
+    ("php85/envelock_file_cache.c", "if (!IS_SERIALIZED(zend_ast_get_op_array(ast)->op_array)) {",
+     "if (1) {", "IS_SERIALIZED(zend_ast_get_op_array(ast)->op_array)"),
+])
+def test_layer_checker_refuses_the_2026_11_17_bytecode_fixes_undone(tmp_path, target, old, new, reported):
+    """Audit 2026-11-17: each bytecode fix is required by the checker, so a regenerated layer or a
+    careless edit that drops it fails the gate, naming what is gone."""
+    r = _checker_on_copy(tmp_path, lambda copy: _replace(copy / target, old, new))
+    assert r.returncode == 1 and reported in r.stdout, r.stdout
+
+
+def test_layer_checker_sees_every_layer_macros_and_emptied_bodies(tmp_path):
+    """Audit 2026-11-17: the checker globbed php8* (an unhardened php90/ layer, which config.m4 would
+    build, passed), searched for forbidden reads only below unserialize_hash (the UNSERIALIZE_STR
+    macro above it reading script->corrupted passed), and matched only the SIGNATURES of the header's
+    helpers (an emptied envelock_fc_finish passed)."""
+    def new_layer(copy):
+        shutil.copytree(copy / "php85", copy / "php90")
+        _replace(copy / "php90" / "envelock_file_cache.c", "envelock_fc_finish(script);", "/* gone */")
+    r = _checker_on_copy(tmp_path / "a", new_layer)
+    assert r.returncode == 1 and "php90/envelock_file_cache.c: missing 'envelock_fc_finish(script);'" in r.stdout, r.stdout
+
+    def macro(copy):
+        _replace(copy / "php84" / "envelock_file_cache.c", "if (EXPECTED(!envelock_fc_corrupted)) { \\",
+                 "if (EXPECTED(!script->corrupted)) { \\")
+    r = _checker_on_copy(tmp_path / "b", macro)
+    assert r.returncode == 1 and "php84/envelock_file_cache.c: forbidden on the unserialize side 'script->corrupted'" in r.stdout, r.stdout
+
+    def empty_finish(copy):
+        header = copy / "envelock_bc_harden.h"
+        text = header.read_text(encoding="utf-8")
+        signature = "static void envelock_fc_finish(envelock_persistent_script *script)"
+        start = text.index(signature)
+        open_at = text.index("{", start)
+        depth, end = 0, open_at
+        for i in range(open_at, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            if depth == 0:
+                end = i
+                break
+        header.write_text(text[:open_at] + "{\n\t(void) script;\n}" + text[end + 1:], encoding="utf-8")
+    r = _checker_on_copy(tmp_path / "c", empty_finish)
+    assert r.returncode == 1 and "envelock_fc_finish" in r.stdout and "empty body" in r.stdout, r.stdout
+    assert _checker_on_copy(tmp_path / "d", lambda copy: None).returncode == 0
+
+
 def test_generator_refuses_to_overwrite_a_hardened_layer(tmp_path):
     """gen_persist.py emits the upstream (unhardened) traversal: it must not silently replace a
     shipped layer."""

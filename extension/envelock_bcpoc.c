@@ -57,6 +57,10 @@ PHP_FUNCTION(envelock_bc_emit)
         Z_PARAM_PATH(path, path_length)
     ZEND_PARSE_PARAMETERS_END();
 
+#if defined(ENVELOCK_BCRUN)
+    /* A test-only legacy emit that bailed out (compile fatal) cannot leak into this one. */
+    envelock_bc_test_legacy_call_ops = false;
+#endif
     zend_stream_init_filename_ex(&file_handle, zend_string_init(path, path_length, 0));
     if (envelock_bc_emit_file(&file_handle, &image, &image_length, &error) != SUCCESS) {
         zend_destroy_file_handle(&file_handle);
@@ -69,6 +73,41 @@ PHP_FUNCTION(envelock_bc_emit)
 }
 
 #endif /* ENVELOCK_BCEMIT */
+
+#if defined(ENVELOCK_BCRUN)
+
+/* envelock_bc_emit_legacy_calls(string $path): string|false — TEST ONLY (C-05). envelock_bc_emit as
+ * the emitters before C-05 compiled it: the calls keep the DO_UCALL the compiler chose, so on PHP 8.3.6
+ * an internal static method is called through DO_UCALL. The suite runs such an image to prove that the
+ * LOADER makes its calls generic on its own (images packed before the fix). Gated under ENVELOCK_BCRUN. */
+PHP_FUNCTION(envelock_bc_emit_legacy_calls)
+{
+    char *path;
+    size_t path_length;
+    zend_file_handle file_handle;
+    unsigned char *image = NULL;
+    size_t image_length = 0;
+    const char *error = NULL;
+    int rc;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_PATH(path, path_length)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zend_stream_init_filename_ex(&file_handle, zend_string_init(path, path_length, 0));
+    envelock_bc_test_legacy_call_ops = true;
+    rc = envelock_bc_emit_file(&file_handle, &image, &image_length, &error);
+    envelock_bc_test_legacy_call_ops = false;
+    zend_destroy_file_handle(&file_handle);
+    if (rc != SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Envelock bytecode: %s", error ? error : "failed");
+        RETURN_FALSE;
+    }
+    RETVAL_STRINGL((char *) image, image_length);
+    free(image);
+}
+
+#endif /* ENVELOCK_BCRUN */
 
 #if defined(ENVELOCK_BCRUN)
 

@@ -230,6 +230,46 @@ def test_nonportable_paths_rejected(name):
         a.validate_portable_path(Path(name))
 
 
+def test_target_linux_portability_adversarial():
+    """C-21, ATTACK: relaxing the Windows rules for target=linux must NOT relax the universal safety
+    rules. Control characters, empty/./.. components (traversal) stay refused on EVERY target, while
+    only the genuine Windows-only names/characters become allowed on linux."""
+    from pathlib import Path as _P
+    # Refused on EVERY target. (pathlib normalises away '.', '//' and a leading './' when the Path is
+    # built, so those cannot reach here as components; a '..' and any control character persist and MUST
+    # be refused, on linux too.)
+    for name in ["a\x01b.php", "tab\there.php", "x/\x00.php", "a/../b.php", "..", "lib/../../etc.php"]:
+        for target in ("portable", "linux"):
+            with pytest.raises(ValueError):
+                a.validate_portable_path(_P(name), target)
+    # Windows-only rules: refused on portable, ALLOWED on linux (device names in every case form,
+    # trailing dot/space, and the characters POSIX permits).
+    windows_only = ["CON.php", "con", "Con.php", "COM1.php", "com9.json", "LPT0", "nul.PHP",
+                    "aux.module", "dir/trailing.", "dir/file ", 'weird<>name.php', "a:b.php",
+                    'q"uote.php', "star*.php", "pipe|x.php"]
+    for name in windows_only:
+        with pytest.raises(ValueError, match="portable"):
+            a.validate_portable_path(_P(name))                 # portable refuses
+        a.validate_portable_path(_P(name), "linux")            # linux accepts (no raise)
+    # The reserved-name match is on the stem and case-insensitive: `console.php` is NOT reserved.
+    assert a.validate_portable_path(_P("console.php")) == a.validate_portable_path(_P("CONSOLE.PHP"))
+
+
+@pytest.mark.parametrize("name", ["nul.php", "con.php", "aux.php", "com1.php", "lpt0", "dir/trailing."])
+def test_target_linux_allows_windows_reserved_names(name):
+    """C-21: a Linux-only package must not be blocked by Windows device names. With target='linux' the
+    Windows-only rules are off, but control characters are still refused on every target."""
+    # Default (portable) still refuses them:
+    with pytest.raises(ValueError, match="portable"):
+        a.validate_portable_path(Path(name))
+    # target='linux' accepts them and returns the canonical name:
+    assert a.validate_portable_path(Path(name), "linux") == \
+        __import__("unicodedata").normalize("NFC", Path(name).as_posix()).casefold()
+    # control characters are refused regardless of target:
+    with pytest.raises(ValueError, match="control characters"):
+        a.validate_portable_path(Path("dir/a\x01b.php"), "linux")
+
+
 def test_case_and_unicode_collisions():
     assert a.validate_portable_path(Path("Lib/Service.php")) == a.validate_portable_path(
         Path("lib/service.php")
@@ -637,6 +677,70 @@ def test_set_minimum_refuses_downgrade(material):
         a.set_minimum(store, project, 50)
     lowered = a.set_minimum(store, project, 50, allow_downgrade=True)
     assert a.identity_minimums(lowered)[(uuid.UUID(project).bytes, a.ZERO32)] == 50
+
+
+def test_minimum_set_guards_against_a_higher_applicable_minimum(material):
+    """C-32: setting the UNBOUND minimum below an existing developer-bound one does not raise the
+    effective bar, so it needs --allow-downgrade and must not silently claim a lower floor. Setting it
+    ABOVE is fine. The guard is symmetric for a bound minimum set below the unbound one."""
+    owner, recipient, _ = material
+    project = str(uuid.uuid4())
+    pid = uuid.UUID(project).bytes
+    dev = bytes.fromhex(owner["signing_public"])
+    store = a.set_minimum(a.add_recipient_to_store(None, recipient, owner), project, 100, dev)  # bound 100
+    # Unbound 50 (< the bound 100) would not raise the effective bar -> refused without downgrade:
+    with pytest.raises(ValueError, match="higher effective minimum"):
+        a.set_minimum(store, project, 50)                      # unbound (ZERO32)
+    # Unbound 150 (> the bound 100) genuinely raises the bar for everyone -> allowed:
+    assert a.effective_minimum(a.set_minimum(store, project, 150), project, dev) == 150
+    # Forcing the low one records it, but the bound 100 still governs that developer's packages:
+    forced = a.set_minimum(store, project, 50, allow_downgrade=True)
+    assert a.identity_minimums(forced)[(pid, a.ZERO32)] == 50
+    assert a.effective_minimum(forced, project, dev) == 100
+    # Symmetric: a bound minimum set below an existing unbound one is likewise guarded.
+    unbound200 = a.set_minimum(a.add_recipient_to_store(None, recipient, owner), project, 200)  # unbound 200
+    with pytest.raises(ValueError, match="higher effective minimum"):
+        a.set_minimum(unbound200, project, 100, dev)           # bound 100 < unbound 200
+
+
+def test_minimum_guard_adversarial(material):
+    """C-32, ATTACK: try to lower the EFFECTIVE anti-rollback bar by the back door, and probe the
+    boundaries. The guard must fire whenever a new entry would sit below the highest APPLICABLE minimum,
+    allow an equal value, respect the serial range, and never block a genuinely independent developer."""
+    owner, recipient, _ = material
+    project = str(uuid.uuid4())
+    pid = uuid.UUID(project).bytes
+    da = bytes.fromhex(owner["signing_public"])
+    db = bytes.fromhex(a.make_owner()["signing_public"])
+    store = a.add_recipient_to_store(None, recipient, owner)
+    store = a.set_minimum(store, project, 100, da)            # developer A bound at 100
+    store = a.set_minimum(store, project, 50, db)             # developer B bound at 50 (independent)
+
+    # Unbound below the HIGHEST applicable bound (100) is refused, even though it is ABOVE B's 50:
+    with pytest.raises(ValueError, match="higher effective minimum"):
+        a.set_minimum(store, project, 75)
+    # Equal to the floor is NOT a downgrade -> allowed:
+    assert a.effective_minimum(a.set_minimum(store, project, 100), project, da) == 100
+    # Serial 0 unbound when a bound 100 exists is a downgrade -> refused; forcing records it but A's
+    # effective bar stays 100:
+    with pytest.raises(ValueError, match="higher effective minimum"):
+        a.set_minimum(store, project, 0)
+    forced = a.set_minimum(store, project, 0, allow_downgrade=True)
+    assert a.effective_minimum(forced, project, da) == 100 and a.effective_minimum(forced, project, db) == 50
+    # ...and "forcing records it" is literally true: the unbound 0 is in the file, next to A's and B's
+    # untouched bound entries (not silently dropped, and not overwriting a bound one).
+    assert a.identity_minimums(forced) == {(pid, a.ZERO32): 0, (pid, da): 100, (pid, db): 50}
+    # The maximum serial is accepted and becomes the floor for everyone:
+    top = a.set_minimum(store, project, 2 ** 64 - 1)
+    assert a.effective_minimum(top, project, db) == 2 ** 64 - 1
+    # A genuinely independent developer C is never blocked by A's or B's minima:
+    dc = bytes.fromhex(a.make_owner()["signing_public"])
+    a.set_minimum(store, project, 5, dc)                      # must not raise (C has no applicable floor)
+    # Out-of-range serial and a malformed developer key are clean errors:
+    with pytest.raises(ValueError):
+        a.set_minimum(store, project, 2 ** 64)
+    with pytest.raises(ValueError):
+        a.set_minimum(store, project, 10, b"\x00" * 31)
 
 
 def test_minimum_keeps_each_developer_independently(material):

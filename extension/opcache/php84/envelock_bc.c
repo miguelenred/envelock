@@ -505,15 +505,246 @@ static size_t envelock_bc_estimate_arena(envelock_persistent_script *script, siz
     return total * 2 + (4u << 20);                               /* 2x margin + 4 MB floor */
 }
 
+/* C-05: zend_get_call_op() emits DO_UCALL (and DO_FCALL_BY_NAME) only while zend_execute_ex is the
+ * engine's own execute_ex; with any other value every call gets the generic DO_FCALL, which checks at
+ * run time whether the callee is a user or an internal function. envelock_bc_emit_file installs this
+ * pass-through for the length of the compile, so no image carries a DO_UCALL aimed at an internal
+ * callee (and the loader rewrites any it meets anyway, envelock_fc_generic_call). It only forwards:
+ * if anything ran while compiling it would behave exactly as without it. */
+static void envelock_bc_compile_execute_ex(zend_execute_data *execute_data)
+{
+    execute_ex(execute_data);
+}
+
+#if defined(ENVELOCK_BCRUN)
+/* TEST ONLY (ENVELOCK_BCRUN): compile without the pass-through above, exactly like the emitters before
+ * C-05, so the suite can hand the LOADER an image that still hard-codes DO_UCALL and prove that the
+ * deserializer makes it generic on its own. Never compiled into a pack-time or server loader. */
+bool envelock_bc_test_legacy_call_ops = false;
+#endif
+
+/* H-09: reproducible images. Persist copies the compiler's structures into the (zeroed) arena whole,
+ * padding included -- the 7 bytes after zend_class_entry.type, the 4 after a zend_type's mask in every
+ * arg_info and property, the hole in a zend_ast_list, zend_early_binding's tail, and more -- and the
+ * engine never writes those bytes. Measured with valgrind (VALGRIND_GET_VBITS over a finished image):
+ * 68 runs of uninitialised bytes in one 16 KiB image, allocated by the compiler arena, zend_compile_params,
+ * zend_ast_copy, zend_compile_enum_case and others; across two runs of the same file 154 bytes differed
+ * (stale heap pointers, which ASLR changes), and they were whatever the request heap held before: bytes
+ * of the previously packed file could end up in the next one's image. Rather than chase every padding
+ * hole of every engine structure in four PHP versions, every allocation made while one file is compiled
+ * comes back zeroed: the Zend heap gets pass-through handlers for that window that clear what they hand
+ * out, and the free tail of the compiler arena is cleared before it. Only the requested size is cleared:
+ * persist never copies past a structure's size, and the heap cannot report a block's size while custom
+ * handlers are installed. Pack time only (the emitter); the server never compiles. */
+#if PHP_VERSION_ID >= 80400
+# define ENVELOCK_ZERO_DC ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC
+# define ENVELOCK_ZERO_PREV_CC ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC
+# define ENVELOCK_ZERO_MM_CC ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC
+#else
+# define ENVELOCK_ZERO_DC
+# define ENVELOCK_ZERO_PREV_CC
+# define ENVELOCK_ZERO_MM_CC ZEND_FILE_LINE_CC ZEND_FILE_LINE_EMPTY_CC
+#endif
+static zend_mm_heap *envelock_zero_heap = NULL;
+static bool envelock_zero_wrapping = false;   /* the heap already had custom handlers (USE_ZEND_ALLOC=0) */
+static void *(*envelock_zero_prev_malloc)(size_t ENVELOCK_ZERO_DC);
+static void (*envelock_zero_prev_free)(void * ENVELOCK_ZERO_DC);
+static void *(*envelock_zero_prev_realloc)(void *, size_t ENVELOCK_ZERO_DC);
+#if PHP_VERSION_ID >= 80400
+static size_t (*envelock_zero_prev_gc)(void);
+static void (*envelock_zero_prev_shutdown)(bool, bool);
+#endif
+
+/* The size of every block handed out in the window, so that growing one with erealloc can zero the new
+ * tail too (zend_declare_typed_property grows the default-property table that way, and only the value
+ * of each new slot is written, not its u2). Open addressing on the address; an entry is overwritten
+ * when its address is handed out again, so freed blocks need no deletion. A block from before the
+ * window is unknown and its tail is left as it is. Plain malloc: this table must not go through the
+ * handlers it serves. Freed at the end of the window. */
+typedef struct _envelock_zero_slot { void *ptr; size_t size; } envelock_zero_slot;
+static envelock_zero_slot *envelock_zero_slots = NULL;
+static size_t envelock_zero_capacity = 0;   /* a power of two, or 0 when not tracking */
+static size_t envelock_zero_used = 0;
+
+static size_t envelock_zero_hash(const void *ptr)
+{
+    return (size_t) (((uint64_t) (uintptr_t) ptr >> 3) * UINT64_C(0x9E3779B97F4A7C15));
+}
+
+static void envelock_zero_put(envelock_zero_slot *slots, size_t capacity, void *ptr, size_t size,
+                              size_t *used)
+{
+    size_t i = envelock_zero_hash(ptr) & (capacity - 1);
+    while (slots[i].ptr != NULL && slots[i].ptr != ptr) {
+        i = (i + 1) & (capacity - 1);
+    }
+    if (slots[i].ptr == NULL) {
+        (*used)++;
+    }
+    slots[i].ptr = ptr;
+    slots[i].size = size;
+}
+
+static void envelock_zero_remember(void *ptr, size_t size)
+{
+    if (envelock_zero_capacity == 0 || ptr == NULL) {
+        return;
+    }
+    if ((envelock_zero_used + 1) * 2 > envelock_zero_capacity) {
+        size_t bigger = envelock_zero_capacity * 2, i, used = 0;
+        envelock_zero_slot *grown = calloc(bigger, sizeof(*grown));
+        if (grown == NULL) {                  /* stop tracking: tails are then left as they are */
+            free(envelock_zero_slots);
+            envelock_zero_slots = NULL;
+            envelock_zero_capacity = 0;
+            return;
+        }
+        for (i = 0; i < envelock_zero_capacity; i++) {
+            if (envelock_zero_slots[i].ptr != NULL) {
+                envelock_zero_put(grown, bigger, envelock_zero_slots[i].ptr, envelock_zero_slots[i].size, &used);
+            }
+        }
+        free(envelock_zero_slots);
+        envelock_zero_slots = grown;
+        envelock_zero_capacity = bigger;
+        envelock_zero_used = used;
+    }
+    envelock_zero_put(envelock_zero_slots, envelock_zero_capacity, ptr, size, &envelock_zero_used);
+}
+
+/* The size a block was handed out with in this window, or SIZE_MAX when it is not known. */
+static size_t envelock_zero_size_of(const void *ptr)
+{
+    size_t i;
+    if (envelock_zero_capacity == 0 || ptr == NULL) {
+        return SIZE_MAX;
+    }
+    i = envelock_zero_hash(ptr) & (envelock_zero_capacity - 1);
+    while (envelock_zero_slots[i].ptr != NULL) {
+        if (envelock_zero_slots[i].ptr == ptr) {
+            return envelock_zero_slots[i].size;
+        }
+        i = (i + 1) & (envelock_zero_capacity - 1);
+    }
+    return SIZE_MAX;
+}
+
+static void *envelock_zero_malloc(size_t size ENVELOCK_ZERO_DC)
+{
+    void *p = envelock_zero_wrapping
+        ? envelock_zero_prev_malloc(size ENVELOCK_ZERO_PREV_CC)
+        : _zend_mm_alloc(envelock_zero_heap, size ENVELOCK_ZERO_MM_CC);
+    if (p != NULL) {
+        memset(p, 0, size);
+        envelock_zero_remember(p, size);
+    }
+    return p;
+}
+
+static void envelock_zero_free(void *p ENVELOCK_ZERO_DC)
+{
+    if (envelock_zero_wrapping) {
+        envelock_zero_prev_free(p ENVELOCK_ZERO_PREV_CC);
+    } else {
+        _zend_mm_free(envelock_zero_heap, p ENVELOCK_ZERO_MM_CC);
+    }
+}
+
+static void *envelock_zero_realloc(void *p, size_t size ENVELOCK_ZERO_DC)
+{
+    size_t old = p == NULL ? 0 : envelock_zero_size_of(p);
+    void *q = envelock_zero_wrapping
+        ? envelock_zero_prev_realloc(p, size ENVELOCK_ZERO_PREV_CC)
+        : _zend_mm_realloc(envelock_zero_heap, p, size ENVELOCK_ZERO_MM_CC);
+    if (q != NULL) {
+        /* A new block (p NULL) or one handed out in this window: zero what it did not have before. */
+        if (old != SIZE_MAX && size > old) {
+            memset((char *) q + old, 0, size - old);
+        }
+        envelock_zero_remember(q, size);
+    }
+    return q;
+}
+
+/* Starts the zeroing window. False (and nothing changed) when it is already open, or when the heap has
+ * custom handlers this cannot wrap. Every path out of the window must call envelock_zero_end(). */
+static bool envelock_zero_begin(void)
+{
+    zend_mm_heap *heap = zend_mm_get_heap();
+    if (envelock_zero_heap != NULL || heap == NULL) {
+        return false;
+    }
+    envelock_zero_wrapping = zend_mm_is_custom_heap(heap);
+    if (envelock_zero_wrapping) {
+#if PHP_VERSION_ID >= 80400
+        zend_mm_get_custom_handlers_ex(heap, &envelock_zero_prev_malloc, &envelock_zero_prev_free,
+                                       &envelock_zero_prev_realloc, &envelock_zero_prev_gc,
+                                       &envelock_zero_prev_shutdown);
+#else
+        zend_mm_get_custom_handlers(heap, &envelock_zero_prev_malloc, &envelock_zero_prev_free,
+                                    &envelock_zero_prev_realloc);
+#endif
+        if (!envelock_zero_prev_malloc || !envelock_zero_prev_free || !envelock_zero_prev_realloc) {
+            return false;
+        }
+    }
+    envelock_zero_heap = heap;
+    envelock_zero_used = 0;
+    envelock_zero_slots = calloc(4096, sizeof(*envelock_zero_slots));
+    envelock_zero_capacity = envelock_zero_slots != NULL ? 4096 : 0;
+#ifndef ZEND_TRACK_ARENA_ALLOC
+    if (CG(arena) != NULL && CG(arena)->end > CG(arena)->ptr) {
+        memset(CG(arena)->ptr, 0, (size_t) (CG(arena)->end - CG(arena)->ptr));
+    }
+#endif
+#if PHP_VERSION_ID >= 80400
+    zend_mm_set_custom_handlers_ex(heap, envelock_zero_malloc, envelock_zero_free, envelock_zero_realloc,
+                                   envelock_zero_wrapping ? envelock_zero_prev_gc : NULL,
+                                   envelock_zero_wrapping ? envelock_zero_prev_shutdown : NULL);
+#else
+    zend_mm_set_custom_handlers(heap, envelock_zero_malloc, envelock_zero_free, envelock_zero_realloc);
+#endif
+    return true;
+}
+
+static void envelock_zero_end(void)
+{
+    zend_mm_heap *heap = envelock_zero_heap;
+    if (heap == NULL) {
+        return;
+    }
+    if (envelock_zero_wrapping) {
+#if PHP_VERSION_ID >= 80400
+        zend_mm_set_custom_handlers_ex(heap, envelock_zero_prev_malloc, envelock_zero_prev_free,
+                                       envelock_zero_prev_realloc, envelock_zero_prev_gc,
+                                       envelock_zero_prev_shutdown);
+#else
+        zend_mm_set_custom_handlers(heap, envelock_zero_prev_malloc, envelock_zero_prev_free,
+                                    envelock_zero_prev_realloc);
+#endif
+    } else {
+        zend_mm_set_custom_handlers(heap, NULL, NULL, NULL);
+    }
+    free(envelock_zero_slots);
+    envelock_zero_slots = NULL;
+    envelock_zero_capacity = 0;
+    envelock_zero_used = 0;
+    envelock_zero_heap = NULL;
+    envelock_zero_wrapping = false;
+}
+
 int envelock_bc_emit_file(zend_file_handle *file_handle, unsigned char **image_out,
                           size_t *image_length, const char **error)
 {
-    envelock_persistent_script *script;
+    /* volatile: set after the zend_try blocks below, and live across them (-Wclobbered). */
+    envelock_persistent_script *volatile script = NULL;
     zend_op_array *volatile op_array = NULL;
     uint32_t orig_functions_count, orig_class_count;
     zend_op_array *orig_active_op_array;
     uint32_t orig_compiler_options;
+    uint32_t orig_rtd_key_counter;
     void (*orig_execute_internal)(zend_execute_data *execute_data, zval *return_value);
+    void (*orig_execute_ex)(zend_execute_data *execute_data);
     volatile bool compile_bailed = false;
     size_t length;
 
@@ -548,56 +779,109 @@ int envelock_bc_emit_file(zend_file_handle *file_handle, unsigned char **image_o
     /* Constants the engine marks CONST_NO_FILE_CACHE (PHP_SAPI, PHP_BINARY) describe the PROCESS,
      * not the build: never fold the packer's values into the image (BC-16). */
     CG(compiler_options) |= ZEND_COMPILE_WITH_FILE_CACHE;
+    /* Nor any other persistent constant: their values belong to the HOST that runs the image
+     * (PHP_OS_FAMILY packed on macOS and run on Linux, PHP_WINDOWS_VERSION_BUILD, ICONV_VERSION and
+     * LIBXML_LOADED_VERSION of the host's libraries, PHP_BINDIR/PHP_EXTENSION_DIR of another distro's
+     * build, constants of an extension the server lacks), and the build id the image is bound to does
+     * not cover them. They were folded at pack time, so valid code silently read the packer's values
+     * (audit 2026-11-17). OPcache's own file cache sets the same flag (php-src bug #79568). */
+    CG(compiler_options) |= ZEND_COMPILE_NO_PERSISTENT_CONSTANT_SUBSTITUTION;
     /* Compile as if an execute_internal hook were installed. The compiler then emits no frameless
      * calls (ZEND_FRAMELESS_ICALL_*: an index into a process table the deserializer cannot bound,
-     * produced for unqualified calls in a namespace even under IGNORE_INTERNAL_FUNCTIONS) and the
-     * generic ZEND_DO_FCALL instead of DO_UCALL/DO_ICALL, which skip whatever execute hooks the
-     * SERVER has. The image therefore does not depend on the packer's hooks (BC-16), and the loader
-     * can refuse frameless opcodes outright (BC-12). execute_internal is the engine's own default,
-     * so anything run while compiling behaves exactly as without the hook. */
+     * produced for unqualified calls in a namespace even under IGNORE_INTERNAL_FUNCTIONS) and no
+     * DO_ICALL, which skips whatever execute_internal hook the SERVER has. The image therefore does
+     * not depend on the packer's hooks (BC-16), and the loader can refuse frameless opcodes outright
+     * (BC-12). execute_internal is the engine's own default, so anything run while compiling behaves
+     * exactly as without the hook. */
     orig_execute_internal = zend_execute_internal;
     if (zend_execute_internal == NULL) {
         zend_execute_internal = execute_internal;
     }
+    /* And with a pass-through zend_execute_ex (C-05): no DO_UCALL / DO_FCALL_BY_NAME either, only the
+     * generic DO_FCALL. Under IGNORE_INTERNAL_FUNCTIONS the compiler otherwise emits DO_UCALL for an
+     * INTERNAL static method it resolved (PHP 8.3.6 resolves DateTime::createFromFormat despite
+     * IGNORE_INTERNAL_CLASSES), and that call crashed the server at execution. */
+    orig_execute_ex = zend_execute_ex;
+    if (zend_execute_ex == execute_ex
+#if defined(ENVELOCK_BCRUN)
+        && !envelock_bc_test_legacy_call_ops
+#endif
+        ) {
+        zend_execute_ex = envelock_bc_compile_execute_ex;
+    }
+    /* The engine's own compile_file, not the zend_compile_file hook chain: with OPcache caching in the
+     * packing PHP (opcache.enable_cli=1) the chain returned op_arrays, functions and classes living in
+     * OPcache's SHARED memory, which persist then freed as if they were request memory -- heap
+     * corruption or a crash on every file at pack time (audit 2026-11-17). The source compiled here
+     * is a plain file, so no other hook has anything to do with it. */
+    (void) envelock_zero_begin();          /* H-09: everything allocated until envelock_zero_end() is zeroed */
+    /* H-09, the last per-process input: the compiler numbers every runtime definition key (closures,
+     * anonymous classes, delayed early binding) from a process-wide counter, so a file's image depended
+     * on how many files the packer had compiled before it. A key also holds the file's path and line,
+     * so numbering each file from 0 cannot make two files' keys collide; the counter is put back after. */
+    orig_rtd_key_counter = CG(rtd_key_counter);
+    CG(rtd_key_counter) = 0;
     zend_try {
-        op_array = zend_compile_file(file_handle, ZEND_INCLUDE);
+        op_array = compile_file(file_handle, ZEND_INCLUDE);
     } zend_catch {
         compile_bailed = true;
     } zend_end_try();
+    CG(rtd_key_counter) = orig_rtd_key_counter;
+    zend_execute_ex = orig_execute_ex;
     zend_execute_internal = orig_execute_internal;
     CG(compiler_options) = orig_compiler_options;
     CG(active_op_array) = orig_active_op_array;
     if (compile_bailed) {
         /* A compile-time fatal: let it end the request, with the engine's options put back. */
+        envelock_zero_end();
         _zend_bailout("envelock_bc.c", __LINE__);
     }
 
     if (op_array == NULL) {
+        envelock_zero_end();
         *error = "compilation failed";
         return FAILURE;
     }
 
-    script = envelock_create_script();
+    {
+        /* The script and its early-binding list are persisted too, so they are built inside the
+         * window; an out-of-memory bail-out here closes it before ending the request. */
+        volatile bool build_bailed = false;
+        envelock_persistent_script *volatile built = NULL;
+        zend_try {
+            envelock_persistent_script *fresh = envelock_create_script();
+            if (fresh != NULL) {
+                fresh->script.main_op_array = *op_array;
+                envelock_move_user_functions(CG(function_table),
+                                             CG(function_table)->nNumUsed - orig_functions_count,
+                                             &fresh->script);
+                envelock_move_user_classes(CG(class_table),
+                                           CG(class_table)->nNumUsed - orig_class_count, &fresh->script);
+                envelock_build_delayed_early_binding_list(fresh);
+                fresh->num_warnings = 0;
+                fresh->warnings = NULL;
+                fresh->timestamp = 0;
+                fresh->script.filename = file_handle->opened_path
+                    ? zend_string_copy(file_handle->opened_path)
+                    : zend_string_copy(file_handle->filename);
+                zend_string_hash_val(fresh->script.filename);
+            }
+            built = fresh;
+        } zend_catch {
+            build_bailed = true;
+        } zend_end_try();
+        envelock_zero_end();
+        if (build_bailed) {
+            _zend_bailout("envelock_bc.c", __LINE__);
+        }
+        script = built;
+    }
     if (script == NULL) {
         destroy_op_array(op_array);
         efree(op_array);
         *error = "out of memory";
         return FAILURE;
     }
-    script->script.main_op_array = *op_array;
-    envelock_move_user_functions(CG(function_table),
-                                 CG(function_table)->nNumUsed - orig_functions_count,
-                                 &script->script);
-    envelock_move_user_classes(CG(class_table),
-                               CG(class_table)->nNumUsed - orig_class_count, &script->script);
-    envelock_build_delayed_early_binding_list(script);
-    script->num_warnings = 0;
-    script->warnings = NULL;
-    script->timestamp = 0;
-    script->script.filename = file_handle->opened_path
-        ? zend_string_copy(file_handle->opened_path)
-        : zend_string_copy(file_handle->filename);
-    zend_string_hash_val(script->script.filename);
     efree(op_array);
 
     /* Persist into the arena (for_shm = 0: process memory), then serialize out of it. The

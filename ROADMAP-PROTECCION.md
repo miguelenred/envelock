@@ -5,8 +5,8 @@ application keeps working unchanged on a real web server. Reliability is part of
 brake: a protector that breaks the app protects nothing.
 
 > **Version note.** The anti-root architecture this roadmap calls "2.0" is the internal **codename** for
-> the work, not a released version number. Nothing is published yet; it ships as part of Envelock's first
-> **1.0.0** release (all of it opt-in and off by default). "2.0" throughout this file means that codename.
+> the work, not a released version number. It shipped in Envelock's first release, 1.0.0 (2026-11-12), and is part of the current
+> **1.1.0** release (all of it opt-in and off by default). "2.0" throughout this file means that codename.
 
 **Honest threat model.** Envelock does not fully defeat the administrator/root of the server that
 runs the application: with full control, root can still read process memory. No tool in this class
@@ -53,10 +53,11 @@ and current status:
 - **Obfuscation.** Global AST renaming and conservative flow obfuscation are in; real control-flow
   flattening and constant mixing are unfinished, and the opcode VM (O4) is laboratory-only and not
   production-hardened. A competent analyst can still recover logic, especially from bytecode.
-- **Windows 2.0 — done (verified under Wine).** The 2.0 native modules and the bytecode layer (O1)
-  were ported to the MSVC/Windows toolchain; all 8 DLLs build and the bytecode round-trip runs on
-  8.4/8.5 NTS under Wine. Real-Windows confirmation (ACLs, non-ASCII paths, VCRUNTIME) is still the
-  user's to make. Linux 2.0 is complete and tested; macOS source is portable, validated by CI.
+- **Windows 2.0 — done (built and validated natively on Windows 11).** The 2.0 native modules and the
+  bytecode layer (O1) were ported to the MSVC/Windows toolchain; all 8 DLLs are built natively on
+  Windows 11 x64 (VS Build Tools 2022) and pass `tests/test_native.py` (the bytecode layer ships in
+  the NTS builds; TS is source-only). Linux 2.0 is complete and tested; macOS source is portable,
+  validated by CI.
 - **OPcache.** Protected files are refused under OPcache SHM by default (fail-closed); coexistence is
   opt-in via `opcache.blacklist_filename`. Decrypted code is never cached between requests, by design.
 
@@ -67,8 +68,8 @@ and current status:
   the development sandbox).
 - Rebuild and publish the 2.0 loaders for every target (Linux/Windows/ARM64 × versions) from CI and
   regenerate `prebuilt/SHA256SUMS`.
-- Confirm the Windows 2.0 DLLs (now ported and Wine-verified, bytecode included) on real Windows
-  (ACLs, non-ASCII paths, VCRUNTIME), and build/validate the macOS 2.0 loader on a real Mac / CI.
+- Build and validate the macOS 2.0 loader on a real Mac / CI (the Windows 2.0 DLLs are already built
+  and validated natively on Windows 11).
 - An accredited external audit of the C/Zend and of the packaging.
 
 See `docs/AUDITORIA.md` for the per-pass review record and `docs/VERIFICACION.md` for measured

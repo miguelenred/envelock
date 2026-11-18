@@ -5,13 +5,34 @@
  * Upload this file to the server and run it with the SAME PHP that will serve the protected site:
  *   - web:  open it in the browser (it reports the web SAPI, e.g. PHP-FPM or LiteSpeed), or
  *   - CLI:  php envelock-preflight.php   (reports the CLI, which often reads another php.ini).
- * Delete it afterwards: it prints details of the server configuration.
+ * Delete it afterwards: it prints details of the server configuration. Over the web it answers only
+ * during the hour after it was uploaded and shows file names, not paths.
  *
  * It only reads settings; it changes nothing and loads nothing. FAIL = Envelock will not run as
  * configured, WARN = it runs only with a change or with limits, INFO = matters for some options.
  */
 
 const ENVELOCK_PREFLIGHT_MIN_GLIBC = '2.28';   // what the prebuilt Linux loaders need (docs/HOSTING.md §2)
+const ENVELOCK_PREFLIGHT_LIFETIME = 3600;     // seconds a web copy keeps answering after it was uploaded
+
+$cli = in_array(PHP_SAPI, ['cli', 'phpdbg'], true);
+// Left on a web server, this page told anyone the path of the server's private identity file and of
+// the prepend/blacklist files (audit 2026-11-17). Over the web it answers only during the hour after
+// it was uploaded (the later of its modification and change times: an upload sets the change time
+// even when the client keeps the original modification time), and it shows file NAMES, not paths.
+if (!$cli) {
+    $uploaded = max((int) @filemtime(__FILE__), (int) @filectime(__FILE__));
+    if ($uploaded > 0 && time() - $uploaded > ENVELOCK_PREFLIGHT_LIFETIME) {
+        http_response_code(410);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "This Envelock pre-flight check has expired (it answers for one hour after upload).\n"
+            . "Upload it again to re-run it, and delete it from the server afterwards.\n";
+        exit(1);
+    }
+}
+$shown = static function (string $path) use ($cli): string {
+    return ($cli || $path === '') ? $path : basename(str_replace('\\', '/', $path)) . ' (full path hidden on the web)';
+};
 
 $rows = [];
 $add = static function (string $level, string $what, string $detail) use (&$rows): void {
@@ -64,11 +85,18 @@ if (PHP_OS_FAMILY === 'Windows') {
     }
     $add($x64 ? 'OK' : 'FAIL', 'Architecture', $machine . ($x64 ? '' : ': no prebuilt loader for it; build one on this system'));
     $add('OK', 'OpenSSL', 'nothing needed from the system: the prebuilt Linux loaders carry their own OpenSSL 3');
-    $loader = $x64 ? "prebuilt/loader/linux-x86_64/php-$minor-" . (PHP_ZTS ? 'zts' : 'nts') . '/envelock.so' : null;
+    // Linux ships one thread-safe loader, for PHP 8.4 ZTS (prebuilt/README.md); for any other ZTS
+    // PHP this used to name a php-8.x-zts folder that does not exist (audit 2026-11-17).
+    if ($x64 && PHP_ZTS && $minor !== '8.4') {
+        $add('WARN', 'Prebuilt loader', "none for PHP $minor ZTS (only 8.4 ZTS is shipped for Linux): "
+            . 'build the loader on this server (docs/BUILDING.md)');
+    } else {
+        $loader = $x64 ? "prebuilt/loader/linux-x86_64/php-$minor-" . (PHP_ZTS ? 'zts' : 'nts') . '/envelock.so' : null;
+    }
 } else {
     $add('FAIL', 'Platform', PHP_OS_FAMILY . ': no prebuilt loader; build one on this system (docs/PLATAFORMAS.md)');
 }
-if ($loader !== null) {
+if ($loader !== null && $supported) {
     $add('INFO', 'Loader to use', $loader . ' (complete distribution)');
 }
 
@@ -76,16 +104,24 @@ if ($loader !== null) {
 $installed = extension_loaded('envelock');
 if ($installed) {
     $identity = (string) ini_get('envelock.identity');
-    ob_start();
-    phpinfo(INFO_MODULES);
-    $store = preg_match('/Trust store\W*(loaded|not configured)/', strip_tags((string) ob_get_clean()), $m) ? $m[1] : '?';
+    $store = '?';
+    // phpinfo() is often in disable_functions on shared hosting: calling it was a fatal error that
+    // left no report at all (audit 2026-11-17).
+    if (function_exists('phpinfo')) {
+        ob_start();
+        phpinfo(INFO_MODULES);
+        $store = preg_match('/Trust store\W*(loaded|not configured)/', strip_tags((string) ob_get_clean()), $m) ? $m[1] : '?';
+    }
     if ($identity === '') {
         $add('FAIL', 'Envelock loader', 'loaded, but envelock.identity is empty: set it in php.ini and restart PHP');
+    } elseif ($store === '?') {
+        $add('WARN', 'Envelock loader', 'loaded, envelock.identity=' . $shown($identity) . '; whether the '
+            . 'identity file was accepted cannot be read here (phpinfo is disabled): check the PHP error log');
     } elseif ($store !== 'loaded') {
-        $add('FAIL', 'Envelock loader', "loaded, but the identity file $identity was not accepted (owner, "
-            . 'permissions or contents; the PHP error log says why); fix it and restart PHP');
+        $add('FAIL', 'Envelock loader', 'loaded, but the identity file ' . $shown($identity) . ' was not accepted '
+            . '(owner, permissions or contents; the PHP error log says why); fix it and restart PHP');
     } else {
-        $add('OK', 'Envelock loader', "loaded; identity file accepted ($identity)");
+        $add('OK', 'Envelock loader', 'loaded; identity file accepted (' . $shown($identity) . ')');
     }
 } else {
     $add('WARN', 'Envelock loader', 'not loaded in this PHP: the server administrator adds "extension=" and '
@@ -93,7 +129,6 @@ if ($installed) {
 }
 
 // --- OPcache ----------------------------------------------------------------------------------
-$cli = in_array(PHP_SAPI, ['cli', 'phpdbg'], true);
 if (!extension_loaded('Zend OPcache')) {
     $add('OK', 'OPcache', 'not loaded');
 } else {
@@ -111,7 +146,8 @@ if (!extension_loaded('Zend OPcache')) {
         $add('OK', 'OPcache', 'on in php.ini but switched off for this site (per directory, vhost or pool): '
             . 'accepted by loaders built from 2026-11-11 on; older ones refused it (docs/HOSTING.md §3.3)');
     } elseif ($allow && $blacklist !== '') {
-        $add('OK', 'OPcache', "on, envelock.allow_opcache=1, blacklist $blacklist (it must list the protected folder)");
+        $add('OK', 'OPcache', 'on, envelock.allow_opcache=1, blacklist ' . $shown($blacklist)
+            . ' (it must list the protected folder)');
     } else {
         $add('FAIL', 'OPcache', 'on: protected files are refused unless php.ini sets envelock.allow_opcache=1 and '
             . 'opcache.blacklist_filename lists the protected folder, or opcache.enable=0');
@@ -156,11 +192,13 @@ $ffi = extension_loaded('ffi') ? (string) ini_get('ffi.enable') : 'not loaded';
 $add('INFO', 'For --no-ffi packages', 'enable_dl=' . ($on(ini_get('enable_dl')) ? 'On' : 'Off') . ", ffi.enable=$ffi"
     . (($on(ini_get('enable_dl')) || $on($ffi) || ($cli && strtolower($ffi) === 'preload'))
         ? ' -> NOT ready: needs enable_dl=Off and FFI off' : ' -> ready'));
-$prepend = trim((string) ini_get('auto_prepend_file') . ' ' . (string) ini_get('auto_append_file'));
+$prepend = trim($shown((string) ini_get('auto_prepend_file')) . ' ' . $shown((string) ini_get('auto_append_file')));
 $add('INFO', 'For --no-prepend packages', $prepend === '' ? 'no auto_prepend/append file -> ready'
     : "auto_prepend/append_file set ($prepend) -> NOT ready (e.g. a security plugin's firewall)");
+$basedir = (string) ini_get('open_basedir');
 $add('INFO', 'open_basedir / disable_functions', 'nothing special: protected files must be inside open_basedir '
-    . 'like any PHP file (open_basedir=' . ((string) ini_get('open_basedir') !== '' ? ini_get('open_basedir') : 'none') . ')');
+    . 'like any PHP file (open_basedir=' . ($basedir === '' ? 'none'
+        : ($cli ? $basedir : 'set, ' . count(array_filter(explode(PATH_SEPARATOR, $basedir))) . ' folder(s)')) . ')');
 
 // --- Report -----------------------------------------------------------------------------------
 if (!$cli) {

@@ -696,6 +696,7 @@ echo $r->find(0), "\\n";
 '''
 
 
+@needs_php
 def test_obfuscate_flatten_function_that_falls_off_the_end_terminates(tmp_path):
     """Regression (O6, found by the plain-app test): a body whose last statement is not a return used
     to end its last segment with a plain `break;`, which leaves the switch but not the while, so the
@@ -1058,6 +1059,8 @@ def test_names_survives_a_file_that_would_not_compile(tmp_path):
     assert renamed, "the control case must rename"
     assert b"class Ok6" not in out["x.php"]
 
+
+@needs_php
 def test_namespaced_pack_is_returned_byte_for_byte(tmp_path):
     """Without the separate experimental AST opt-in, a namespaced pack is declined unchanged.
 

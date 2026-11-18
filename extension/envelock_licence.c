@@ -92,12 +92,22 @@ int envelock_licence_parse(const unsigned char *blob, size_t length, envelock_li
     memcpy(out->domain, blob + 50, 32);
     memcpy(out->ip, blob + 82, 32);
     /* A constraint flagged absent but non-zero (or vice versa) means the file was edited by hand
-     * or by a mismatched encoder. Refuse rather than guess which of the two to believe. */
+     * or by a mismatched encoder. Refuse rather than guess which of the two to believe. Every slot:
+     * domain and IP were not checked (only machine and expiry), although this comment said so
+     * (audit 2026-11-17). */
     {
         unsigned char zero[32];
         memset(zero, 0, sizeof(zero));
         if (((out->fields & ENVELOCK_LICENCE_FIELD_MACHINE) != 0)
                 == (memcmp(out->machine, zero, 32) == 0)) {
+            return 0;
+        }
+        if (((out->fields & ENVELOCK_LICENCE_FIELD_DOMAIN) != 0)
+                == (memcmp(out->domain, zero, 32) == 0)) {
+            return 0;
+        }
+        if (((out->fields & ENVELOCK_LICENCE_FIELD_IP) != 0)
+                == (memcmp(out->ip, zero, 32) == 0)) {
             return 0;
         }
         if ((out->fields & ENVELOCK_LICENCE_FIELD_EXPIRY) != 0 && out->expires == 0) {
@@ -339,7 +349,11 @@ size_t envelock_host_domain(char *buf, size_t cap)
      * Command-line SAPIs have no configured server name, and their $_SERVER is built from the
      * ENVIRONMENT, so `SERVER_NAME=licensed.example php app.php` would pass anywhere: there only the
      * machine's own host name counts. (Apache with UseCanonicalName Off also fills SERVER_NAME from
-     * the client's Host header; that is documented, the server must set UseCanonicalName On.) */
+     * the client's Host header; that is documented, the server must set UseCanonicalName On.)
+     * php-cgi is the exception this cannot tell apart: run by hand it is still the "cgi-fcgi" SAPI
+     * and builds $_SERVER from the environment, exactly as CGI does from a web server, so there
+     * SERVER_NAME comes from whoever started it -- like the web server configuration it stands for,
+     * that is the server administrator, whom a domain binding does not stop (audit 2026-11-17). */
     if (!sapi_module.name || (strcmp(sapi_module.name, "cli") != 0
                               && strcmp(sapi_module.name, "phpdbg") != 0
                               && strcmp(sapi_module.name, "embed") != 0)) {
@@ -456,6 +470,54 @@ static int envelock_domain_hash(const char *name, size_t len, unsigned char out[
     return envelock_sha256(buf, ENVELOCK_DOMAIN_INFO_LEN + 1 + len, out);
 }
 
+/* The host-bound checks are cached, because they ran for EVERY protected file and they are the
+ * expensive part: the IP binding is a getifaddrs() netlink dump, the machine binding reads
+ * /etc/machine-id and every interface under /sys/class/net, about twenty system calls per file, then
+ * SHA-256 (audit 2026-11-17).
+ *  - The machine fingerprint once per process (per thread in ZTS) once it has been computed: only the
+ *    machine's administrator can change its inputs, and it is first computed at start-up -- in the
+ *    FPM master, before a pool's chroot -- so a chrooted worker, which has no /sys or
+ *    /etc/machine-id, no longer refuses every file of a machine-bound package. A failed computation
+ *    is not cached (it is retried).
+ *  - The IP fingerprint once per request: addresses can change (DHCP) during a worker's life.
+ * Expiry and the domain are still checked for every file (they are cheap, and the clock moves). */
+ZEND_TLS int envelock_machine_known = 0;           /* ZEND_TLS is already `static` (thread-local in ZTS) */
+ZEND_TLS unsigned char envelock_machine_here[32];
+ZEND_TLS int envelock_ip_state = 0;                /* 0 = not computed this request, 1 = ok, -1 = none */
+ZEND_TLS unsigned char envelock_ip_here[32];
+
+void envelock_licence_request_start(void)
+{
+    envelock_ip_state = 0;
+}
+
+static int envelock_machine_cached(unsigned char out[32])
+{
+    if (!envelock_machine_known) {
+        if (envelock_machine_fingerprint(envelock_machine_here) != 1) {
+            return 0;
+        }
+        envelock_machine_known = 1;
+    }
+    memcpy(out, envelock_machine_here, 32);
+    return 1;
+}
+
+static int envelock_ips_cached(unsigned char out[32], int request_active)
+{
+    if (!request_active) {
+        return envelock_host_ips_hash(out);          /* start-up: not a request, nothing to cache */
+    }
+    if (envelock_ip_state == 0) {
+        envelock_ip_state = envelock_host_ips_hash(envelock_ip_here) == 1 ? 1 : -1;
+    }
+    if (envelock_ip_state != 1) {
+        return 0;
+    }
+    memcpy(out, envelock_ip_here, 32);
+    return 1;
+}
+
 const char *envelock_licence_refusal(const envelock_licence *licence, int request_active)
 {
     if (!licence) {
@@ -491,7 +553,7 @@ const char *envelock_licence_refusal(const envelock_licence *licence, int reques
     }
     if (licence->fields & ENVELOCK_LICENCE_FIELD_IP) {
         unsigned char here[32];
-        if (envelock_host_ips_hash(here) != 1) {
+        if (envelock_ips_cached(here, request_active) != 1) {
             return "this server reports no IP address, and the license is bound to one";
         }
         if (memcmp(here, licence->ip, 32) != 0) {
@@ -500,7 +562,7 @@ const char *envelock_licence_refusal(const envelock_licence *licence, int reques
     }
     if (licence->fields & ENVELOCK_LICENCE_FIELD_MACHINE) {
         unsigned char here[32];
-        if (envelock_machine_fingerprint(here) != 1) {
+        if (envelock_machine_cached(here) != 1) {
             return "this host reports no machine identity, and the license is bound to one";
         }
         if (memcmp(here, licence->machine, 32) != 0) {

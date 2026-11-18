@@ -314,7 +314,7 @@ Ed25519 verify (87 µs by `openssl speed` on this host); the per-worker cache al
 repeat requests. Measured first-compile cost (400 files, min of 9, startup subtracted): plain 17–19,
 protected 121–127, and **24–26 µs/file with the manifest fast path** — about 5×. `envelock.manifest_fastpath`
 was therefore changed from opt-in (default off) to **on by default under `--enforce-manifest`**:
-that package's manifest signature is verified every request for enforcement anyway, so seeding the
+that package's manifest signature is verified for enforcement anyway (every request at the time; once per worker since Pass 35), so seeding the
 verified cache from it adds no new trust (independently re-reviewed; **superseded by Pass 32**: with two
 or more trusted developers it did add trust, and the fast path is now off in that case). `envelock.manifest_fastpath=0`
 restores the per-file verify (measured: back to ~121 µs/file). Behaviour is identical either way, only
@@ -943,6 +943,45 @@ first run against the unchanged code and failed there.
 - The report's suggestion to add `secret_memory` with worker recycling, and sealed with OPcache, to
   `scripts/fpm_smoke.py`. Instead, H-01 is covered by the fork harness, which runs on any Linux
   (`memfd_secret` is rarely available on CI kernels). H-02 has no code change to test.
+
+## Pass 35: two external reports on 1.1.0, then an internal code audit (November 17)
+
+Two external reports on the 1.1.0 source (one with a dynamic run on PHP 8.3.6) were fixed first:
+C-05 for real (the first fix only removed `DO_ICALL`), the stale evidence (H-1) and the test suite
+(H-2…H-6); `CHANGELOG.md` has the details. Then a full internal audit, split by area (loader core;
+crypto, licences, clock and VM; bytecode layer; encoder; assistant, scripts and release gate). Every
+finding was checked against the code here and, where possible, reproduced; every fix has a test that
+was run against the fix undone (a scratch build of the loader for the C ones) and failed there.
+
+| Area | Finding | Status |
+|---|---|---|
+| Loader | `allow_opcache=1` + OPcache caching skipped the compile-hook check, so any hook above Envelock's was accepted (HOST-1 incomplete) | Fixed |
+| Loader | The anti-rollback record was loaded in the FPM master only; forked workers judged the clock against it and ignored what others had saved (reproduced: up to an hour on a clock set back a month) | Fixed: re-read at each request's first file |
+| Loader | Windows: no inter-process lock on the record (a process could lower it); its open followed a reparse point planted after the path check | Fixed (`LockFileEx`, `FILE_FLAG_OPEN_REPARSE_POINT`) |
+| Loader | Teardown in RSHUTDOWN ran before the session module's save handler (user code): sealed `eval()` accepted, vault literals "" | Fixed: teardown in post-deactivate |
+| Loader | An out-of-memory bail-out in the vault parsers freed the decrypted source unwiped; plain vault literals freed unwiped | Fixed |
+| Loader | C-11 took any non-canonical include (`..`, Windows separators) for a directory symlink | Fixed: lexical comparison |
+| Loader | Machine/IP licence fingerprints recomputed for every file (≈20 system calls each); broke machine binding in a chrooted pool | Fixed: once per process / per request |
+| Loader | Manifest signature verified on every request | Fixed: once per worker, by SHA-256 |
+| Loader | Encrypted vault refused a source under 4 bytes; licence domain/IP slot vs flag unchecked; sealed check skipped when reading failed; 32-bit length wrap; `ftruncate` failure reported as `memfd_secret`; clock save failures silent | Fixed |
+| Loader | `harden_memory` and the tracer check do nothing on Windows | Fixed: process and request-thread access list (only SYSTEM / SeDebugPrivilege may read, debug, inject or duplicate handles), applied at the first request; a debugger attached to the process is refused in paranoid mode. Both tests fail against the previous DLL. Limits (the parent `w3wp.exe`/Apache handle, thread-pool threads) in MANUAL; `envelock_secret_memory()` reports `VirtualLock` |
+| Loader | The anti-rollback record's `flock` blocked: a process holding the lock stalled every protected request | Fixed: tried ~20 ms, then read without it and skip the save |
+| Loader | Per-file costs: package digest re-hashed the recipient table (≤127 KB), twelve module lookups for debuggers, sealed check for plain files, 16 MiB manifest buffer | Fixed: remembered per worker / per request (by module count, so `dl()` is still seen) / skipped when nothing is sealed / sized from the file |
+| Loader | Mini-VM: each call re-decoded and re-validated its program and zeroed a 64 KiB stack | Fixed: prepared once per request (malformed programs still refused on every call), stack grows from 16 slots |
+| Loader | `clang --analyze` notes on `envelock_vm.c` (external audit 2026-11-12) | Fixed (names read from the constant pool; a guard the validator already implied); the analyser is clean on the loader's own sources. Notes remaining in the copied OPcache persist/file-cache code are on pack-time paths or need an op_array without literals to reach an IS_CONST operand; the one on the load side (`envelock_fc_inside` with no region) now refuses |
+| Loader | Directives read only at start-up (licence, clock, trusted time, secret/harden memory) ignored per FPM pool without saying so | Documented (MANUAL) |
+| Loader | ZTS: no `ZEND_ENABLE_STATIC_TSRMLS_CACHE` (every global access calls `tsrm_get_ls_cache()`) | Not changed, on purpose: a few function calls per protected file against ~100 µs of crypto, and a missed cache update on some thread path would crash ZTS servers |
+| Loader | php-cgi run by hand takes `SERVER_NAME` from the environment | Documented (the administrator's, like the web server configuration) |
+| Bytecode | PHP 8.5: inherited closure property default could not be packed | Fixed |
+| Bytecode | Persistent constants folded at pack time | Fixed (`NO_PERSISTENT_CONSTANT_SUBSTITUTION`) |
+| Bytecode | Emitter compiled through OPcache's hook (crash with `opcache.enable_cli=1`) | Fixed (`compile_file`) |
+| Bytecode | Images carry bytes of the previously emitted file (H-09) | Fixed. Valgrind (definedness bits of a finished image) found 68 undefined runs from heap padding, the compiler's stack (null/bool zval values, `zend_type`/`zend_type_list` padding, operands the VM ignores) and a per-process key counter; all cleared, and valgrind now finds none. Operands are cleared only where provably meaningless (THIS, NEXT, CONSTRUCTOR kinds with a declared type list; `RECV_VARIADIC` op2): the static-property opcodes are declared ANY but keep the fetch kind in op2, and a broader first rule crashed `static::$x++` (caught by the new test). Same image in separate processes, after other files and repeated in one process (`test_bytecode_images_are_reproducible`), and for all 103 compilable `.php` files of PHP 8.4's source tree; where valgrind is installed, `test_bytecode_image_holds_no_uninitialised_byte_under_valgrind` asks memcheck about every byte written |
+| Bytecode | JIT or observer extensions change the build identity | Documented (MANUAL) |
+| Bytecode | `check_bc_layers.py` could pass a broken tree (`php8*` glob, macro region, empty helper bodies) | Fixed |
+| Encoder | Windows: packed files got an owner-only ACL (IIS could not read them) | Fixed |
+| Encoder | PowerShell password files (BOM/UTF-16) bypassed the length check and locked keys to the file | Fixed (old keys still open) |
+| Encoder | POSIX identity updates dropped owner/mode; manifest over 16 MiB accepted at pack; `--obfuscate-properties` renamed names a class reads; `server-install --identity` accepted any file; empty licence bindings; `write_public` intermediate folders; `verify` could not pin project/serial | Fixed |
+| Assistant / scripts | GUI hid pack warnings, ran a bare `php` from the current folder, saved keys at an unstated path; release gate: terms file in tree, symlinks, archive formats, BOM, unpinned sources; evidence: wrong OpenSSL, exerciser text, host name; `build-unix.sh` path gate; PIE build-id check; preflight paths, ZTS names, `phpinfo` | Fixed |
 
 ## Open risks and necessary work
 

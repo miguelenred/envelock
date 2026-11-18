@@ -19,6 +19,7 @@
 #ifndef PHP_WIN32
 #include <unistd.h>   /* POSIX-only; Windows uses <io.h> below */
 #include <sys/stat.h> /* fstat() for the hardlink (st_nlink) guard below */
+#include <sys/file.h> /* flock(): serialise the watermark read-modify-write ACROSS FPM processes */
 #endif
 #include <fcntl.h>
 #include <errno.h>
@@ -83,8 +84,11 @@ static int envelock_clock_fd_ok(int fd)
 }
 
 #ifdef PHP_WIN32
-/* CRT open() follows a symlink or junction at the final component; refuse one up front (the handle
- * check above then catches a hardlink, and a reparse point swapped in between shows up there too). */
+/* A symlink or junction at the final component is refused up front, and again on the opened handle
+ * (envelock_clock_fd_ok): the open below does NOT follow a reparse point, so a link swapped in after
+ * this check is opened AS the link and refused there too. The CRT _wopen() used before followed it,
+ * so the handle check saw the TARGET's attributes and a link planted in between went unnoticed: the
+ * 28-byte write could be redirected into any file the PHP account can write (audit 2026-11-17). */
 static int envelock_clock_path_ok(const char *path)
 {
     DWORD attributes;
@@ -101,23 +105,112 @@ static int envelock_clock_path_ok(const char *path)
                           | FILE_ATTRIBUTE_DEVICE)) == 0;
 }
 
-/* The CRT open() reads the path in the ANSI code page, so a UTF-8 php.ini value with a non-ASCII
- * character would name another (missing) file: open through the wide API (ENV-14). */
+/* Opens through the wide API (the CRT open() reads the path in the ANSI code page, so a UTF-8 php.ini
+ * value with a non-ASCII character would name another, missing, file: ENV-14), never following a
+ * reparse point, and hands back a CRT descriptor. Only the flag combinations used here are mapped. */
 static int envelock_clock_open(const char *path, int flags, int mode)
 {
+    HANDLE handle;
+    DWORD access = ((flags & O_RDWR) ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ);
+    DWORD disposition = (flags & O_CREAT) ? OPEN_ALWAYS : OPEN_EXISTING;
     int fd;
     wchar_t *wide = envelock_path_wide(path);
+    (void) mode;
     if (!wide) {
         return -1;
     }
-    fd = _wopen(wide, flags, mode);
+    handle = CreateFileW(wide, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = (GetLastError() == ERROR_ACCESS_DENIED) ? EACCES : ENOENT;
+        return -1;
+    }
+    fd = _open_osfhandle((intptr_t) handle, (flags & O_RDWR) ? (_O_RDWR | _O_BINARY) : (_O_RDONLY | _O_BINARY));
+    if (fd < 0) {
+        CloseHandle(handle);
+        return -1;
+    }
     return fd;
+}
+
+/* Whole-record lock ACROSS PROCESSES (C-10), and positioned reads/writes at offset 0. Windows had no
+ * lock at all, so a long-lived process (an IIS FastCGI php-cgi, a CLI daemon) holding a stale value
+ * rewrote the record LOWER than one another process had saved: "never lowers" held on POSIX only
+ * (audit 2026-11-17). */
+static int envelock_clock_try_lock(int fd, int exclusive)
+{
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    if (LockFileEx((HANDLE) _get_osfhandle(fd),
+                   (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0) | LOCKFILE_FAIL_IMMEDIATELY, 0,
+                   MAXDWORD, MAXDWORD, &overlapped)) {
+        return 1;
+    }
+    return GetLastError() == ERROR_LOCK_VIOLATION ? -1 : 0;
+}
+# define envelock_clock_pause() Sleep(1)
+static void envelock_clock_unlock_fd(int fd)
+{
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    (void) UnlockFileEx((HANDLE) _get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped);
+}
+static long envelock_clock_read_at0(int fd, unsigned char *buf, size_t n)
+{
+    if (_lseeki64(fd, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+    return (long) _read(fd, buf, (unsigned int) n);
+}
+static long envelock_clock_write_at0(int fd, const unsigned char *buf, size_t n)
+{
+    if (_lseeki64(fd, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+    return (long) _write(fd, buf, (unsigned int) n);
 }
 #else
 # define envelock_clock_path_ok(path) 1
 # define envelock_clock_open(path, flags, mode) open((path), (flags), (mode))
+static int envelock_clock_try_lock(int fd, int exclusive)
+{
+    if (flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0) {
+        return 1;
+    }
+    return (errno == EWOULDBLOCK || errno == EAGAIN) ? -1 : 0;
+}
+# define envelock_clock_pause() usleep(1000)
+static void envelock_clock_unlock_fd(int fd)
+{
+    (void) flock(fd, LOCK_UN);
+}
+static long envelock_clock_read_at0(int fd, unsigned char *buf, size_t n)
+{
+    return (long) pread(fd, buf, n, 0);
+}
+static long envelock_clock_write_at0(int fd, const unsigned char *buf, size_t n)
+{
+    return (long) pwrite(fd, buf, n, 0);
+}
 #endif
+
+/* 1 = locked; 0 = the filesystem has no locking (go on without it, best effort); -1 = another process
+ * still holds it after about 20 ms. Never a blocking wait: the lock used to be taken with a plain
+ * flock(LOCK_EX), under the ZTS mutex too, so any process running as the PHP user that held the
+ * record's lock stalled every worker's next save, indefinitely (audit 2026-11-17). A genuine writer
+ * holds it for one 28-byte write. */
+static int envelock_clock_lock_fd(int fd, int exclusive)
+{
+    int attempt, state = -1;
+    for (attempt = 0; attempt < 20 && state == -1; attempt++) {
+        state = envelock_clock_try_lock(fd, exclusive);
+        if (state == -1) {
+            envelock_clock_pause();
+        }
+    }
+    return state;
+}
 
 #define ENVELOCK_CLOCK_INFO "envelock-clock-1\n"
 #define ENVELOCK_CLOCK_INFO_LEN 17U
@@ -143,58 +236,69 @@ static void envelock_clock_check(const unsigned char *body, unsigned char out[8]
     memcpy(out, digest, 8);
 }
 
-int envelock_clock_load(const char *path, uint64_t *watermark)
+/* Validates a record read from disk: 1 and *value when it is one, 0 otherwise. */
+static int envelock_clock_parse(const unsigned char blob[ENVELOCK_CLOCK_SIZE], uint64_t *value)
 {
-    unsigned char blob[ENVELOCK_CLOCK_SIZE];
     unsigned char want[8];
-    FILE *file;
-    size_t got;
+    uint64_t v = 0;
     size_t i;
-    uint64_t value;
-
-    if (!path || !*path || !watermark) {
-        return 0;
-    }
-    {
-        /* O_NOFOLLOW/O_CLOEXEC: the clock-state path must not be read through a symlink an attacker
-         * planted, nor leak the descriptor to a child process (ENV-2026-10). */
-        int rfd;
-        if (!envelock_clock_path_ok(path)) {
-            return 0;
-        }
-        /* O_NONBLOCK: a FIFO planted at the path must not block the worker in open(); the fd check
-         * then refuses anything but one ordinary file. */
-        rfd = envelock_clock_open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_BINARY | O_NONBLOCK, 0);
-        if (rfd < 0) {
-            return 0;                               /* first run, removed, or a symlink in its place */
-        }
-        if (!envelock_clock_fd_ok(rfd)) {
-            close(rfd);
-            return 0;
-        }
-        file = fdopen(rfd, "rb");
-        if (!file) {
-            close(rfd);
-            return 0;
-        }
-    }
-    got = fread(blob, 1, sizeof(blob), file);
-    fclose(file);
-    if (got != sizeof(blob) || memcmp(blob, ENVELOCK_CLOCK_MAGIC, 8) != 0
-            || blob[8] != ENVELOCK_CLOCK_FORMAT) {
-        return 0;                                   /* truncated, foreign, or a newer format */
+    if (memcmp(blob, ENVELOCK_CLOCK_MAGIC, 8) != 0 || blob[8] != ENVELOCK_CLOCK_FORMAT) {
+        return 0;                                   /* foreign, or a newer format */
     }
     envelock_clock_check(blob, want);
     if (memcmp(want, blob + ENVELOCK_CLOCK_CHECK_OFFSET, 8) != 0) {
         return 0;                                   /* half-written or edited by hand */
     }
-    value = 0;
     for (i = 0; i < 8; i++) {
-        value = (value << 8) | (uint64_t) blob[12 + i];
+        v = (v << 8) | (uint64_t) blob[12 + i];
     }
     /* A watermark of 0 is indistinguishable from "nothing observed", and a wildly future one is a
      * forged or corrupt record; ignoring either is safer than refusing to run on their account. */
-    if (value == 0 || value > (uint64_t) 4294967296LL) {
+    if (v == 0 || v > (uint64_t) 4294967296LL) {
+        return 0;
+    }
+    *value = v;
+    return 1;
+}
+
+/* Reads the record at `path` under a SHARED lock (a writer holds the exclusive one only for its
+ * 28-byte rewrite). 1 and *value when a valid record was read. */
+static int envelock_clock_read(const char *path, uint64_t *value)
+{
+    unsigned char blob[ENVELOCK_CLOCK_SIZE];
+    int fd, ok = 0;
+    if (!envelock_clock_path_ok(path)) {
+        return 0;
+    }
+    /* O_NOFOLLOW/O_CLOEXEC: the clock-state path must not be read through a symlink an attacker
+     * planted, nor leak the descriptor to a child process (ENV-2026-10). O_NONBLOCK: a FIFO planted at
+     * the path must not block the worker in open(); the fd check then refuses anything but one
+     * ordinary file. */
+    fd = envelock_clock_open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_BINARY | O_NONBLOCK, 0);
+    if (fd < 0) {
+        return 0;                                   /* first run, removed, or a symlink in its place */
+    }
+    if (envelock_clock_fd_ok(fd)) {
+        /* Busy or not, the record is read: a half-written one fails its check and counts as
+         * no record, which is what an unreadable file means here anyway. */
+        int locked = envelock_clock_lock_fd(fd, 0) == 1;
+        ok = envelock_clock_read_at0(fd, blob, sizeof(blob)) == (long) sizeof(blob)
+             && envelock_clock_parse(blob, value);
+        if (locked) {
+            envelock_clock_unlock_fd(fd);
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+int envelock_clock_load(const char *path, uint64_t *watermark)
+{
+    uint64_t value;
+    if (!path || !*path || !watermark) {
+        return 0;
+    }
+    if (!envelock_clock_read(path, &value)) {
         return 0;
     }
     *watermark = value;
@@ -239,13 +343,59 @@ int envelock_clock_advance(const char *path, uint64_t *watermark, uint64_t step,
     return result;
 }
 
+/* C-10: the rollback check and the advance as ONE locked operation. The refusal used to read the
+ * process-wide watermark OUTSIDE the lock that envelock_clock_advance takes, so in ZTS another thread
+ * could be advancing it at the same time (a torn 64-bit read on 32-bit builds, or a check against a
+ * value already being changed). Holding the lock across both the read and the advance removes that
+ * window; the per-process state is also protected across processes by the file lock inside the
+ * advance.
+ *
+ * `resync` (the first protected file of a request): first adopt the record ON DISK when it is higher
+ * than this process's value. The record is loaded once, at MINIT -- in the FPM master or Apache parent
+ * -- so a worker forked later held the master's start-up value and judged a clock set back against
+ * it, ignoring everything other workers had saved since; only its throttled advance re-read the disk,
+ * after the refusal had already passed (audit 2026-11-17). */
+const char *envelock_clock_guard(const char *path, uint64_t *watermark, uint64_t tolerance,
+                                 int resync)
+{
+    const char *refusal;
+    if (!path || !*path || !watermark) {
+        return NULL;
+    }
+    ENVELOCK_CLOCK_LOCK();
+    if (resync) {
+        uint64_t disk;
+        if (envelock_clock_read(path, &disk)) {
+            if (disk > *watermark) {
+                *watermark = disk;
+            }
+            if (disk > envelock_clock_persisted) {
+                envelock_clock_persisted = disk;
+            }
+        }
+    }
+    refusal = envelock_clock_refusal(*watermark, tolerance);   /* watermark read under the lock */
+    if (refusal == NULL) {
+        envelock_clock_advance_locked(path, watermark, tolerance > 0 ? tolerance : 3600, 1);
+    }
+    ENVELOCK_CLOCK_UNLOCK();
+    return refusal;
+}
+
+/* After the record could not be opened for writing (owner/permissions), no new attempt before this
+ * time: every protected file used to pay a failed open() for good. */
+static uint64_t envelock_clock_retry_at = 0;
+static int envelock_clock_warned = 0;
+
 static int envelock_clock_advance_locked(const char *path, uint64_t *watermark, uint64_t step,
                                          int may_create)
 {
     unsigned char blob[ENVELOCK_CLOCK_SIZE];
-    uint64_t now, previous, value;
+    unsigned char current[ENVELOCK_CLOCK_SIZE];
+    uint64_t now, previous, value, disk;
     size_t i;
-    int fd;
+    int fd, locked;
+    long written;
 
     now = (uint64_t) time(NULL);
     if (now == 0 || now > (uint64_t) 4294967296LL) {
@@ -263,6 +413,9 @@ static int envelock_clock_advance_locked(const char *path, uint64_t *watermark, 
      * crossed the threshold and never persisted, so the disk kept its load-time value and a restart
      * lost the whole advance (audit ENV-01). */
     if (envelock_clock_persisted != 0 && value < envelock_clock_persisted + step) {
+        return 0;
+    }
+    if (envelock_clock_retry_at != 0 && now < envelock_clock_retry_at) {
         return 0;
     }
     memcpy(blob, ENVELOCK_CLOCK_MAGIC, 8);
@@ -288,11 +441,30 @@ static int envelock_clock_advance_locked(const char *path, uint64_t *watermark, 
     if (!envelock_clock_path_ok(path)) {
         return 0;
     }
-    fd = envelock_clock_open(path, O_WRONLY | (may_create ? O_CREAT : 0) | O_NOFOLLOW | O_CLOEXEC
+    /* O_RDWR (not O_WRONLY): the record is re-read under the lock below before it is rewritten, so a
+     * higher value another process already persisted is never lowered (C-10). */
+    fd = envelock_clock_open(path, O_RDWR | (may_create ? O_CREAT : 0) | O_NOFOLLOW | O_CLOEXEC
                                    | O_BINARY | O_NONBLOCK, 0600);
     if (fd < 0) {
+        if (errno == EACCES || errno == EPERM) {
+            /* The record exists but this process may not write it -- typically created as root, 0600,
+             * by a CLI or cron run before the workers -- so the saved rollback floor stops advancing.
+             * That used to be silent; say it once per process in the PHP log, and stop retrying on
+             * every protected file. */
+            envelock_clock_retry_at = now + 60;
+            if (!envelock_clock_warned) {
+                char message[600];
+                envelock_clock_warned = 1;
+                snprintf(message, sizeof(message),
+                         "Envelock: cannot write the clock state file %.400s (owner or permissions; "
+                         "the PHP worker user must own it): the anti-rollback record is not being saved",
+                         path);
+                php_log_err(message);
+            }
+        }
         return 0;
     }
+    envelock_clock_retry_at = 0;
     /* O_NOFOLLOW only refuses a SYMLINK as the final component (and does nothing on Windows); a
      * pre-planted HARDLINK to a victim file is followed and would be overwritten. Refuse to write
      * through anything but one ordinary, singly-linked file (internal audit, Nov 2026). */
@@ -300,13 +472,40 @@ static int envelock_clock_advance_locked(const char *path, uint64_t *watermark, 
         close(fd);
         return 0;
     }
-    {
-        ssize_t written = write(fd, blob, sizeof(blob));
-        close(fd);
-        if (written == (ssize_t) sizeof(blob)) {
-            envelock_clock_persisted = value;        /* disk now holds this; measure the next step from it */
-            return 1;
-        }
+    /* C-10: serialise the read-modify-write ACROSS PROCESSES (flock on POSIX, LockFileEx on Windows,
+     * which had none). Every PHP-FPM worker is a separate process, so the ZTS mutex above does not
+     * reach them, and a process still holding a stale value could otherwise overwrite a LATER value
+     * another one had persisted -- moving the on-disk rollback floor BACKWARDS. Under the lock,
+     * re-read the current record and, if it already holds a higher value, adopt it and write nothing
+     * (never lower it); otherwise write ours. The lock is advisory and released on unlock, close or
+     * process death (no deadlock), and a write happens at most once per `step` (the tolerance, an
+     * hour by default), so contention is negligible. Where the filesystem has no locking the same
+     * read-then-write still runs, best effort, rather than record nothing. */
+    locked = envelock_clock_lock_fd(fd, 1);
+    if (locked == -1) {
+        close(fd);                                   /* held elsewhere: save at a later file */
         return 0;
     }
+    if (envelock_clock_read_at0(fd, current, sizeof(current)) == (long) sizeof(current)
+            && envelock_clock_parse(current, &disk) && disk > value) {
+        if (disk > *watermark) {
+            *watermark = disk;                       /* adopt the higher value in memory too */
+        }
+        envelock_clock_persisted = disk;
+        if (locked) {
+            envelock_clock_unlock_fd(fd);
+        }
+        close(fd);
+        return 1;                                    /* nothing lower was written */
+    }
+    written = envelock_clock_write_at0(fd, blob, sizeof(blob));
+    if (locked) {
+        envelock_clock_unlock_fd(fd);
+    }
+    close(fd);
+    if (written == (long) sizeof(blob)) {
+        envelock_clock_persisted = value;            /* disk now holds this; measure the next step from it */
+        return 1;
+    }
+    return 0;
 }

@@ -183,11 +183,65 @@ STRINGS = {
                 "Cifrados {n} fichero(s), copiados {a} recurso(s).\nProyecto {p}\nSerial {s}"),
     "asset_not_copied": ("\n\nNOT copied: {asset} — {reason}.",
                          "\n\nNO copiado: {asset} — {reason}."),
+    # Warnings the CLI prints to stderr, which the windowed assistant has none of (audit 2026-11-17).
+    "pack_syntax": ("\n\nWARNING: PHP syntax error, packed anyway: {detail}",
+                    "\n\nAVISO: error de sintaxis PHP, cifrado igualmente: {detail}"),
+    "pack_not_transformed": ("\n\nWARNING: {n} file(s) contain __halt_compiler() and were NOT "
+                             "obfuscated/vaulted (they ship as readable source inside the "
+                             "encryption): {files}",
+                             "\n\nAVISO: {n} fichero(s) contienen __halt_compiler() y NO se han "
+                             "ofuscado ni puesto en la bóveda (van como código legible dentro del "
+                             "cifrado): {files}"),
+    "pack_inc_no_prepend": ("\n\nWARNING: 'Include protection' without 'Refuse auto_prepend/append' "
+                            "can be bypassed by an auto_prepend_file/auto_append_file set on the "
+                            "server. Tick that option too, or make sure the PHP pool leaves both "
+                            "empty.",
+                            "\n\nAVISO: 'Protección de includes' sin 'Rechazar auto_prepend/append' "
+                            "se puede saltar con un auto_prepend_file/auto_append_file configurado "
+                            "en el servidor. Marca también esa opción, o asegúrate de que el pool "
+                            "de PHP los deja vacíos."),
+    "saved_at": ("Saved to:\n{path}", "Guardado en:\n{path}"),
     # keys tab
     "keys_help": ("Create your keys once. The owner signs; each server has its own recipient key. "
                   "Share only the public (.pub) files and keep the private ones safe.",
                   "Crea tus claves una vez. El owner firma; cada servidor tiene su clave recipient. "
                   "Comparte solo los ficheros públicos (.pub) y guarda bien los privados."),
+    "keys_naming": (
+        "Name the files so you can tell them apart later. Suggested patterns:\n"
+        "   • Signing key (owner):      owner-<yourname>.enc.json        e.g. owner-acme.enc.json\n"
+        "   • Server key (recipient):   server-<site>.enc.json           e.g. server-shop-prod.enc.json\n"
+        "   • Public key to share:      server-<site>.pub.json           e.g. server-shop-prod.pub.json\n"
+        "   • Developer descriptor:     developer-<yourname>.json        e.g. developer-acme.json",
+        "Nombra los ficheros para poder distinguirlos después. Patrones sugeridos:\n"
+        "   • Clave de firma (owner):      owner-<tunombre>.enc.json      p. ej. owner-acme.enc.json\n"
+        "   • Clave de servidor (recipient): servidor-<sitio>.enc.json    p. ej. servidor-tienda-prod.enc.json\n"
+        "   • Clave pública a compartir:   servidor-<sitio>.pub.json      p. ej. servidor-tienda-prod.pub.json\n"
+        "   • Descriptor de desarrollador: developer-<tunombre>.json      p. ej. developer-acme.json"),
+    "key_created_title": ("Key created — back it up now", "Clave creada — haz copia de seguridad ya"),
+    "pw_remember": ("remember the password you set (it cannot be recovered either)",
+                    "recuerda la contraseña que pusiste (tampoco se puede recuperar)"),
+    "pw_none": ("the file is NOT password-protected, so keep the file itself private",
+                "el fichero NO está protegido con contraseña, así que mantén el propio fichero en privado"),
+    "owner_created": (
+        "Your SIGNING KEY (owner) was saved to:\n{path}\n\n"
+        "This file is the identity that signs every package. If you lose it you CANNOT sign updates your "
+        "servers will trust, and it cannot be recovered — there is no reset. Back it up now to a safe, "
+        "OFFLINE place (a password manager or an encrypted USB), and {pw}. Never put it on a web server "
+        "or in a public repository; share only its PUBLIC descriptor (Export developer descriptor).",
+        "Tu CLAVE DE FIRMA (owner) se guardó en:\n{path}\n\n"
+        "Este fichero es la identidad que firma cada paquete. Si lo pierdes NO podrás firmar "
+        "actualizaciones en las que confíen tus servidores, y no se puede recuperar — no hay forma de "
+        "restablecerlo. Haz una copia ahora en un lugar seguro y SIN CONEXIÓN (un gestor de contraseñas "
+        "o un USB cifrado), y {pw}. No lo subas nunca a un servidor web ni a un repositorio público; "
+        "comparte solo su descriptor PÚBLICO (Exportar descriptor de desarrollador)."),
+    "recipient_created": (
+        "The SERVER KEY (recipient) was saved to:\n{path}\n\n"
+        "This private key lets its server decrypt your packages. Keep it safe and {pw}. To set the "
+        "server up you need its PUBLIC half: use Export public key to make the .pub.json you encrypt for.",
+        "La CLAVE DE SERVIDOR (recipient) se guardó en:\n{path}\n\n"
+        "Esta clave privada permite a su servidor descifrar tus paquetes. Guárdala bien y {pw}. Para "
+        "preparar el servidor necesitas su mitad PÚBLICA: usa Exportar clave pública para crear el "
+        ".pub.json con el que cifras."),
     "create_owner": ("Create signing key (owner)", "Crear clave de firma (owner)"),
     "with_recovery": ("Also create a recovery key", "Crear también clave de recuperación"),
     "create_recipient": ("Create server key (recipient)", "Crear clave de servidor (recipient)"),
@@ -250,6 +304,68 @@ STRINGS = {
         "que el análisis no ve (cada una dice por qué y cómo comprobarlo); y opciones que no activar, cada "
         "una con su motivo. Solo lectura; no cambia nada."),
     "recommend_btn": ("Analyse and recommend", "Analizar y recomendar"),
+    # manifest option (Encrypt tab)
+    "opt_manifest": ("Signed manifest for 'Verify' (lets you check the package later)",
+                     "Manifiesto firmado para 'Verificar' (permite comprobar el paquete después)"),
+    # verify tab
+    "tab_verify": ("Verify", "Verificar"),
+    "verify_help": (
+        "Check a packed folder against its signed manifest: confirms every file is present and "
+        "unchanged, and that your key signed it. Pack with the 'Signed manifest' option ticked (or "
+        "the command line's --manifest) to create the manifest this reads.",
+        "Comprueba una carpeta cifrada contra su manifiesto firmado: confirma que todos los ficheros "
+        "están y no se han tocado, y que los firmó tu clave. Cifra con la opción 'Manifiesto firmado' "
+        "marcada (o --manifest en la línea de comandos) para crear el manifiesto que esto lee."),
+    "verify_descriptor": ("Developer or owner descriptor", "Descriptor de desarrollador u owner"),
+    "verify_btn": ("Verify the package", "Verificar el paquete"),
+    "verify_ok": ("OK — the package is intact and signed by that key.\n\n{detail}",
+                  "OK — el paquete está intacto y firmado por esa clave.\n\n{detail}"),
+    "verify_bad": ("MISMATCH — the package does not match its manifest:\n\n{detail}",
+                   "NO COINCIDE — el paquete no concuerda con su manifiesto:\n\n{detail}"),
+    # licence tab
+    "tab_licence": ("Licence", "Licencia"),
+    "licence_help": (
+        "Issue a signed deployment licence (optional expiry or host binding), read this host's "
+        "fingerprints to bind one, or inspect a licence. A licence is NOT secret: its integrity is "
+        "the signature. Point envelock.licence at it on the server; issue one per host.",
+        "Emite una licencia de despliegue firmada (caducidad o vínculo a un host, opcionales), lee "
+        "las huellas de este equipo para vincular una, o inspecciona una licencia. Una licencia NO es "
+        "secreta: su integridad es la firma. Apunta envelock.licence a ella en el servidor; una por host."),
+    "lic_issue": ("Issue a licence", "Emitir una licencia"),
+    "lic_issue_help": (
+        "Sign a licence with your owner key. Leave the expiry and binding fields empty for a licence "
+        "that never expires and runs on any host. A binding ('this' uses THIS machine, or paste a "
+        "fingerprint the server reported) is not checked by Windows loaders.",
+        "Firma una licencia con tu clave owner. Deja vacíos la caducidad y los vínculos para una "
+        "licencia que no caduca y vale en cualquier host. Un vínculo ('this' usa ESTA máquina, o pega "
+        "una huella que te dé el servidor) no lo comprueban los cargadores de Windows."),
+    "licence_out": ("Save licence to", "Guardar licencia en"),
+    "lic_days": ("Expire in N days", "Caduca en N días"),
+    "lic_expires": ("…or expire YYYY-MM-DD", "…o caduca AAAA-MM-DD"),
+    "lic_machine": ("Machine ('this' / 64 hex)", "Máquina ('this' / 64 hex)"),
+    "lic_domain": ("Domain ('this' / a name)", "Dominio ('this' / un nombre)"),
+    "lic_ip": ("IP ('this' / 64 hex)", "IP ('this' / 64 hex)"),
+    "opt_overwrite": ("Overwrite the licence file if it exists",
+                      "Sobrescribir el fichero de licencia si existe"),
+    "lic_issue_btn": ("Issue", "Emitir"),
+    "lic_days_not_number": ("'Expire in N days' must be a whole number of days, or empty.",
+                            "'Caduca en N días' debe ser un número entero de días, o vacío."),
+    "lic_issued": ("Licence written to:\n{path}\n\nexpires : {expires}\nmachine : {machine}\n"
+                   "domain  : {domain}\nip      : {ip}",
+                   "Licencia escrita en:\n{path}\n\ncaduca  : {expires}\nmáquina : {machine}\n"
+                   "dominio : {domain}\nip      : {ip}"),
+    "lic_ids": ("This host's fingerprints", "Huellas de este equipo"),
+    "lic_ids_help": (
+        "Run this ON THE SERVER to get the values to bind a licence to it. On a web server the loader "
+        "compares SERVER_NAME (the site name), usually NOT this machine's own name.",
+        "Ejecuta esto EN EL SERVIDOR para obtener los valores con los que vincular una licencia. En un "
+        "servidor web el cargador compara SERVER_NAME (el nombre del sitio), normalmente NO el nombre "
+        "propio de esta máquina."),
+    "lic_machine_id_btn": ("Show machine id", "Mostrar id de máquina"),
+    "lic_host_id_btn": ("Show domain / IP id", "Mostrar id de dominio / IP"),
+    "lic_inspect": ("Inspect a licence", "Inspeccionar una licencia"),
+    "licence_file": ("Licence file (.bin)", "Fichero de licencia (.bin)"),
+    "lic_inspect_btn": ("Inspect licence", "Inspeccionar licencia"),
 }
 
 
@@ -258,14 +374,18 @@ ANY_FILES = [("All files", "*.*")]
 _JSON = [("JSON key", "*.json")] + ANY_FILES
 _PUB = [("Public key", "*.pub.json"), ("JSON", "*.json")] + ANY_FILES
 _BIN = [("Identity file", "*.bin")] + ANY_FILES
+_LIC = [("Licence file", "*.bin")] + ANY_FILES
 FILETYPES = {
     "owner_file": (_JSON, ".json"),
     "recipient_file": (_JSON, ".json"),
     "developer_file": (_JSON, ".json"),
+    "verify_descriptor": (_JSON, ".json"),
     "public_file": (_PUB, ".pub.json"),
     "out_file": (_JSON, ".json"),
     "new_owner_file": (_JSON, ".json"),
     "identity_file": (_BIN, ".bin"),
+    "licence_out": (_LIC, ".bin"),
+    "licence_file": (_LIC, ".bin"),
     "file": (ANY_FILES, ""),
     "php_path": ([("PHP", "php.exe"), ("PHP", "php")] + ANY_FILES, ""),
 }
@@ -277,6 +397,9 @@ EXPECT_KIND = {
     "recipient_file": {"envelock-recipient", "envelock-encrypted"},
     "developer_file": {"envelock-developer-public"},
     "public_file": {"envelock-recipient-public"},
+    # verify accepts a public developer descriptor OR an owner (its signing public key), which may be
+    # encrypted (its real kind is hidden until the password is given).
+    "verify_descriptor": {"envelock-developer-public", "envelock-owner", "envelock-encrypted"},
 }
 # Human name of a detected kind, for the "wrong file" warning.
 KIND_STRING = {
@@ -360,7 +483,8 @@ class Assistant(tk.Tk):
         for name, builder in (("tab_pack", self._tab_pack), ("tab_recommend", self._tab_recommend),
                               ("tab_keys", self._tab_keys),
                               ("tab_identity", self._tab_identity), ("tab_rotate", self._tab_rotate),
-                              ("tab_inspect", self._tab_inspect)):
+                              ("tab_licence", self._tab_licence), ("tab_inspect", self._tab_inspect),
+                              ("tab_verify", self._tab_verify)):
             frame = ttk.Frame(self.nb, padding=10)
             self.nb.add(frame, text=self.t(name))
             builder(frame)
@@ -392,6 +516,8 @@ class Assistant(tk.Tk):
         ttk.Label(frame, text=label, width=38, anchor="w").pack(side="left")
         var = tk.StringVar()
         ttk.Entry(frame, textvariable=var).pack(side="left", fill="x", expand=True)
+        if kind == "savefile":
+            self._save_vars = getattr(self, "_save_vars", []) + [var]
         if kind != "entry":
             ttk.Button(frame, text=self.t("browse"),
                        command=lambda: self._pick(var, kind, ftypes, key)).pack(side="left", padx=4)
@@ -466,6 +592,13 @@ class Assistant(tk.Tk):
             if not var.get().strip():
                 messagebox.showerror(self.t("error"), self.t("field_required", name=self.t(key)))
                 return False
+        # A file to WRITE given as a bare name ("owner.enc.json", the suggestion) used to land in the
+        # process's current folder -- the executable's own, often Downloads -- and the notice named
+        # the bare file only. Make it absolute here, once, so what is written and what every message
+        # shows is the full path (audit 2026-11-17).
+        for var in fields.values():
+            if any(var is saved for saved in getattr(self, "_save_vars", ())):
+                var.set(_absolute_path(var.get()))
         return True
 
     def _run_async(self, work, on_ok, status: str = "working"):
@@ -652,10 +785,12 @@ class Assistant(tk.Tk):
         ffi = tk.BooleanVar()
         seal = tk.BooleanVar()
         enfman = tk.BooleanVar(value=True)   # runtime manifest on by default (parity with the CLI)
+        man = tk.BooleanVar()                # signed JSON manifest, for the Verify tab (off by default)
         for var, key in ((strip, "opt_strip"), (obf, "opt_obf"), (comp, "opt_compact"),
                          (enc, "opt_encstr"), (meth, "opt_methods"), (prop, "opt_props"),
                          (flow, "opt_flow"), (vault, "opt_vault"), (inc, "opt_inc"), (prep, "opt_prepend"),
-                         (ffi, "opt_ffi"), (seal, "opt_sealed"), (enfman, "opt_enforce_manifest")):
+                         (ffi, "opt_ffi"), (seal, "opt_sealed"), (enfman, "opt_enforce_manifest"),
+                         (man, "opt_manifest")):
             ttk.Checkbutton(opts, text=self.t(key), variable=var).pack(anchor="w")
         exclude = self._row(opts, "exclude")
         assets = self._row(opts, "assets")
@@ -725,18 +860,40 @@ class Assistant(tk.Tk):
                     obfuscate_properties=prop.get(),
                     obfuscate_flow=flow.get(), vault_strings=vault.get(),
                     include_protection=inc.get(), no_prepend=prep.get(), no_ffi=ffi.get(),
-                    sealed=seal.get(), enforce_manifest=enfman.get(), php=php.get() or "php")
+                    sealed=seal.get(), enforce_manifest=enfman.get(), manifest=man.get(),
+                    php=php.get() or "php")
 
-            self._run_async(work, lambda info: messagebox.showinfo(
-                self.t("done"), self.t("pack_ok", n=info["protected_files"], a=info["copied_assets"],
-                                       p=info["project_id"], s=info["serial"])
-                + "".join(self.t("asset_not_copied", asset=m["asset"], reason=m["reason"])
-                          for m in info.get("assets_not_copied", []))))
+            warn_prepend = inc.get() and not prep.get()
+
+            def report(info):
+                text, warned = self._pack_summary(info, warn_prepend)
+                (messagebox.showwarning if warned else messagebox.showinfo)(self.t("done"), text)
+
+            self._run_async(work, report)
 
         ttk.Button(f, text=self.t("run"), command=run).pack(pady=8)
 
+    def _pack_summary(self, info, warn_prepend: bool) -> tuple[str, bool]:
+        """The text shown after a pack, and whether it carries a warning (pure, so it is testable).
+        It used to show only the counts: the syntax errors pack found (C-17), the files it could not
+        obfuscate and the C-30 advisory went to stderr, which the windowed assistant does not have,
+        so the user saw a plain success (audit 2026-11-17)."""
+        text = self.t("pack_ok", n=info["protected_files"], a=info["copied_assets"],
+                      p=info["project_id"], s=info["serial"])
+        extra = [self.t("asset_not_copied", asset=m["asset"], reason=m["reason"])
+                 for m in info.get("assets_not_copied", [])]
+        extra += [self.t("pack_syntax", detail=w) for w in info.get("syntax_warnings", [])]
+        halted = info.get("files_not_token_transformed") or []
+        if halted and not info.get("bytecode"):
+            extra.append(self.t("pack_not_transformed", n=len(halted), files=", ".join(halted)))
+        if warn_prepend:
+            extra.append(self.t("pack_inc_no_prepend"))
+        return text + "".join(extra), bool(extra)
+
     def _tab_keys(self, f):
-        ttk.Label(f, text=self.t("keys_help"), wraplength=660, foreground="#555").pack(anchor="w", pady=(0, 8))
+        ttk.Label(f, text=self.t("keys_help"), wraplength=660, foreground="#555").pack(anchor="w", pady=(0, 4))
+        ttk.Label(f, text=self.t("keys_naming"), wraplength=680, foreground="#1a6b3a",
+                  justify="left", font=("TkFixedFont", 9)).pack(anchor="w", pady=(0, 8))
 
         box = ttk.LabelFrame(f, text=self.t("create_owner"), padding=6)
         box.pack(fill="x", pady=4)
@@ -792,8 +949,9 @@ class Assistant(tk.Tk):
             pw = self._encrypt_password(enc, Path(out.get()).name)
         except ValueError:
             return
-        self._run_async(lambda: actions.create_owner(Path(out.get()), recovery.get(), pw, enc.get()),
-                        lambda r: messagebox.showinfo(self.t("done"), self.t("done")))
+        path, encrypted = out.get(), enc.get()
+        self._run_async(lambda: actions.create_owner(Path(path), recovery.get(), pw, encrypted),
+                        lambda r: self._key_saved("owner_created", path, encrypted))
 
     def _do_create_recipient(self, out, label, enc):
         if not self._idle():
@@ -804,8 +962,15 @@ class Assistant(tk.Tk):
             pw = self._encrypt_password(enc, Path(out.get()).name)
         except ValueError:
             return
-        self._run_async(lambda: actions.create_recipient(Path(out.get()), label.get(), pw, enc.get()),
-                        lambda r: messagebox.showinfo(self.t("done"), self.t("done")))
+        path, encrypted = out.get(), enc.get()
+        self._run_async(lambda: actions.create_recipient(Path(path), label.get(), pw, encrypted),
+                        lambda r: self._key_saved("recipient_created", path, encrypted))
+
+    def _key_saved(self, key, path, encrypted):
+        """Emphatic post-creation notice: a generated key cannot be recovered, so the user MUST back it
+        up now (addresses the request to insist on saving the keys)."""
+        pw = self.t("pw_remember") if encrypted else self.t("pw_none")
+        messagebox.showwarning(self.t("key_created_title"), self.t(key).format(path=path, pw=pw))
 
     def _do_export_public(self, rec_in, pub_out):
         if not self._idle():
@@ -816,8 +981,9 @@ class Assistant(tk.Tk):
             pw = self._password_for(rec_in.get())
         except ValueError:
             return
-        self._run_async(lambda: actions.export_public(Path(rec_in.get()), pw, Path(pub_out.get())),
-                        lambda r: messagebox.showinfo(self.t("done"), self.t("done")))
+        target = pub_out.get()
+        self._run_async(lambda: actions.export_public(Path(rec_in.get()), pw, Path(target)),
+                        lambda r: messagebox.showinfo(self.t("done"), self.t("saved_at", path=target)))
 
     def _do_export_developer(self, own_in, dev_out):
         if not self._idle():
@@ -828,8 +994,9 @@ class Assistant(tk.Tk):
             pw = self._password_for(own_in.get())
         except ValueError:
             return
-        self._run_async(lambda: actions.export_developer(Path(own_in.get()), pw, Path(dev_out.get())),
-                        lambda r: messagebox.showinfo(self.t("done"), self.t("done")))
+        target = dev_out.get()
+        self._run_async(lambda: actions.export_developer(Path(own_in.get()), pw, Path(target)),
+                        lambda r: messagebox.showinfo(self.t("done"), self.t("saved_at", path=target)))
 
     def _tab_identity(self, f):
         ttk.Label(f, text=self.t("identity_help"), wraplength=660, foreground="#555").pack(anchor="w", pady=(0, 6))
@@ -965,6 +1132,135 @@ class Assistant(tk.Tk):
             self._run_async(lambda: json.dumps(actions.inspect(target), indent=2), done)
         ttk.Button(f, text=self.t("inspect"), command=show).pack(anchor="e")
 
+    def _tab_verify(self, f):
+        ttk.Label(f, text=self.t("verify_help"), wraplength=660, foreground="#555").pack(
+            anchor="w", pady=(0, 6))
+        pkg = self._row(f, "package_dir", "dir")
+        desc = self._row(f, "verify_descriptor", "file")
+        out = tk.Text(f, height=16, wrap="word")
+        out.pack(fill="both", expand=True, pady=6)
+
+        def show():
+            if not self._idle():
+                return
+            if not self._need(package_dir=pkg, verify_descriptor=desc):
+                return
+            try:
+                pw = self._password_for(desc.get())            # a password only if the owner is encrypted
+            except ValueError:
+                return
+            import json
+            package, descriptor = Path(pkg.get()), Path(desc.get())
+
+            def done(report):
+                key = "verify_ok" if report["ok"] else "verify_bad"
+                out.delete("1.0", "end")
+                out.insert("1.0", self.t(key, detail=json.dumps(report, indent=2)))
+            # Reads and hashes the whole package off the UI thread (like Inspect/Recommend).
+            self._run_async(lambda: actions.verify(package, descriptor, pw), done)
+        ttk.Button(f, text=self.t("verify_btn"), command=show).pack(anchor="e")
+
+    def _tab_licence(self, f):
+        ttk.Label(f, text=self.t("licence_help"), wraplength=660, foreground="#555").pack(
+            anchor="w", pady=(0, 6))
+        outbox = tk.Text(f, height=8, wrap="word")     # shared by 'this host' and 'inspect' (packed last)
+
+        box = ttk.LabelFrame(f, text=self.t("lic_issue"), padding=6)
+        box.pack(fill="x", pady=3)
+        ttk.Label(box, text=self.t("lic_issue_help"), wraplength=560, foreground="#555").pack(anchor="w")
+        own = self._row(box, "owner_file", "file")
+        out = self._row(box, "licence_out", "savefile")
+        out.set("licence.bin")
+        days = self._row(box, "lic_days")
+        expires = self._row(box, "lic_expires")
+        machine = self._row(box, "lic_machine")
+        domain = self._row(box, "lic_domain")
+        ip = self._row(box, "lic_ip")
+        overwrite = tk.BooleanVar()
+        ttk.Checkbutton(box, text=self.t("opt_overwrite"), variable=overwrite).pack(anchor="w")
+
+        def issue():
+            if not self._idle():
+                return
+            if not self._need(owner_file=own, licence_out=out):
+                return
+            days_val = None
+            if days.get().strip():
+                try:
+                    days_val = int(days.get().strip())
+                except ValueError:
+                    messagebox.showerror(self.t("error"), self.t("lic_days_not_number"))
+                    return
+            try:
+                pw = self._password_for(own.get())
+            except ValueError:
+                return
+            # Read every Tk variable HERE, on the UI thread, and pass plain values into the worker:
+            # Tk is not thread-safe, and a .get() from the worker thread raises "main thread is not in
+            # main loop". (The worker does file I/O and signing only — never touches the widgets.)
+            owner_path, out_path = Path(own.get()), Path(out.get())
+            expires_val = expires.get().strip() or None
+            machine_val = machine.get().strip() or None
+            domain_val = domain.get().strip() or None
+            ip_val = ip.get().strip() or None
+            force_val = overwrite.get()
+
+            def work():
+                return actions.licence_issue(owner_path, pw, out_path, days=days_val,
+                                             expires=expires_val, machine=machine_val,
+                                             domain=domain_val, ip=ip_val, force=force_val)
+
+            def done(info):
+                text = self.t("lic_issued", path=info["path"], expires=info["expires"],
+                              machine=info["machine"], domain=info["domain"], ip=info["ip"])
+                if info["warnings"]:
+                    messagebox.showwarning(self.t("done"), text + "\n\n" + "\n\n".join(info["warnings"]))
+                else:
+                    messagebox.showinfo(self.t("done"), text)
+            self._run_async(work, done)
+        ttk.Button(box, text=self.t("lic_issue_btn"), command=issue).pack(anchor="e")
+
+        box = ttk.LabelFrame(f, text=self.t("lic_ids"), padding=6)
+        box.pack(fill="x", pady=3)
+        ttk.Label(box, text=self.t("lic_ids_help"), wraplength=560, foreground="#555").pack(anchor="w")
+        ids_row = ttk.Frame(box)
+        ids_row.pack(anchor="e")
+
+        def show_ids(action):
+            if not self._idle():
+                return
+            import json
+
+            def done(data):
+                outbox.delete("1.0", "end")
+                outbox.insert("1.0", json.dumps(data, indent=2) if isinstance(data, dict) else str(data))
+            # machine_id() may raise off Linux (no machine-id/MAC); the queue surfaces that as an error.
+            self._run_async(action, done)
+        ttk.Button(ids_row, text=self.t("lic_machine_id_btn"),
+                   command=lambda: show_ids(actions.machine_id)).pack(side="left", padx=4)
+        ttk.Button(ids_row, text=self.t("lic_host_id_btn"),
+                   command=lambda: show_ids(actions.host_id)).pack(side="left", padx=4)
+
+        box = ttk.LabelFrame(f, text=self.t("lic_inspect"), padding=6)
+        box.pack(fill="x", pady=3)
+        licfile = self._row(box, "licence_file", "file")
+
+        def inspect():
+            if not self._idle():
+                return
+            if not self._need(licence_file=licfile):
+                return
+            import json
+            target = Path(licfile.get())
+
+            def done(data):
+                outbox.delete("1.0", "end")
+                outbox.insert("1.0", json.dumps(data, indent=2))
+            self._run_async(lambda: actions.licence_inspect(target), done)
+        ttk.Button(box, text=self.t("lic_inspect_btn"), command=inspect).pack(anchor="e")
+
+        outbox.pack(fill="both", expand=True, pady=6)
+
     def _tab_recommend(self, f):
         ttk.Label(f, text=self.t("recommend_help"), wraplength=660, foreground="#555").pack(
             anchor="w", pady=(0, 6))
@@ -995,6 +1291,13 @@ class Assistant(tk.Tk):
 
 def _split(text: str) -> list[str]:
     return [p.strip() for p in text.split(",") if p.strip()]
+
+
+def _absolute_path(value: str) -> str:
+    """value as an absolute path (a bare or relative name is taken from the current folder, as the
+    file would have been written there anyway), so the user is told exactly where it went."""
+    path = Path(value.strip()).expanduser()
+    return str(path if path.is_absolute() else Path.cwd() / path)
 
 
 def _suggest(var, base: str, ext: str):
@@ -1030,7 +1333,7 @@ def main():
         # Headless check that the (possibly frozen) bundle wires up: encoder import, actions and
         # the window build, without entering the event loop. Prints OK and exits 0.
         app = Assistant()
-        if len(app.nb.tabs()) != 6:
+        if len(app.nb.tabs()) != 8:
             raise SystemExit("selftest failed: unexpected tab count")
         app._switch_language(1)
         app._detector.join(60)            # let the PHP search finish (no half-run process at exit)

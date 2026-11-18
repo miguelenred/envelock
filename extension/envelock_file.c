@@ -33,6 +33,63 @@ static int envelock_process_user(BYTE *buffer, DWORD buffer_size)
     return ok;
 }
 
+/* envelock.harden_memory on Windows, which until 2026-11-17 only locked the keys in RAM: Windows has
+ * no PR_SET_DUMPABLE, and the nearest thing is the access list of the process (and thread) object
+ * itself. It is replaced by one that keeps SYSTEM unrestricted and lets the account PHP runs as,
+ * Administrators without SeDebugPrivilege, and the object's owner do only what a process list or a
+ * service manager does -- see it, wait for it, end it, read its access list. What that takes away is
+ * what reading or steering the process needs: VM_READ / VM_WRITE / VM_OPERATION (ReadProcessMemory,
+ * MiniDumpWriteDump, a debugger attaching), CREATE_THREAD (injecting code), DUP_HANDLE (it hands back
+ * a full handle to the process itself, by duplicating its own pseudo-handle), CREATE_PROCESS,
+ * SET_INFORMATION / SET_QUOTA / SUSPEND_RESUME, and WRITE_DAC / WRITE_OWNER: the OWNER RIGHTS entry is
+ * what keeps the owner's implicit WRITE_DAC from simply putting the old list back. For a thread:
+ * GET_CONTEXT / SET_CONTEXT / SUSPEND_RESUME (hijacking it), IMPERSONATE, TERMINATE and the rest.
+ *
+ * Limits, stated rather than hidden: a handle opened before (the one CreateProcess gave the parent,
+ * w3wp.exe or Apache's parent, which run as the same account) keeps its access; SeDebugPrivilege (an
+ * elevated administrator) passes any access list, like CAP_SYS_PTRACE on Linux; threads Windows starts
+ * later on its own (the thread pool) keep the default list. Returns 1 when the list was set. */
+static int envelock_restrict_object(HANDLE object, DWORD full, DWORD limited)
+{
+    BYTE user[SECURITY_MAX_SID_SIZE], system_sid[SECURITY_MAX_SID_SIZE];
+    BYTE admins[SECURITY_MAX_SID_SIZE], owner_rights[SECURITY_MAX_SID_SIZE];
+    /* ACL header and four entries, each at most an entry header, a mask and the largest SID; DWORDs
+     * because an ACL must be DWORD-aligned. */
+    DWORD buffer[(sizeof(ACL) + 4 * (sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE)) /
+                 sizeof(DWORD) + 1];
+    PACL acl = (PACL)buffer;
+    DWORD n;
+    if (!envelock_process_user(user, sizeof(user))) return 0;
+    n = sizeof(system_sid);
+    if (!CreateWellKnownSid(WinLocalSystemSid, NULL, system_sid, &n)) return 0;
+    n = sizeof(admins);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, admins, &n)) return 0;
+    n = sizeof(owner_rights);
+    if (!CreateWellKnownSid(WinCreatorOwnerRightsSid, NULL, owner_rights, &n)) return 0;
+    if (!InitializeAcl(acl, (DWORD)sizeof(buffer), ACL_REVISION) ||
+        !AddAccessAllowedAce(acl, ACL_REVISION, full, (PSID)system_sid) ||
+        !AddAccessAllowedAce(acl, ACL_REVISION, limited, (PSID)user) ||
+        !AddAccessAllowedAce(acl, ACL_REVISION, limited, (PSID)admins) ||
+        !AddAccessAllowedAce(acl, ACL_REVISION, limited, (PSID)owner_rights)) {
+        return 0;
+    }
+    return SetSecurityInfo(object, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                           NULL, NULL, acl, NULL) == ERROR_SUCCESS;
+}
+
+int envelock_restrict_process_access(void)
+{
+    return envelock_restrict_object(GetCurrentProcess(), PROCESS_ALL_ACCESS,
+        SYNCHRONIZE | READ_CONTROL | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION |
+        PROCESS_QUERY_LIMITED_INFORMATION);
+}
+
+int envelock_restrict_thread_access(void)
+{
+    return envelock_restrict_object(GetCurrentThread(), THREAD_ALL_ACCESS,
+        SYNCHRONIZE | READ_CONTROL | THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION);
+}
+
 const char *envelock_identity_file_check(FILE *file)
 {
     static const char *const unreadable = "its permissions cannot be read";
@@ -159,6 +216,14 @@ int envelock_file_is_regular(FILE *file)
     return handle != INVALID_HANDLE_VALUE && GetFileType(handle) == FILE_TYPE_DISK;
 }
 
+long long envelock_file_size(FILE *file)
+{
+    LARGE_INTEGER size;
+    HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+    if (handle == INVALID_HANDLE_VALUE || !GetFileSizeEx(handle, &size)) return -1;
+    return (long long)size.QuadPart;
+}
+
 #else
 # include <fcntl.h>
 # include <sys/stat.h>
@@ -216,5 +281,11 @@ int envelock_file_is_regular(FILE *file)
 {
     struct stat info;
     return fstat(fileno(file), &info) == 0 && S_ISREG(info.st_mode);
+}
+
+long long envelock_file_size(FILE *file)
+{
+    struct stat info;
+    return fstat(fileno(file), &info) == 0 ? (long long)info.st_size : -1;
 }
 #endif

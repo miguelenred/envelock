@@ -477,7 +477,25 @@ def test_downloaded_php_is_found_first(tmp_path, monkeypatch):
 def test_check_php_detects_missing_vc_runtime(monkeypatch):
     fake = _subprocess.CompletedProcess([], 0xC0000135, "", "")
     monkeypatch.setattr(actions.subprocess, "run", lambda *a, **k: fake)
-    assert actions.check_php("php.exe")[0] == "no_vcruntime"
+    assert actions.check_php(os.path.abspath("php.exe"))[0] == "no_vcruntime"
+
+
+def test_check_php_never_runs_a_bare_php_from_the_current_folder(tmp_path, monkeypatch):
+    """Audit 2026-11-17 (T-3 incomplete): the probe handed the bare default "php" to CreateProcess,
+    which on Windows searches the application and CURRENT folders before PATH, so a php.exe planted
+    in the folder the assistant runs from was executed. A bare name is looked up in PATH only."""
+    _plant_php(tmp_path / "cwd")
+    monkeypatch.chdir(tmp_path / "cwd")
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    ran = []
+    fake = _subprocess.CompletedProcess([], 0, "8.3.0 80300 1", "")
+    monkeypatch.setattr(actions.subprocess, "run", lambda cmd, *a, **k: ran.append(cmd[0]) or fake)
+    assert actions.check_php("php")[0] == "not_found" and ran == []
+    on_path = _plant_php(tmp_path / "bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(empty), str(tmp_path / "bin")]))
+    assert actions.check_php("php") == ("ok", "8.3.0") and ran == [str(on_path)]
 
 
 def test_vc_redist_runs_only_if_signed_by_microsoft(tmp_path, monkeypatch):
@@ -678,3 +696,119 @@ def test_actions_recommend_rejects_a_file_path(tmp_path):
         assert "folder" in str(e).lower()
     else:
         raise AssertionError("expected a ValueError for a file path")
+
+
+# --- verify, licences and host ids (assistant Verify / Licence tabs) --------------------------
+
+def _pack_with_manifest(tmp_path, out_name="out"):
+    """Pack a two-file project WITH the signed JSON manifest (so `verify` has something to check).
+    Returns (owner path [encrypted], developer descriptor path [public], output folder)."""
+    owner, rcpt, pub = tmp_path / "o.enc.json", tmp_path / "r.enc.json", tmp_path / "r.pub.json"
+    actions.create_owner(owner, False, PASSWORD)
+    actions.create_recipient(rcpt, "srv", PASSWORD)
+    actions.export_public(rcpt, PASSWORD, pub)
+    dev = tmp_path / "dev.json"
+    actions.export_developer(owner, PASSWORD, dev)
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "index.php").write_text("<?php echo 1;")
+    (src / "lib.php").write_text("<?php function v(){ return 2; }")
+    out = tmp_path / out_name
+    actions.pack(owner, PASSWORD, [pub], actions.new_project(), src, out, manifest=True)
+    return owner, dev, out
+
+
+def test_actions_verify_clean_tampered_and_added(tmp_path):
+    """Verify a packed folder against its signed manifest: a clean package passes under either the
+    developer descriptor or the owner; a changed file and an added file are both caught (ATTACK: the
+    point of verify is to notice exactly these)."""
+    owner, dev, out = _pack_with_manifest(tmp_path)
+    assert (out / "envelock-manifest").is_file()
+    clean = actions.verify(out, dev)                         # developer descriptor: public, no password
+    assert clean["ok"] and clean["missing"] == [] and clean["added"] == [] and clean["changed"] == []
+    assert clean["files"] >= 2                                # the two PHP stubs (+ package metadata)
+    assert actions.verify(out, owner, PASSWORD)["ok"]        # owner descriptor (encrypted: password)
+    (out / "index.php").write_bytes((out / "index.php").read_bytes() + b"\n// tampered")
+    changed = actions.verify(out, dev)
+    assert not changed["ok"] and "index.php" in changed["changed"]
+    (out / "stray.php").write_text("<?php echo 'x';")
+    added = actions.verify(out, dev)
+    assert not added["ok"] and "stray.php" in added["added"]
+
+
+def test_actions_verify_refuses_without_manifest_or_wrong_signer(tmp_path):
+    """No signed manifest -> a clear instruction, not a crash. A DIFFERENT developer's key must not
+    verify the manifest (ATTACK: a forged descriptor cannot vouch for someone else's package)."""
+    owner, rcpt, pub = tmp_path / "o.enc.json", tmp_path / "r.enc.json", tmp_path / "r.pub.json"
+    actions.create_owner(owner, False, PASSWORD)
+    actions.create_recipient(rcpt, "srv", PASSWORD)
+    actions.export_public(rcpt, PASSWORD, pub)
+    dev = tmp_path / "dev.json"
+    actions.export_developer(owner, PASSWORD, dev)
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "i.php").write_text("<?php echo 1;")
+    plain = tmp_path / "plain"
+    actions.pack(owner, PASSWORD, [pub], actions.new_project(), src, plain)   # no manifest=True
+    with pytest.raises(ValueError, match="manifest"):
+        actions.verify(plain, dev)
+    signed = tmp_path / "signed"
+    actions.pack(owner, PASSWORD, [pub], actions.new_project(), src, signed, manifest=True)
+    other = tmp_path / "o2.enc.json"
+    actions.create_owner(other, False, PASSWORD)
+    other_dev = tmp_path / "dev2.json"
+    actions.export_developer(other, PASSWORD, other_dev)
+    with pytest.raises(ValueError, match="does not verify"):
+        actions.verify(signed, other_dev)
+
+
+def test_actions_licence_issue_inspect_roundtrip(tmp_path):
+    """Issue an unbound (expiry-only) licence, inspect it, and confirm it verifies under the owner's
+    own signing key — the loader's check, done here as a sanity round trip."""
+    owner = tmp_path / "owner.enc.json"
+    actions.create_owner(owner, with_recovery=True, password=PASSWORD)
+    lic = tmp_path / "licence.bin"
+    summary = actions.licence_issue(owner, PASSWORD, lic, days=30)
+    assert lic.exists() and summary["expires"] != "never"
+    assert summary["machine"] == "any" and summary["domain"] == "any" and summary["ip"] == "any"
+    assert summary["warnings"] == []                         # unbound -> no Windows-binding warning
+    info = actions.licence_inspect(lic)
+    assert info["format"] == 1 and info["machine"] == "any" and info["expires"] != "never"
+    owner_cfg = actions.a.read_config(owner, "envelock-owner", PASSWORD)
+    parsed = actions.a.verify_licence(lic.read_bytes(), [owner_cfg["signing_public"]])
+    assert parsed["fields"] & actions.a.LICENCE_FIELD_EXPIRY
+
+
+def test_actions_licence_overwrite_binding_and_rejections(tmp_path):
+    """Overwrite is refused without force; a machine binding warns about Windows and shows in inspect;
+    an all-zero binding is refused and nothing is written (ATTACK: the C-27 no-op-binding guard, now
+    on the GUI path too)."""
+    owner = tmp_path / "owner.enc.json"
+    actions.create_owner(owner, False, PASSWORD)
+    lic = tmp_path / "licence.bin"
+    actions.licence_issue(owner, PASSWORD, lic)              # unbound, never expires
+    with pytest.raises(ValueError, match="already exists"):
+        actions.licence_issue(owner, PASSWORD, lic)
+    actions.licence_issue(owner, PASSWORD, lic, force=True, days=10)         # overwrite allowed
+    bound = tmp_path / "bound.bin"
+    summary = actions.licence_issue(owner, PASSWORD, bound, machine="aa" * 32)
+    assert any("Windows" in w for w in summary["warnings"])
+    assert actions.licence_inspect(bound)["machine"] != "any"
+    zero = tmp_path / "zero.bin"
+    with pytest.raises(ValueError, match="all zeros"):
+        actions.licence_issue(owner, PASSWORD, zero, machine="0" * 64)
+    assert not zero.exists()
+
+
+def test_actions_machine_and_host_id():
+    """host-id works everywhere (domain hash always; ipv4 only where the OS exposes it); machine-id
+    needs a Linux machine-id/MAC source, so off Linux it is a clear error, not a crash."""
+    info = actions.host_id()
+    assert info["domain"] and len(info["domain_hash"]) == 64
+    assert isinstance(info["ipv4"], list)
+    if sys.platform.startswith("linux"):
+        mid = actions.machine_id()
+        assert len(mid) == 64 and all(c in "0123456789abcdef" for c in mid)
+    else:
+        with pytest.raises(ValueError):
+            actions.machine_id()

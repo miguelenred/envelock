@@ -308,8 +308,11 @@ void envelock_build_delayed_early_binding_list(envelock_persistent_script *persi
 		}
 	}
 
+	/* Envelock (H-09): zeroed. zend_early_binding ends in a uint32_t followed by 4 bytes of padding,
+	 * which persist copies into the image as they were: bytes of whatever the heap held there before
+	 * (a stale pointer, another file's data), so two packs of one file differed. */
 	zend_early_binding *early_binding = persistent_script->early_bindings =
-		emalloc(sizeof(zend_early_binding) * persistent_script->num_early_bindings);
+		ecalloc(persistent_script->num_early_bindings, sizeof(zend_early_binding));
 
 	for (zend_op *opline = op_array->opcodes; opline < end; opline++) {
 		if (opline->opcode == ZEND_DECLARE_CLASS_DELAYED) {

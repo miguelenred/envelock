@@ -58,6 +58,11 @@ static int decrypt_gcm(const unsigned char key[32], const unsigned char nonce[12
         EVP_DecryptFinal_ex(ctx, output + written, &final_length) != 1) goto done;
     ok = written + final_length == ciphertext_length;
 done:
+    /* GCM streams plaintext into `output` during DecryptUpdate, BEFORE DecryptFinal verifies the
+     * tag. On any failure that buffer holds unauthenticated bytes, so wipe it here rather than trust
+     * every caller to do it (audit 2026-11, C-23). Harmless on success: nothing is wiped then. */
+    if (!ok && output && ciphertext_length > 0)
+        OPENSSL_cleanse(output, (size_t)ciphertext_length);
     EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
@@ -87,6 +92,10 @@ int envelock_gcm_decrypt(const unsigned char key[32], const unsigned char nonce[
      * and a good ciphertext can report written = 0. */
     ok = EVP_DecryptFinal_ex(ctx, output + written, &final_length) == 1;
 done:
+    /* Wipe any plaintext DecryptUpdate streamed into `output` before the tag was checked, on any
+     * failure path, so an unauthenticated result never survives in the caller's buffer (C-23). */
+    if (!ok && output && ciphertext_length > 0 && ciphertext_length <= (size_t)INT_MAX)
+        OPENSSL_cleanse(output, ciphertext_length);
     EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
@@ -152,7 +161,11 @@ int envelock_parse_header(const unsigned char *blob, size_t length, envelock_hea
     const unsigned char *header;
     size_t table_size;
     int i;
-    if (!blob || !h || length < fixed || memcmp(blob, ENVELOCK_STUB, stub_length) != 0) return 0;
+    /* C-31: accept EITHER stub (same length) — the pre-1.1 ENVELOCK_STUB or the 1.1 ENVELOCK_STUB_V3.
+     * The stub bytes are part of the signed/AAD region, so a file still cannot forge a different one. */
+    if (!blob || !h || length < fixed ||
+        (memcmp(blob, ENVELOCK_STUB, stub_length) != 0 &&
+         memcmp(blob, ENVELOCK_STUB_V3, stub_length) != 0)) return 0;
     header = blob + stub_length;
     /* Anti-downgrade: only exactly this magic and version are accepted. Both live inside the
      * signed region, so flipping them breaks the signature. */

@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -502,8 +503,8 @@ def test_enc15_pgpass_conf_name_refused(tmp_path, material):
 def test_enc16_lint_writes_no_temporary_file(monkeypatch):
     def no_temp(*args, **kwargs):
         raise AssertionError("plaintext written to a temporary file")
-    monkeypatch.setattr(a.tempfile, "NamedTemporaryFile", no_temp)
-    monkeypatch.setattr(a.tempfile, "mkstemp", no_temp)
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", no_temp)
+    monkeypatch.setattr(tempfile, "mkstemp", no_temp)
     assert a._php_lint_error_line(PHP, b"<?php echo 1;\n") is None
     assert a._php_lint_error_line(PHP, b"<?php\n\nfunction f() { return 1 }\n") == 3
     assert a._php_lint_error_line(PHP, b"<?php\nclass A { public $x = \\strlen('ab'); }\n") == 2
@@ -735,3 +736,202 @@ def test_enc25_file_versus_folder_collision(first, second):
     names, folders = set(), set()
     assert not a._claim_portable_name(a.validate_portable_path(Path("lib/x.php")), names, folders)
     assert not a._claim_portable_name(a.validate_portable_path(Path("lib/y.php")), names, folders)
+
+
+# --- Encoder audit 2026-11-17 ------------------------------------------------------------------------
+
+@windows_only
+def test_packed_files_inherit_the_destination_permissions_on_windows(tmp_path, material):
+    """Since Python 3.12.4, tempfile.mkdtemp gives its folder a PROTECTED owner-only ACL on Windows,
+    and pack staged in one: every packed file and folder kept that ACL after the move, so an IIS
+    application pool (or any other service account) was denied the package, and granting read on the
+    site folder afterwards did not reach them. They must inherit the destination's permissions."""
+    src = source_tree(tmp_path, {"index.php": b"<?php echo 1;", "lib/a.php": b"<?php echo 2;"})
+    www = tmp_path / "www"
+    www.mkdir()
+    # The site folder grants read to the local Users group (S-1-5-32-545, "BU"), as one would for a
+    # service account; the packed files must carry that entry, inherited.
+    granted = subprocess.run(["icacls", str(www), "/grant", "*S-1-5-32-545:(OI)(CI)RX"],
+                             capture_output=True, text=True)
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    out = www / "app"
+    pack(material, src, out, enforce_manifest=True)
+    for rel in ("index.php", "lib", "lib/a.php", a.MANIFEST_BIN_NAME):
+        sddl = windows_dacl(out / rel)
+        flags, aces = a._parse_sddl_dacl(sddl)
+        assert "P" not in flags, (rel, sddl)
+        assert any(";BU)" in ace or "S-1-5-32-545" in ace for ace in aces), (rel, sddl)
+    assert not list(www.glob(".envelock-pack-*"))                      # no staging left behind
+
+
+def test_pack_staging_is_not_mkdtemp(tmp_path, material, monkeypatch):
+    """The staging folder is made with the folder's normal permissions, not by tempfile.mkdtemp (whose
+    protected ACL leaked into the package on Windows), and it is gone after a pack, failed or not."""
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a_, **k: pytest.fail("mkdtemp used for staging"))
+    src = source_tree(tmp_path, {"index.php": b"<?php echo 1;"})
+    pack(material, src, tmp_path / "out")
+    assert (tmp_path / "out" / "index.php").is_file()
+    assert not list(tmp_path.glob(".envelock-pack-*"))
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-8-sig"])
+def test_password_file_with_a_bom_is_read_as_its_text(tmp_path, monkeypatch, encoding):
+    """Windows PowerShell 5.1 writes password files with a BOM (UTF-16 by `>`/Out-File, UTF-8 by
+    Set-Content -Encoding utf8). Read raw, the BOM and every NUL counted: "short" passed the 16-character
+    minimum, and a key made from such a file could not be opened by typing the same password."""
+    p = tmp_path / "password"
+    raw = "short\r\n".encode(encoding)
+    if encoding == "utf-16-be":
+        raw = b"\xfe\xff" + raw
+    a.secret_write(p, raw)
+    monkeypatch.setenv("ENVELOCK_PASSWORD_FILE", str(p))
+    with pytest.raises(ValueError, match="at least 16 characters"):
+        a.password_from_user()
+    text = "correct horse battery staple"
+    q = tmp_path / "password2"
+    raw = (text + "\r\n").encode(encoding)
+    if encoding == "utf-16-be":
+        raw = b"\xfe\xff" + raw
+    a.secret_write(q, raw)
+    monkeypatch.setenv("ENVELOCK_PASSWORD_FILE", str(q))
+    assert a.password_from_user() == text.encode("utf-8")
+    key = tmp_path / "owner.enc.json"
+    a.save_json(key, a.make_owner(), a.password_from_user())
+    # The same password typed (or kept in a plain UTF-8 file) opens it.
+    assert a.read_config(key, "envelock-owner", text.encode("utf-8"))["kind"] == "envelock-owner"
+
+
+def test_key_made_from_a_bom_password_file_before_the_fix_still_opens(tmp_path, monkeypatch):
+    """Compatibility: a key encrypted with the RAW bytes of a UTF-16 password file (as before the fix)
+    still opens with that same file; the wrong file still fails."""
+    text = "correct horse battery staple"
+    raw = (text + "\r\n").encode("utf-16")
+    p = tmp_path / "password"
+    a.secret_write(p, raw)
+    key = tmp_path / "owner.enc.json"
+    a.save_json(key, a.make_owner(), raw.rstrip(b"\r\n"))        # what the old reading produced
+    monkeypatch.setenv("ENVELOCK_PASSWORD_FILE", str(p))
+    assert a.read_config(key, "envelock-owner")["kind"] == "envelock-owner"
+    other = tmp_path / "other"
+    a.secret_write(other, "another long password!!".encode("utf-16"))
+    monkeypatch.setenv("ENVELOCK_PASSWORD_FILE", str(other))
+    with pytest.raises(ValueError, match="Wrong password"):
+        a.read_config(key, "envelock-owner")
+
+
+@posix_only
+def test_identity_update_keeps_owner_and_mode_on_posix(tmp_path, material):
+    """An identity installed for a rootless loader (0400, the PHP user's) came back 0600 and owned by
+    whoever ran `minimum set` / `recipient add`: the loader could no longer read it. The replacement
+    keeps the file's owner, group and owner/group-only mode."""
+    owner, recipient, _ = material
+    path = tmp_path / "identity.bin"
+    path.write_bytes(a.add_recipient_to_store(None, recipient, owner))
+    os.chmod(path, 0o440)
+    before = os.stat(path)
+    a.write_store(path, a.add_recipient_to_store(path.read_bytes(), a.make_recipient("r2"), owner))
+    after = os.stat(path)
+    assert stat.S_IMODE(after.st_mode) == 0o440
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    if os.geteuid() == 0:
+        os.chown(path, 65534, 65534)                                   # nobody, as server-install does
+        os.chmod(path, 0o400)
+        a.write_store(path, a.add_recipient_to_store(path.read_bytes(), a.make_recipient("r3"), owner))
+        after = os.stat(path)
+        assert (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) == (65534, 65534, 0o400)
+
+
+def test_runtime_manifest_over_the_loader_limit_is_refused_at_pack(tmp_path, material, monkeypatch):
+    """The loader refuses a runtime manifest over 16 MiB as malformed (refusing every file of the
+    package at run time); pack used to write one with exit 0. The limit is lowered here so the test
+    stays small."""
+    src = source_tree(tmp_path, {f"f{i:03d}.php": b"<?php echo 1;" for i in range(20)})
+    monkeypatch.setattr(a, "MANIFEST_BIN_MAX", 600)
+    with pytest.raises(ValueError, match="over the loader's limit"):
+        pack(material, src, tmp_path / "out", enforce_manifest=True)
+    assert not (tmp_path / "out").exists()
+    pack(material, src, tmp_path / "out2", enforce_manifest=False)        # without it, packs
+    assert a.MANIFEST_BIN_MAX != 16 * 1024 * 1024
+    monkeypatch.undo()
+    assert a.MANIFEST_BIN_MAX == 16 * 1024 * 1024
+    loader = (ROOT / "extension" / "envelock.c").read_text(encoding="utf-8")
+    assert "#define ENVELOCK_MANIFEST_MAX (16U * 1024 * 1024)" in loader      # the two limits agree
+
+
+@needs_php
+@pytest.mark.parametrize("reader", ["foreach ($this as $k => $v) { $o[$k] = $v; }",
+                                    "$o = (array) $this;",
+                                    "$o = get_mangled_object_vars($this);",
+                                    "$o = var_export($this, true);"])
+def test_obfuscate_properties_leaves_classes_that_read_their_property_names(reader):
+    """--obfuscate-properties renamed private properties of a class that reads its own property NAMES
+    (a toArray() built with foreach over $this changed its keys from "email" to "a")."""
+    head = b"<?php class User { private $email = 'a@x'; public function mail() { return $this->email; } "
+    control = a.transform_sources({"u.php": head + b"}"}, PHP, properties=True)[0]["u.php"]
+    assert b"$this->email" not in control, control          # the pass does rename a plain class
+    src = head + b"public function toArray() { $o = []; " + reader.encode() + b" return $o; } }"
+    out = a.transform_sources({"u.php": src}, PHP, properties=True)[0]["u.php"]
+    assert b"$this->email" in out and b"private $email" in out, out
+
+
+def test_server_install_identity_refuses_a_file_that_is_not_an_identity(tmp_path, material):
+    """`server-install --identity` installed ANY file: passing the owner key by mistake put the private
+    signing key on the server (what the option exists to avoid) and the loader just failed to start."""
+    owner_file, _, _ = keyfiles(tmp_path, material)
+    out = tmp_path / "srv" / "identity.bin"
+    r = run_cli("server-install", "--identity", owner_file, "--out", out)
+    assert r.returncode != 0 and "not an Envelock server identity file" in r.stderr, r.stderr
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("option", ["--machine", "--domain", "--ip"])
+def test_licence_issue_refuses_an_empty_binding(tmp_path, material, option):
+    """--machine "$FP" with an empty FP (a failed capture in a script) issued an UNBOUND licence with
+    exit 0, granting more than was asked; omitting the option is how to ask for no binding."""
+    owner_file, _, _ = keyfiles(tmp_path, material)
+    lic = tmp_path / "licence.bin"
+    for empty in ("", "  "):
+        r = run_cli("licence", "issue", "--owner", owner_file, "--out", lic, "--days", "30", option, empty)
+        assert r.returncode != 0 and "is empty" in r.stderr, r.stderr
+        assert not lic.exists()
+    assert run_cli("licence", "issue", "--owner", owner_file, "--out", lic, "--days", "30").returncode == 0
+
+
+def test_verify_can_pin_project_and_minimum_serial(tmp_path, material):
+    """verify only checked a package against its OWN manifest, so a whole package swapped for another
+    package of the same developer (an older release, another project) passed. --project and
+    --min-serial pin what is expected."""
+    owner, recipient, _ = material
+    owner_file, _, _ = keyfiles(tmp_path, material)
+    src = source_tree(tmp_path, {"index.php": b"<?php echo 1;"})
+    project = str(uuid.uuid4())
+    out = tmp_path / "pkg"
+    a.pack_tree(src, out, [a.recipient_public(recipient)], owner, project, manifest=True, serial=5)
+    dev = tmp_path / "dev.json"
+    dev.write_text(json.dumps(a.developer_public(owner)), encoding="utf-8")
+    base = ["verify", "--package", out, "--developer", dev]
+    assert run_cli(*base).returncode == 0
+    assert run_cli(*base, "--project", project, "--min-serial", "5").returncode == 0
+    wrong = run_cli(*base, "--project", str(uuid.uuid4()))
+    assert wrong.returncode == 1 and "is not the expected" in wrong.stdout
+    old = run_cli(*base, "--min-serial", "6")
+    assert old.returncode == 1 and "below the expected minimum" in old.stdout
+    assert run_cli(*base, "--project", "not-a-uuid").returncode != 0
+
+
+@posix_only
+def test_licence_written_into_new_nested_folders_is_reachable(tmp_path):
+    """write_public made only the IMMEDIATE parent traversable: under the CLI's umask 077 the other
+    folders it created stayed 0700 and a non-root reader could not reach the licence."""
+    old = os.umask(0o077)
+    try:
+        target = tmp_path / "lic" / "a" / "b" / "licence.bin"
+        a.write_public(target, b"LICENCE")
+    finally:
+        os.umask(old)
+    for folder in (tmp_path / "lic", tmp_path / "lic" / "a", tmp_path / "lic" / "a" / "b"):
+        assert stat.S_IMODE(os.stat(folder).st_mode) == 0o755, folder
+    # A folder that already existed is left as the administrator set it.
+    os.chmod(tmp_path / "lic", 0o750)
+    a.write_public(tmp_path / "lic" / "c" / "licence.bin", b"LICENCE")
+    assert stat.S_IMODE(os.stat(tmp_path / "lic").st_mode) == 0o750

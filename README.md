@@ -1,12 +1,12 @@
 # Envelock
 
 **Offline encoder and loader extension for PHP 8.2–8.5.**  
-Version **1.0.0** · Python + C + OpenSSL 3 · Apache-2.0 license.  
+Version **1.1.0** · Python + C + OpenSSL 3 · Apache-2.0 license.  
 Project page: **[miguelenred.es/envelock](https://miguelenred.es/envelock)** · Source: **[github.com/miguelenred/envelock](https://github.com/miguelenred/envelock)**
 
 Distribute PHP projects without shipping their files in readable text. A **generic** extension (with no embedded keys) verifies each file's signature, unwraps the content key with the recipient's private key, decrypts in memory and hands the result to PHP's normal compiler. The private key and the trusted signer are read from an external identity file pointed to by `envelock.identity` in `php.ini`. A single host can serve several projects from different folders, each encrypted with different keys.
 
-> **It is not a compiler to machine code nor an invulnerable system.** The server owner can instrument PHP or read the identity file and the source in memory during compilation. Confidentiality against root/Administrator is not guaranteed, nor is the absence of bugs. The design aims to prevent the public engine or another developer's keys from decrypting packages intended for others, subject to the cryptographic assumptions and correct implementation.
+> **It is not a compiler to machine code, nor an invulnerable system.** Its aim is to keep PHP out of readable text and to stop the public engine, or another developer's keys, from decrypting packages meant for other recipients — subject to the cryptographic assumptions and a correct implementation. The complete threat model, including what the server's own operator can and cannot do, is in [docs/SEGURIDAD.md](docs/SEGURIDAD.md).
 
 ## Documentation
 
@@ -115,7 +115,7 @@ Do not publish `owner*.json`, `recipient*.json`, identity files `identity*.bin`,
 
 The code includes signed licence constraints (including expiry and a machine fingerprint) and a quarantined mini-VM restricted to unsafe laboratory research (not production), but there is no general online revocation or TPM/DPAPI sealing of the server identity. Real control-flow flattening and constant mixing remain unfinished; the AST name pass and strict allowlist do not prove a closed application boundary. See [ROADMAP-PROTECCION.md](ROADMAP-PROTECCION.md) for the remaining objectives and measured limitations.
 
-Optional per-package protections include anti-rollback by serial, path binding, include protection, no-prepend, local-variable / private-method / private-property obfuscation, dead-branch flow obfuscation, string-literal encoding and a C-side string-literal vault, refusal of FFI/`dl()`, a sealed tree, refusal of debugging extensions, and runtime enforcement of a signed file manifest. Even so this is not a full deployment-integrity sandbox: without the signed manifest (enforced by default; opt out with `--no-manifest`) a file can be deleted or a whole package folder swapped, normal PHP is allowed alongside protected files, and none of these layers defeat the server administrator, who can read process memory. OPcache is refused for protected files unless the operator opts in and blacklists the protected tree (`envelock.allow_opcache`); preloading and `opcache.file_cache` are never allowed. PHAR, `__halt_compiler()` in the original source and code that reads its own file have no guaranteed compatibility.
+Optional per-package protections include anti-rollback by serial, path binding, include protection, no-prepend, local-variable / private-method / private-property obfuscation, dead-branch flow obfuscation, string-literal encoding and a C-side string-literal vault, refusal of FFI/`dl()`, a sealed tree, refusal of debugging extensions, and runtime enforcement of a signed file manifest. Even so this is not a full deployment-integrity sandbox: without the signed manifest (enforced by default; opt out with `--no-manifest`) a file can be deleted or a whole package folder swapped, normal PHP is allowed alongside protected files, and — as on any system — the server's own operator could still read fragments of the process memory. OPcache is refused for protected files unless the operator opts in and blacklists the protected tree (`envelock.allow_opcache`); preloading and `opcache.file_cache` are never allowed. PHAR, `__halt_compiler()` in the original source and code that reads its own file have no guaranteed compatibility.
 
 **Before relying on it in production:** an independent review, native tests on each target, an FPM/Apache/ZTS evaluation, stress testing and validation with your real applications.
 

@@ -90,4 +90,8 @@ int envelock_host_ips_hash(unsigned char out[32]);
  * knowable at startup and are checked either way. */
 const char *envelock_licence_refusal(const envelock_licence *licence, int request_active);
 
+/* Called at the start of every request (RINIT): forgets the IP fingerprint cached for the previous
+ * request (envelock_licence_refusal caches the host-bound checks; see envelock_licence.c). */
+void envelock_licence_request_start(void);
+
 #endif /* ENVELOCK_LICENCE_H */

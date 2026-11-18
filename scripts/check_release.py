@@ -9,11 +9,14 @@ Portable (Python stdlib only). Run before every commit, archive or release:
 
     python scripts/check_release.py            # scan repo root
     python scripts/check_release.py some/dir   # scan a staged release tree
+    python scripts/check_release.py --terms scripts/forbidden-terms.txt some/dir
 
 Exit status: 0 clean, 1 findings, 2 usage error (e.g. the argument is not a directory).
 
 Extra literal terms to block (e.g. vendor or internal app names) can be listed, one per
-line, in scripts/forbidden-terms.txt; that file is git-ignored so the terms never ship.
+line, in scripts/forbidden-terms.txt; that file is git-ignored so the terms never ship. A staged
+tree is checked against it with --terms FILE: the file must not be copied INTO the tree, where its
+presence outside a live git checkout is itself a finding (it would publish every term).
 """
 from __future__ import annotations
 
@@ -66,7 +69,8 @@ BINARY_MAGIC = (b"\x7fELF", b"MZ", b"!<arch>\n", b"\xfe\xed\xfa\xce", b"\xfe\xed
 # Data formats that are never text: upstream files starting like this are not searched for terms
 # (their random bytes would give false matches).
 DATA_MAGIC = BINARY_MAGIC + (b"\x89PNG", b"GIF8", b"\xff\xd8\xff", b"icns", b"\x00\x00\x01\x00",
-                             b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ", b"%PDF", b"wOF", b"\x00\x01\x00\x00")
+                             b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ", b"%PDF", b"wOF", b"\x00\x01\x00\x00",
+                             b"\x28\xb5\x2f\xfd", b"MSCF", b"\x1f\x9d", b"LZIP", b"\x04\x22\x4d\x18")
 # Repository folders whose every file must be listed, with the same hash, in <folder>/SHA256SUMS:
 # prebuilt/ (the only compiled files allowed) and third_party/ (upstream sources byte for byte, so
 # build outputs, swapped files or end-of-line conversions are caught). Upstream authors' emails,
@@ -104,13 +108,19 @@ CONTENT_SKIP = {"scripts/check_release.py", "scripts/forbidden-terms.txt",
 # listing cannot prove the file is absent from a release. They are tolerated only inside a live git
 # working tree (a real ".git" directory is present), where git actually keeps an ignored file out of
 # commits and archives; in any other tree (a naive copy, an extracted release) their presence fails.
-NEVER_SHIP = {"CONTEXTO-PROYECTO.md"}
+# The terms file is one of them: a staged tree checked by copying it in would otherwise pass and ship
+# the whole list of terms the guard exists to keep private (audit 2026-11-17); use --terms instead.
+NEVER_SHIP = {"CONTEXTO-PROYECTO.md", "scripts/forbidden-terms.txt"}
 
 # Compressed archives hide their contents from the content scan. Outside the hash-locked folders
-# (prebuilt/ wheels are handled there) an archive in a release tree is refused.
+# (prebuilt/ wheels are handled there) an archive in a release tree is refused. Zstandard, cabinet,
+# compress (.Z), lzip and LZ4 too: without their magic they fell through as "binary blobs" and
+# shipped unscanned (a .tar.zst is what docs/BUILDING.md has the maintainer download).
 ARCHIVE_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"BZh", b"\xfd7zXZ",
-                 b"7z\xbc\xaf\x27\x1c", b"Rar!")
-ARCHIVE_EXT = {".zip", ".gz", ".tgz", ".xz", ".bz2", ".tar", ".7z", ".rar"}
+                 b"7z\xbc\xaf\x27\x1c", b"Rar!", b"\x28\xb5\x2f\xfd", b"MSCF", b"\x1f\x9d", b"LZIP",
+                 b"\x04\x22\x4d\x18")
+ARCHIVE_EXT = {".zip", ".gz", ".tgz", ".xz", ".txz", ".bz2", ".tbz2", ".tar", ".7z", ".rar", ".zst",
+               ".tzst", ".cab", ".z", ".lz", ".lz4", ".lzma", ".jar"}
 
 # Documentation / private IP ranges allowed in examples (RFC 5737 / RFC 1918 / RFC 3849).
 ALLOWED_IP = re.compile(
@@ -155,8 +165,12 @@ ENCRYPTED_BLOB = re.compile(r"\\*[\"']ciphertext\\*[\"']\s*:\s*\\*[\"'][0-9a-fA-
 # Byte-order marks of UTF-16/32 text (which holds NUL bytes, e.g. PowerShell 5.1's `>` output).
 UTF_BOMS = (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
 
-# Start of every Envelock-protected file (encrypted, signed; never contains private keys).
-PROTECTED_STUB = b'<?php /* Envelock */ exit("Envelock loader required\\n"); __halt_compiler();\n'
+# Start of every Envelock-protected file (encrypted, signed; never contains private keys). Two stubs:
+# the 1.1 one (HTTP 500 + non-zero exit without the loader) and the pre-1.1 one (C-31). Both recognised.
+PROTECTED_STUBS = (
+    b'<?php /* Envelock 1.1 */ http_response_code(500);exit(1);__halt_compiler();\n',
+    b'<?php /* Envelock */ exit("Envelock loader required\\n"); __halt_compiler();\n',
+)
 
 ALLOWED_EMAIL = re.compile(r"@(?:example\.(?:com|org|net)|localhost)$", re.I)
 
@@ -185,14 +199,21 @@ def upstream_email_allowed(relp, n: int, line: str, text: str) -> bool:
     return all(marker in head for marker in UPSTREAM_HEADER_MARKERS)
 
 
-def load_terms(root: Path) -> tuple[list[str], list[str]]:
+def terms_path(root: Path, terms_file: Path | None = None) -> Path:
+    """The terms file in effect: the one given with --terms, else the tree's own."""
+    return terms_file if terms_file is not None else root / "scripts" / "forbidden-terms.txt"
+
+
+def load_terms(root: Path, terms_file: Path | None = None) -> tuple[list[str], list[str]]:
     """(forbidden terms, allowed phrases). A line starting with "!" is a phrase that contains a
     term but is not a finding in upstream files (e.g. a person's name in their credits): a term
     match lying entirely inside such a phrase is ignored there. Envelock's own files get none."""
-    f = root / "scripts" / "forbidden-terms.txt"
-    if not f.exists():
+    f = terms_path(root, terms_file)
+    if not f.is_file():
         return [], []
-    lines = [t.strip() for t in f.read_text(encoding="utf-8").splitlines()
+    # Decoded like any scanned text (UTF-8 with or without a BOM, UTF-16/32): PowerShell 5.1 writes a
+    # BOM, which a plain UTF-8 read left glued to the first term, silently disabling it.
+    lines = [t.strip() for t in upstream_text(f.read_bytes()).lstrip("﻿").splitlines()
              if t.strip() and not t.startswith("#")]
     allowed = [t[1:].strip() for t in lines if t.startswith("!")]
     return [t for t in lines if not t.startswith("!")], [t for t in allowed if t]
@@ -327,20 +348,22 @@ def scan_upstream(raw: bytes, word_hit, needles: tuple[bytes, ...], fragments: t
     return found
 
 
-def scan(root: Path, notes: list[str] | None = None, require_complete: bool = False) -> list[str]:
+def scan(root: Path, notes: list[str] | None = None, require_complete: bool = False,
+         terms_file: Path | None = None) -> list[str]:
     """Findings (each one fails the check). Informational lines that are not failures (case-only
     name collisions a case-insensitive filesystem cannot hold) are appended to `notes`. With
-    `require_complete`, a file listed in a SHA256SUMS but absent from the tree is a finding too."""
+    `require_complete`, a file listed in a SHA256SUMS but absent from the tree is a finding too.
+    `terms_file` is the --terms file (default: the tree's own scripts/forbidden-terms.txt)."""
     if notes is None:
         notes = []
     # Fail-open guard: if the terms file is absent (e.g. a staged release or a published ZIP, where
     # it is git-ignored) the forbidden-term check cannot run. Say so loudly instead of passing
     # silently, so a green result is never mistaken for "no internal terms present".
-    if not (root / "scripts" / "forbidden-terms.txt").is_file():
+    if not terms_path(root, terms_file).is_file():
         print("WARNING: scripts/forbidden-terms.txt is absent -- forbidden-term checking is "
-              "DISABLED for this scan (a pass does not prove no internal terms are present).",
-              file=sys.stderr)
-    terms, allowed = load_terms(root)
+              "DISABLED for this scan (a pass does not prove no internal terms are present; "
+              "pass the file with --terms).", file=sys.stderr)
+    terms, allowed = load_terms(root, terms_file)
     allowed_re = re.compile("|".join(re.escape(t) for t in allowed), re.I) if allowed else None
     alternatives = "|".join(re.escape(t) for t in terms)
     # Envelock's own files: any occurrence. Upstream sources: whole words only, so an upstream
@@ -411,10 +434,14 @@ def scan(root: Path, notes: list[str] | None = None, require_complete: bool = Fa
         elif is_repository and len(relp.parts) == 1 and rel in SKIP_TOP:
             findings.append(f"{rel}: local working folder of the repository in a tree that is not a "
                             f"live git checkout (it would be published; remove it -- scanned below)")
-        # In the hash-locked folders a link is refused (git on Windows turns it into a text file,
-        # and a link to a folder or outside would escape the list), whatever it points to.
-        if is_repository and len(relp.parts) > 1 and relp.parts[0] in MANIFEST_DIRS and path.is_symlink():
-            findings.append(f"{rel}: symbolic link (not portable across systems; store a real file)")
+        # A link is refused anywhere, whatever it points to: git on Windows turns it into a text file,
+        # tar and git store its target path (a home folder, say) and zip follows it, shipping content
+        # this scan never read -- a link to a folder was skipped silently, a dangling one too (audit
+        # 2026-11-17). A linked hash-locked top folder was already reported above.
+        if path.is_symlink():
+            if not (is_repository and len(relp.parts) == 1 and relp.parts[0] in MANIFEST_DIRS):
+                findings.append(f"{rel}: symbolic link (not portable across systems, and its target "
+                                f"is not scanned; store a real file)")
             continue
         if not path.is_file():
             continue
@@ -432,7 +459,7 @@ def scan(root: Path, notes: list[str] | None = None, require_complete: bool = Fa
                 head = f.read(8)
         except OSError:
             head = b""
-        if head in (b"ENVLKID2", b"ENVLKID3"):
+        if head in (b"ENVLKID2", b"ENVLKID3", b"ENVLKID4"):
             findings.append(f"{rel}: server identity file (private keys), whatever its name")
             continue
 
@@ -487,7 +514,7 @@ def scan(root: Path, notes: list[str] | None = None, require_complete: bool = Fa
         except OSError:
             findings.append(f"{rel}: file that cannot be read (not checked)")
             continue
-        if raw.startswith(PROTECTED_STUB) or raw.startswith(DATA_MAGIC):
+        if raw.startswith(PROTECTED_STUBS) or raw.startswith(DATA_MAGIC):
             continue  # Envelock container or a known binary/data format: holds no readable secret
         if not is_text_ext and b"\x00" in raw[:8192] and not nul_text(raw):
             continue  # binary blob without a known magic (no text extension): not scannable text
@@ -546,11 +573,85 @@ def missing_required(root: Path) -> list[str]:
             for rel in REQUIRED_FILES if not (root / rel).is_file()]
 
 
+# docs/reports/ is the published audit evidence (ruff, bandit, clang, the ASan/UBSan exerciser, the
+# native JUnit run) and targets.json pins the exact sources it was produced from. 1.1.0 was assembled
+# with every pinned hash stale -- the evidence described code from two weeks earlier -- and nothing
+# noticed (audit 2026-11-17, H-1). A release therefore fails when a pinned source changed since.
+EVIDENCE = "docs/reports/targets.json"
+# Every first-party source the evidence covers -- compiled into the loader the JUnit run tests, run
+# by the test suite, or scanned by ruff/bandit -- the ONE list scripts/regen-reports.sh pins from and
+# the release gate checks against: a source added after the evidence (a new module, a new opcache
+# layer file) is unpinned and refused, not silently ignored (audit 2026-11-17). tests/fixtures/ (data
+# the tests read) is not pinned.
+EVIDENCE_PATTERNS = (
+    "extension/*.c", "extension/*.h", "extension/config.m4", "extension/config.w32",
+    "extension/opcache/*.h", "extension/opcache/php8*/*.c", "extension/opcache/php8*/*.h",
+    "encoder/*.py", "encoder/*.php", "gui/*.py", "gui/*.spec", "tests/*.py", "tests/*.c",
+    "scripts/build-unix.sh", "scripts/build-windows.ps1", "scripts/build-gui.sh",
+    "scripts/check_release.py", "scripts/check_bc_layers.py", "scripts/regen-reports.sh",
+    "scripts/demo_material.py", "scripts/bench.py", "scripts/fpm_smoke.py", "CMakeLists.txt",
+)
+
+
+def evidence_sources(root: Path) -> list[str]:
+    """The sources the evidence must pin, as sorted POSIX paths relative to `root`."""
+    return sorted({p.relative_to(root).as_posix() for pattern in EVIDENCE_PATTERNS
+                   for p in root.glob(pattern) if p.is_file()})
+
+
+def evidence_digest(data: bytes) -> str:
+    """How targets.json records a source: SHA-256 with line endings normalised to LF, so the same
+    sources verify on a Windows checkout (CRLF) and in an extracted archive alike."""
+    return "sha256:" + hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def stale_evidence(root: Path) -> list[str]:
+    path = root / EVIDENCE
+    fix = "regenerate it with scripts/regen-reports.sh"
+    if not path.is_file():
+        return [f"{EVIDENCE}: missing, so the release carries no audit evidence ({fix})"]
+    try:
+        items = list(json.loads(path.read_text(encoding="utf-8"))["targets"].items())
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return [f"{EVIDENCE}: unreadable ({fix})"]
+    if not items:
+        return [f"{EVIDENCE}: pins no source ({fix})"]
+    findings = []
+    for rel, digest in items:
+        # Only a plain relative path inside the tree is ever opened (never an absolute path, a
+        # drive, or a climb out of the tree the evidence describes).
+        if (not isinstance(rel, str) or not isinstance(digest, str) or not rel
+                or rel.startswith(("/", "\\")) or ":" in rel or ".." in rel.replace("\\", "/").split("/")):
+            findings.append(f"{EVIDENCE}: invalid entry {rel!r} ({fix})")
+            continue
+        source = root / rel
+        if not source.is_file():
+            findings.append(f"{EVIDENCE}: {rel} is pinned but missing from the tree (stale evidence; {fix})")
+        elif evidence_digest(source.read_bytes()) != digest:
+            findings.append(f"{EVIDENCE}: {rel} changed after the evidence was generated (stale; {fix})")
+    pinned = {rel for rel, _ in items if isinstance(rel, str)}
+    for rel in evidence_sources(root):
+        if rel not in pinned:
+            findings.append(f"{EVIDENCE}: {rel} is not pinned (added after the evidence was "
+                            f"generated; {fix})")
+    return findings
+
+
 def main() -> int:
-    args = [a for a in sys.argv[1:] if a != "--require-complete"]
-    require_complete = "--require-complete" in sys.argv[1:]
+    usage = "usage: check_release.py [--require-complete] [--terms FILE] [directory]"
+    argv = sys.argv[1:]
+    terms_file = None
+    if "--terms" in argv:
+        i = argv.index("--terms")
+        if i + 1 >= len(argv) or not Path(argv[i + 1]).is_file():
+            print(f"ERROR: --terms needs an existing file\n{usage}", file=sys.stderr)
+            return 2
+        terms_file = Path(argv[i + 1]).resolve()
+        argv = argv[:i] + argv[i + 2:]
+    args = [a for a in argv if a != "--require-complete"]
+    require_complete = "--require-complete" in argv
     if len(args) > 1:
-        print("usage: check_release.py [--require-complete] [directory]", file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 2
     # A typo, a mistyped option or a .zip must not "pass" by scanning nothing.
     if args and not Path(args[0]).is_dir():
@@ -559,9 +660,10 @@ def main() -> int:
         return 2
     root = Path(args[0]).resolve() if args else Path(__file__).resolve().parents[1]
     notes: list[str] = []
-    findings = scan(root, notes, require_complete)
+    findings = scan(root, notes, require_complete, terms_file)
     if require_complete:
         findings += missing_required(root)
+        findings += stale_evidence(root)
     for note in notes:
         print("NOTE: " + note)
     if findings:

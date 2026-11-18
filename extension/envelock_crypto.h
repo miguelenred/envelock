@@ -6,6 +6,12 @@
  * Ed25519 signature. The loader holds no embedded secret: the recipient private key
  * and the trusted signer public key come from an external identity (generic binary). */
 #define ENVELOCK_STUB "<?php /* Envelock */ exit(\"Envelock loader required\\n\"); __halt_compiler();\n"
+/* C-31: packages made by Envelock 1.1+ carry a stub that, WITHOUT the loader, sets HTTP 500 and exits
+ * NON-ZERO (the pre-1.1 ENVELOCK_STUB exited 0, so a cron/CLI run or a web health check read a
+ * loader-less server as success). It is the SAME length as ENVELOCK_STUB, so the header offset
+ * (sizeof(ENVELOCK_STUB)-1) is unchanged and the AAD is still the file's own prefix bytes; the loader
+ * accepts either stub so packages made before 1.1 keep running. */
+#define ENVELOCK_STUB_V3 "<?php /* Envelock 1.1 */ http_response_code(500);exit(1);__halt_compiler();\n"
 #define ENVELOCK_MAGIC "ENVLK02\0"
 #define ENVELOCK_FORMAT_VERSION 2U
 #define ENVELOCK_MAX_SOURCE (16U * 1024U * 1024U)

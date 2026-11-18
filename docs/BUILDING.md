@@ -129,12 +129,12 @@ keys. The full recipes are in [PLATAFORMAS.md](PLATAFORMAS.md); in short:
   `ENVELOCK_TEST_EXTENSION=<dll> ENVELOCK_TEST_OWNER=owner.json ENVELOCK_TEST_RECIPIENT=recipient.json python -m pytest tests/test_native.py`.
   The tests adapt their expectations (permission messages, paths) to the PHP they run.
 
-*Run for 1.0.0:* the five Linux x86-64 loaders in `prebuilt/` (PHP 8.2, 8.3, 8.4 NTS/ZTS, 8.5)
-are portable builds made on 2026-11-12 on AlmaLinux 8 with `build-unix.sh`, `ENVELOCK_OPENSSL_STATIC`
+*Run for 1.1.0:* the five Linux x86-64 loaders in `prebuilt/` (PHP 8.2, 8.3, 8.4 NTS/ZTS, 8.5)
+are portable builds remade on 2026-11-18 on AlmaLinux 8 with `build-unix.sh`, `ENVELOCK_OPENSSL_STATIC`
 and `ENVELOCK_MAX_GLIBC=2.28` (PLATAFORMAS.md, "Portable build"): glibc 2.28+ and no system OpenSSL
-needed; tested there and on Ubuntu 24.04 (`TEST-STATUS.md`). The eight Windows x64 DLLs (8.2–8.5, NTS and TS) are built
-natively with `build-windows.ps1` on Windows 11 from the post-audit source (2026-11-10) and pass
-`tests/test_native.py` there with 0 failures on each (`TEST-STATUS.md`); the earlier sets were
+needed (`TEST-STATUS.md`). The eight Windows x64 DLLs (8.2–8.5, NTS and TS) are rebuilt
+natively with `build-windows.ps1` on Windows 11 from the final 1.1.0 source (2026-11-17/18) and pass
+`tests/test_native.py` there with 964 passed, 0 failed on each (`TEST-STATUS.md`); the earlier sets were
 cross-built with `build-windows-wine.sh`. The assistant executables are built with `build-gui.sh`
 (its spec lists the hidden imports the bundled code needs; a test keeps the list complete). *Not run:*
 macOS (no Mac; see PLATAFORMAS.md for building, signing and notarizing there).
@@ -276,11 +276,10 @@ script -qefc "wine $WINPY -m PyInstaller --clean --noconfirm --distpath dist/win
 xvfb-run script -qefc "wine dist/win/envelock-assistant.exe --selftest" /dev/null
 ```
 
-*Run for 1.0.0:* the Windows executable natively on Windows 11 (2026-11-10, CPython 3.12.10,
-PyInstaller 6.22.3, from the post-audit source), passing `--selftest` and `--e2e` (also with a real
-PHP), rebuilt on 2026-11-12 with the recommender change; the Linux executable with `build-gui.sh`
-on AlmaLinux 8 (2026-11-12, CPython 3.12.15, glibc 2.28+), passing `--selftest` under a virtual display
-and `--e2e` with PHP 8.4. *Not run:* macOS.
+*Run for 1.1.0:* the Windows executable natively on Windows 11 (2026-11-16/17, CPython 3.12.10,
+PyInstaller 6.22.3, from the 1.1 source), passing `--selftest`; the Linux executable with `build-gui.sh`
+on AlmaLinux 8 (2026-11-16/17, CPython 3.12.15, glibc 2.28+), passing `--selftest` under a virtual
+display (Xvfb). *Not run:* macOS.
 
 ## 6. Portable Python
 
@@ -361,33 +360,53 @@ cd third_party && find . -type f ! -path ./SHA256SUMS ! -path ./README.md ! -pat
 Linux it prefers a prebuilt `.so` attached to the Release and otherwise builds from source. Users'
 side: `docs/HOSTING.md` §4.1.
 
-1. **Tag without a `v`** (`1.0.0`, not `v1.0.0`): PIE puts the package version in the asset names it
+1. **Tag without a `v`** (`1.1.0`, not `v1.1.0`): PIE puts the package version in the asset names it
    looks for.
 2. **Build and test the loaders** (section 2; Linux on the AlmaLinux 8 baseline with
    `ENVELOCK_OPENSSL_STATIC` and `ENVELOCK_MAX_GLIBC=2.28`, see `docs/PLATAFORMAS.md`), copy them to
    `prebuilt/loader/` and regenerate `prebuilt/SHA256SUMS` (section 7).
-3. **Package the assets** with their exact PIE names:
+3. **Regenerate the audit evidence, then pass the release gate** — after the LAST source change,
+   on Linux with the PHP the evidence names (it runs ruff, bandit, pip-audit, the Clang analyzer,
+   the ASan/UBSan exerciser and the whole test suite, and pins every first-party source it covered
+   in `docs/reports/targets.json`):
 
    ```bash
-   python scripts/package-pie-assets.py --version 1.0.0     # writes dist/pie/
+   bash scripts/regen-reports.sh                       # needs clang, libasan/libubsan, the dev lock
+   python scripts/check_release.py --require-complete  # on the tree you will tag
    ```
 
-   It refuses any binary not listed with its hash in `prebuilt/SHA256SUMS`, reads each DLL's
-   compiler from its PE header (VS16 for PHP 8.2/8.3, VS17 for 8.4/8.5) and writes
-   `php_envelock-1.0.0-8.4-nts-vs17-x86_64.zip` (the DLL inside under the same name) for Windows,
-   `php_envelock-1.0.0_php8.4-x86_64-linux-glibc-nts.zip` (`envelock.so` inside) for Linux, LICENSE
+   `--require-complete` refuses a tree whose pinned sources changed after the evidence was generated,
+   or that holds a source the evidence does not pin (1.1.0 was first assembled with every pin two
+   weeks stale: audit 2026-11-17, H-1). To check a **staged** copy (no `.git`) against your private
+   terms, pass the terms file from outside it — never copy it in, a terms file inside a staged tree is
+   itself refused:
+
+   ```bash
+   python scripts/check_release.py --require-complete --terms scripts/forbidden-terms.txt <staged tree>
+   ```
+4. **Package the assets** with their exact PIE names:
+
+   ```bash
+   python scripts/package-pie-assets.py --version 1.1.0     # writes dist/pie/
+   ```
+
+   It refuses any binary not listed with its hash in `prebuilt/SHA256SUMS` or whose PHP build id
+   (`API<date>,NTS|TS[,VS16|VS17]`, what PHP itself checks when loading it) does not match its folder,
+   reads each DLL's compiler from its PE header (VS16 for PHP 8.2/8.3, VS17 for 8.4/8.5) and writes
+   `php_envelock-1.1.0-8.4-nts-vs17-x86_64.zip` (the DLL inside under the same name) for Windows,
+   `php_envelock-1.1.0_php8.4-x86_64-linux-glibc-nts.zip` (`envelock.so` inside) for Linux, LICENSE
    and NOTICE in each, and a `SHA256SUMS` of the assets. The ZIPs are deterministic.
-4. **Create the GitHub Release** for the tag and attach the assets:
+5. **Create the GitHub Release** for the tag and attach the assets:
 
    ```bash
-   gh release create 1.0.0 dist/pie/*.zip dist/pie/SHA256SUMS --title "Envelock 1.0.0" --notes-file CHANGELOG.md
+   gh release create 1.1.0 dist/pie/*.zip dist/pie/SHA256SUMS --title "Envelock 1.1.0" --notes-file CHANGELOG.md
    ```
 
-5. **Packagist, once:** with the repository public, submit its URL at
+6. **Packagist, once:** with the repository public, submit its URL at
    <https://packagist.org/packages/submit> (logged in with the maintainer's account) and enable the
    GitHub integration Packagist offers, so every new tag is picked up by itself. The vendor name
    `envelock` was free on Packagist on 2026-11-11.
-6. **Check** on a clean server or container: `pie install envelock/loader`, then
+7. **Check** on a clean server or container: `pie install envelock/loader`, then
    `php --ri envelock` and `scripts/envelock-preflight.php`.
 
 The source build PIE falls back to runs a plain `phpize && ./configure && make`, not

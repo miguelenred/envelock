@@ -124,6 +124,11 @@ if test "$PHP_ENVELOCK" != "no"; then
   AX_CHECK_COMPILE_FLAG([-fstack-protector-strong], [ENVELOCK_HARDEN_CFLAGS="$ENVELOCK_HARDEN_CFLAGS -fstack-protector-strong"])
   AX_CHECK_COMPILE_FLAG([-fstack-clash-protection], [ENVELOCK_HARDEN_CFLAGS="$ENVELOCK_HARDEN_CFLAGS -fstack-clash-protection"])
   AX_CHECK_COMPILE_FLAG([-fcf-protection=full], [ENVELOCK_HARDEN_CFLAGS="$ENVELOCK_HARDEN_CFLAGS -fcf-protection=full"])
+  dnl sizeof() of an array parameter is a pointer's size. A draft of the 2026-11-17 audit fixes keyed
+  dnl the verified-signature cache by sizeof(digest) -- 8 bytes of the SHA-256 -- after `digest` had
+  dnl become a parameter; the compiler warned and nothing else noticed. Make it a build failure.
+  AX_CHECK_COMPILE_FLAG([-Werror=sizeof-array-argument], [ENVELOCK_HARDEN_CFLAGS="$ENVELOCK_HARDEN_CFLAGS -Werror=sizeof-array-argument"])
+  AX_CHECK_COMPILE_FLAG([-Werror=sizeof-pointer-memaccess], [ENVELOCK_HARDEN_CFLAGS="$ENVELOCK_HARDEN_CFLAGS -Werror=sizeof-pointer-memaccess"])
   case "${host_alias:-`uname -s`}" in
     *linux*|Linux*)
       dnl Full RELRO, immediate binding, non-executable stack: GNU ld only.

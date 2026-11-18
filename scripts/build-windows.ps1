@@ -65,6 +65,12 @@ $persistentPath = @{}
 foreach ($scope in 'User', 'Machine') {
     $persistentPath[$scope] = [Environment]::GetEnvironmentVariable('Path', $scope)
 }
+# The module downloads the PHP SDK, PHP and its dependencies with Invoke-WebRequest, which in Windows
+# PowerShell 5.1 redraws its progress bar for every chunk: measured on 2026-11-17, the 34 MB SDK took
+# 10-30 minutes that way (a stalled build looked like a dead network) and 2.9 s without it. Global,
+# because the module reads the global preference; put back afterwards.
+$oldProgress = $global:ProgressPreference
+$global:ProgressPreference = 'SilentlyContinue'
 try {
     # Every top-level source and header plus the per-version bytecode layer, not a hand-kept list:
     # config.w32 (PHP_NEW_EXTENSION) is the authority on what compiles. The old 6-file list drifted
@@ -141,6 +147,7 @@ try {
     if ($createdOutput -and -not $keepOutput -and (Test-Path $output)) { Remove-Item $output -Recurse -Force }
     throw
 } finally {
+    $global:ProgressPreference = $oldProgress
     Set-Location $oldLocation
     $env:BUILD_DIRECTORY = $oldBuild
     $env:RUN_TESTS = $oldRunTests

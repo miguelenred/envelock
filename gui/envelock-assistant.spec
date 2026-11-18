@@ -17,7 +17,7 @@ root = os.path.abspath(os.getcwd())
 hidden = [
     "argparse", "base64", "calendar", "ctypes", "ctypes.util", "ctypes.wintypes", "fnmatch", "getpass",
     "glob", "hashlib", "http.server", "importlib.util", "io", "json", "os", "re", "secrets", "shlex",
-    "shutil", "socket", "ssl", "stat", "struct", "subprocess", "tempfile", "threading", "time",
+    "shutil", "signal", "socket", "ssl", "stat", "struct", "subprocess", "tempfile", "threading", "time",
     "types", "unicodedata", "urllib.parse", "urllib.request", "uuid", "zipfile",
 ]
 crypto_datas, crypto_binaries, crypto_hidden = collect_all("cryptography")

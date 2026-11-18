@@ -51,9 +51,15 @@ void envelock_bc_startup(void);
 void envelock_bc_shutdown(void);
 
 /* Pack side: compile a real PHP file and return its image (malloc'd; the caller frees it).
- * Returns SUCCESS and sets *image_out/*image_length, or FAILURE and *error. */
+ * Returns SUCCESS and sets *image_out and *image_length, or FAILURE and *error. */
 int envelock_bc_emit_file(zend_file_handle *file_handle, unsigned char **image_out,
                           size_t *image_length, const char **error);
+
+#if defined(ENVELOCK_BCRUN)
+/* TEST ONLY (C-05): when true, envelock_bc_emit_file compiles like the emitters before C-05 (DO_UCALL
+ * kept), so the suite can prove the loader makes such an image's calls generic on its own. */
+extern bool envelock_bc_test_legacy_call_ops;
+#endif
 
 /* Server side: deserialize an image in place and return a runnable op_array. The image buffer
  * must outlive the op_array — it holds every structure the program points at. Returns NULL when

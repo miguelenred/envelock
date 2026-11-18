@@ -72,6 +72,13 @@
 /* Binary operator ids, matching VM_BINARY in the encoder. 20 and 21 (&& and ||) never reach here:
  * they short-circuit, so the encoder compiles them to jumps. */
 #define ENVELOCK_VM_STACK_MAX 4096
+/* The operand stack starts this small and doubles on demand up to ENVELOCK_VM_STACK_MAX. It used to be
+ * allocated at its maximum and zeroed on every call (64 KiB of ecalloc per call of a virtualized
+ * function, however small). */
+#define ENVELOCK_VM_STACK_FIRST 16
+/* Distinct programs one request keeps prepared (see envelock_vm_cache). Past this, a program is
+ * prepared for its call and dropped, as every program was before. */
+#define ENVELOCK_VM_CACHE_MAX 1024
 
 typedef struct _envelock_vm {
     const unsigned char **constant_offsets; /* validated entry pointers, avoiding a scan on each read */
@@ -98,12 +105,25 @@ static void envelock_vm_fail(envelock_vm *vm, const char *why)
 
 static int envelock_vm_push(envelock_vm *vm, zval *value)
 {
-    if (vm->stack_top >= vm->stack_size) {
-        /* push consumes ownership even on failure; otherwise overflow leaks strings, arrays,
-         * objects or references that were materialized for the rejected slot. */
-        zval_ptr_dtor(value);
-        envelock_vm_fail(vm, "the virtualized function ran out of stack");
-        return 0;
+    if (UNEXPECTED(vm->stack_top >= vm->stack_size)) {
+        zval moved;
+        size_t grown;
+        if (vm->stack_size >= ENVELOCK_VM_STACK_MAX) {
+            /* push consumes ownership even on failure; otherwise overflow leaks strings, arrays,
+             * objects or references that were materialized for the rejected slot. */
+            zval_ptr_dtor(value);
+            envelock_vm_fail(vm, "the virtualized function ran out of stack");
+            return 0;
+        }
+        /* Copied out first: `value` may point into the stack that is about to move (DUP pushes back
+         * the slot it has just popped -- never at a full stack, but nothing should rely on that). */
+        moved = *value;
+        grown = vm->stack_size * 2 > ENVELOCK_VM_STACK_MAX ? ENVELOCK_VM_STACK_MAX : vm->stack_size * 2;
+        vm->stack = (zval *) erealloc(vm->stack, grown * sizeof(zval));
+        memset(vm->stack + vm->stack_size, 0, (grown - vm->stack_size) * sizeof(zval));
+        vm->stack_size = grown;
+        vm->stack[vm->stack_top++] = moved;
+        return 1;
     }
     vm->stack[vm->stack_top++] = *value;
     return 1;
@@ -171,6 +191,48 @@ static int envelock_vm_load_constant(const envelock_vm *vm, size_t index, zval *
         default:
             return 0;
     }
+}
+
+/* Constant #index as a name (a function's, or a local's for its warning): 1 with a new string in *out,
+ * 0 when the constant is valid but not a string, -1 when there is no valid constant there. Read straight
+ * from the pool: going through a zval, a type test the static analyser could not tie to the value made
+ * every name read look like a read of an undefined string (clang --analyze, audit 2026-11-12). */
+static int envelock_vm_constant_name(const envelock_vm *vm, size_t index, zend_string **out)
+{
+    const unsigned char *entry = envelock_vm_constant_at(vm, index);
+    uint32_t length;
+    *out = NULL;
+    if (entry == NULL || *entry > 4) {
+        return -1;
+    }
+    if (*entry != 4) {
+        return 0;
+    }
+    length = ((uint32_t) entry[1] << 16) | ((uint32_t) entry[2] << 8) | (uint32_t) entry[3];
+    *out = zend_string_init((const char *) (entry + 4), length, 0);
+    return 1;
+}
+
+/* A read of an undefined local warns as Zend does for a CV operand. Returns 0, after recording why,
+ * when the program names the local badly. Out of line: the defined case is the hot one. */
+static ENVELOCK_NOINLINE int envelock_vm_warn_undefined(envelock_vm *vm, uint16_t index)
+{
+    zend_string *name;
+    int kind = envelock_vm_constant_name(vm, (size_t) index + 1, &name);
+    if (kind < 0) {
+        envelock_vm_fail(vm, "an undefined local has no valid name");
+        return 0;
+    }
+    if (kind == 0 || ZSTR_LEN(name) < 2 || ZSTR_VAL(name)[0] != '$') {
+        if (name != NULL) {
+            zend_string_release(name);
+        }
+        envelock_vm_fail(vm, "an undefined local has an invalid name");
+        return 0;
+    }
+    zend_error(E_WARNING, "Undefined variable %s", ZSTR_VAL(name));
+    zend_string_release(name);
+    return 1;
 }
 
 static uint16_t envelock_vm_u16(const envelock_vm *vm, size_t at)
@@ -358,18 +420,9 @@ static int envelock_vm_read_local(envelock_vm *vm, uint16_t index, zval *copy)
         return 0;
     }
     if (Z_ISUNDEF(vm->locals[index])) {
-        zval name;
-        if (!envelock_vm_load_constant(vm, (size_t) index + 1, &name)) {
-            envelock_vm_fail(vm, "an undefined local has no valid name");
+        if (!envelock_vm_warn_undefined(vm, index)) {
             return 0;
         }
-        if (Z_TYPE(name) != IS_STRING || Z_STRLEN(name) < 2 || Z_STRVAL(name)[0] != '$') {
-            zval_ptr_dtor(&name);
-            envelock_vm_fail(vm, "an undefined local has an invalid name");
-            return 0;
-        }
-        zend_error(E_WARNING, "Undefined variable %s", Z_STRVAL(name));
-        zval_ptr_dtor(&name);
         ZVAL_NULL(copy);
         return 1;
     }
@@ -433,6 +486,12 @@ static int envelock_vm_fetch_mixed(envelock_vm *vm, zval *result)
     zval current;
     zval *value;
     int ok = 1;
+    if (count == 0) {
+        /* Refused by envelock_vm_validate_code before any instruction runs; stated here too, so this
+         * function never hands back a container it did not fetch from. */
+        envelock_vm_fail(vm, "a dimension fetch is malformed");
+        return 0;
+    }
     if (flags & 1u) {
         base_index = envelock_vm_u16(vm, at);
         at += 2;
@@ -562,26 +621,27 @@ static const char *const envelock_vm_frame_functions[] = {
  * 1.6-2.8% slower on a call-free loop with identical bytecode). */
 static ENVELOCK_NOINLINE void envelock_vm_init_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
 {
-    zval name_value;
+    zend_string *name;
     zend_string *lower_name;
     zend_function *function_entry;
     const char *const *frame;
     unsigned int i;
+    int kind;
 
     if (argc > 64) {
         envelock_vm_fail(vm, "the program calls a function with too many arguments");
         return;
     }
-    if (!envelock_vm_load_constant(vm, name_index, &name_value)) {
+    kind = envelock_vm_constant_name(vm, name_index, &name);
+    if (kind < 0) {
         envelock_vm_fail(vm, "the program calls a function whose name is malformed");
         return;
     }
-    if (Z_TYPE(name_value) != IS_STRING) {
+    if (kind == 0) {
         envelock_vm_fail(vm, "the program calls something that is not a name");
-        zval_ptr_dtor(&name_value);
         return;
     }
-    lower_name = zend_string_tolower(Z_STR(name_value));
+    lower_name = zend_string_tolower(name);
     for (frame = envelock_vm_frame_functions; *frame; frame++) {
         if (strcmp(ZSTR_VAL(lower_name), *frame) == 0) {
             envelock_vm_fail(vm, "the program calls a function that depends on its own frame");
@@ -590,7 +650,7 @@ static ENVELOCK_NOINLINE void envelock_vm_init_call(envelock_vm *vm, uint16_t na
     }
     function_entry = zend_hash_find_ptr(EG(function_table), lower_name);
     if (!function_entry) {
-        zend_throw_error(NULL, "Call to undefined function %s()", ZSTR_VAL(Z_STR(name_value)));
+        zend_throw_error(NULL, "Call to undefined function %s()", ZSTR_VAL(name));
         envelock_vm_fail(vm, "a virtualized operation threw");
         goto done;
     }
@@ -602,28 +662,29 @@ static ENVELOCK_NOINLINE void envelock_vm_init_call(envelock_vm *vm, uint16_t na
     }
 done:
     zend_string_release(lower_name);
-    zval_ptr_dtor(&name_value);
+    zend_string_release(name);
 }
 
 static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
 {
-    zval name_value, function, retval;
+    zval function, retval;
     zval params[64];
     uint8_t i;
     zend_string *name, *lower_name;
     zend_function *function_entry;
+    int kind;
 
     if (argc > 64) {
         envelock_vm_fail(vm, "the program calls a function with too many arguments");
         return;
     }
-    if (!envelock_vm_load_constant(vm, name_index, &name_value)) {
+    kind = envelock_vm_constant_name(vm, name_index, &name);
+    if (kind < 0) {
         envelock_vm_fail(vm, "the program calls a function whose name is malformed");
         return;
     }
-    if (Z_TYPE(name_value) != IS_STRING) {
+    if (kind == 0) {
         envelock_vm_fail(vm, "the program calls something that is not a name");
-        zval_ptr_dtor(&name_value);
         return;
     }
     /* Arguments were pushed left to right, so they come off right to left. */
@@ -636,12 +697,11 @@ static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
             for (j = i; j < argc; j++) {
                 zval_ptr_dtor(&params[j]);
             }
-            zval_ptr_dtor(&name_value);
+            zend_string_release(name);
             return;
         }
         params[i - 1] = *argument;
     }
-    name = Z_STR(name_value);
     lower_name = zend_string_tolower(name);
     /* OP_CALL must enforce the SAME restrictions as INIT_CALL (envelock_vm_init_call): a crafted
      * program that emits CALL (0x08) WITHOUT a preceding INIT would otherwise skip the frame-function
@@ -656,7 +716,7 @@ static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
                 for (i = 0; i < argc; i++) {
                     zval_ptr_dtor(&params[i]);
                 }
-                zval_ptr_dtor(&name_value);
+                zend_string_release(name);
                 return;
             }
         }
@@ -668,7 +728,7 @@ static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
         for (i = 0; i < argc; i++) {
             zval_ptr_dtor(&params[i]);
         }
-        zval_ptr_dtor(&name_value);
+        zend_string_release(name);
         return;
     }
     /* A by-reference parameter would receive a copy from the VM's stack, silently changing behaviour;
@@ -679,11 +739,11 @@ static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
             for (i = 0; i < argc; i++) {
                 zval_ptr_dtor(&params[i]);
             }
-            zval_ptr_dtor(&name_value);
+            zend_string_release(name);
             return;
         }
     }
-    ZVAL_STR_COPY(&function, name);
+    ZVAL_STR(&function, name);           /* the call's zval takes the reference */
     ZVAL_UNDEF(&retval);
     if (call_user_function(NULL, NULL, &function, &retval, argc, params) != SUCCESS) {
         envelock_vm_fail(vm, "a call made by the virtualized function failed");
@@ -692,25 +752,77 @@ static void envelock_vm_call(envelock_vm *vm, uint16_t name_index, uint8_t argc)
     for (i = 0; i < argc; i++) {
         zval_ptr_dtor(&params[i]);
     }
-    zval_ptr_dtor(&name_value);
     if (Z_TYPE(retval) == IS_UNDEF) {
         ZVAL_NULL(&retval);
     }
     envelock_vm_push(vm, &retval);
 }
 
-/* Runs one program. `args` are the function's parameters, positionally. Returns 1 and fills *out
- * with the return value, or 0 with a static reason in *error. */
-static int envelock_vm_execute(const unsigned char *program, size_t program_length,
-                               HashTable *args, zval *out, const char **error)
+/* A program made ready to run: decoded, its header and constant pool checked, its code validated and
+ * its constants indexed. Nothing in it changes while it runs, so repeated and recursive calls of the
+ * same virtualized function share one. Until 2026-11-17 all of this was redone on every call -- the
+ * base64 decode, both validation walks, the constant index -- plus 64 KiB of zeroed stack. */
+typedef struct _envelock_vm_program {
+    zend_string *bytes;                      /* the decoded program; the pointers below point into it */
+    const unsigned char **constant_offsets;
+    size_t constant_count;
+    size_t local_count;
+    const unsigned char *code;
+    size_t code_length;
+} envelock_vm_program;
+
+/* Programs prepared during this request, keyed by the encoded string the call passed. Request-scoped
+ * memory: emptied by envelock_vm_request_end() from the module's post-deactivate hook, forgotten (not
+ * freed: that request's memory is gone) by envelock_vm_request_start(). */
+ZEND_TLS HashTable *envelock_vm_cache = NULL;
+
+static void envelock_vm_program_free(envelock_vm_program *prepared)
 {
+    if (prepared->bytes) {
+        ZEND_SECURE_ZERO(ZSTR_VAL(prepared->bytes), ZSTR_LEN(prepared->bytes));
+        zend_string_release(prepared->bytes);
+        prepared->bytes = NULL;
+    }
+    if (prepared->constant_offsets) {
+        efree((void *) prepared->constant_offsets);
+        prepared->constant_offsets = NULL;
+    }
+}
+
+static void envelock_vm_cache_dtor(zval *entry)
+{
+    envelock_vm_program *prepared = (envelock_vm_program *) Z_PTR_P(entry);
+    envelock_vm_program_free(prepared);
+    efree(prepared);
+}
+
+void envelock_vm_request_start(void)
+{
+    envelock_vm_cache = NULL;
+}
+
+void envelock_vm_request_end(void)
+{
+    if (envelock_vm_cache) {
+        zend_hash_destroy(envelock_vm_cache);
+        FREE_HASHTABLE(envelock_vm_cache);
+        envelock_vm_cache = NULL;
+    }
+}
+
+/* Checks `bytes` (a decoded program) and fills *prepared, which then owns them. Returns 0 with a
+ * static reason in *error, and leaves `bytes` to the caller, when the program is malformed. */
+static int envelock_vm_prepare(zend_string *bytes, envelock_vm_program *prepared, const char **error)
+{
+    const unsigned char *program = (const unsigned char *) ZSTR_VAL(bytes);
+    size_t program_length = ZSTR_LEN(bytes);
     envelock_vm vm;
     size_t cursor, i;
     uint16_t constant_count, local_count;
     uint32_t code_length;
-    int returned = 0;
 
     *error = NULL;
+    memset(prepared, 0, sizeof(*prepared));
     /* v1's encoder and interpreter silently miscomputed valid PHP programs. Never run an old
      * virtualized package under the repaired loader as though it were compatible: repack it. */
     if (program_length >= 6 && memcmp(program, "ENVVM1", 6) == 0) {
@@ -784,12 +896,12 @@ static int envelock_vm_execute(const unsigned char *program, size_t program_leng
     }
     /* The pool has already been checked above. Index it once instead of scanning from the start
      * on every PUSH_CONST or CALL. The table points into the immutable decoded program. */
-    vm.constant_offsets = (const unsigned char **) ecalloc(constant_count ? constant_count : 1,
-                                                             sizeof(*vm.constant_offsets));
+    prepared->constant_offsets = (const unsigned char **) ecalloc(constant_count ? constant_count : 1,
+                                                                  sizeof(*prepared->constant_offsets));
     cursor = 10;
     for (i = 0; i < constant_count; i++) {
         const unsigned char *entry = program + cursor;
-        vm.constant_offsets[i] = entry;
+        prepared->constant_offsets[i] = entry;
         switch (*entry) {
             case 0: cursor += 1; break;
             case 1: cursor += 2; break;
@@ -798,7 +910,33 @@ static int envelock_vm_execute(const unsigned char *program, size_t program_leng
                                   | ((uint32_t) entry[2] << 8) | entry[3]); break;
         }
     }
-    vm.stack_size = ENVELOCK_VM_STACK_MAX;
+    prepared->bytes = bytes;
+    prepared->constant_count = constant_count;
+    prepared->local_count = local_count;
+    prepared->code = vm.code;
+    prepared->code_length = vm.code_length;
+    return 1;
+}
+
+/* Runs one prepared program. `args` are the function's parameters, positionally. Returns 1 and fills
+ * *out with the return value, or 0 with a static reason in *error. */
+static int envelock_vm_run(const envelock_vm_program *prepared, HashTable *args, zval *out,
+                           const char **error)
+{
+    envelock_vm vm;
+    size_t i, local_count = prepared->local_count;
+    int returned = 0;
+
+    *error = NULL;
+    memset(&vm, 0, sizeof(vm));
+    vm.constant_offsets = prepared->constant_offsets;
+    vm.constant_count = prepared->constant_count;
+    vm.code = prepared->code;
+    vm.code_length = prepared->code_length;
+    vm.stack_size = ENVELOCK_VM_STACK_FIRST;
+    /* Zeroed although no slot is read before it is written: the 16 first slots cost nothing to clear
+     * (the 64 KiB cleared on every call before was the cost), and a stack that is never undefined
+     * keeps the static analyser able to check the rest. */
     vm.stack = (zval *) ecalloc(vm.stack_size, sizeof(zval));
     vm.local_count = local_count;
     vm.locals = (zval *) ecalloc(local_count ? local_count : 1, sizeof(zval));
@@ -861,22 +999,13 @@ static int envelock_vm_execute(const unsigned char *program, size_t program_leng
                 {
                     zval copy;
                     if (Z_ISUNDEF(vm.locals[index])) {
-                        zval name;
-                        if (!envelock_vm_load_constant(&vm, (size_t) index + 1, &name)) {
-                            envelock_vm_fail(&vm, "an undefined local has no valid name");
-                            break;
-                        }
-                        if (Z_TYPE(name) != IS_STRING || Z_STRLEN(name) < 2 || Z_STRVAL(name)[0] != '$') {
-                            zval_ptr_dtor(&name);
-                            envelock_vm_fail(&vm, "an undefined local has an invalid name");
-                            break;
-                        }
                         /* Zend reads a variable operand inside the consuming operation, not at the
                          * fetch, and an exception from the warning is only raised after that
                          * operation has run. The read therefore continues with NULL, and the loop
                          * below stops after the next non-fetch opcode if an exception is pending. */
-                        zend_error(E_WARNING, "Undefined variable %s", Z_STRVAL(name));
-                        zval_ptr_dtor(&name);
+                        if (!envelock_vm_warn_undefined(&vm, index)) {
+                            break;
+                        }
                         ZVAL_NULL(&copy);
                     } else {
                         ZVAL_COPY(&copy, &vm.locals[index]);
@@ -1183,7 +1312,6 @@ static int envelock_vm_execute(const unsigned char *program, size_t program_leng
     }
     efree(vm.locals);
     efree(vm.stack);
-    efree(vm.constant_offsets);
     if (vm.failed) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
@@ -1197,15 +1325,16 @@ static int envelock_vm_execute(const unsigned char *program, size_t program_leng
  * to the function table, because ZEND_BEGIN_ARG_* emits a static array per translation unit. */
 PHP_FUNCTION(__envelock_vm)
 {
-    char *encoded;
-    size_t encoded_length;
+    zend_string *encoded;
     zval *args = NULL;
-    zend_string *program;
+    envelock_vm_program *prepared = NULL;
+    envelock_vm_program uncached;
     const char *error = NULL;
     zval result;
+    int ran;
 
     ZEND_PARSE_PARAMETERS_START(1, 2)
-        Z_PARAM_STRING(encoded, encoded_length)
+        Z_PARAM_STR(encoded)
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY(args)
     ZEND_PARSE_PARAMETERS_END();
@@ -1233,15 +1362,45 @@ PHP_FUNCTION(__envelock_vm)
 
     /* The program travels as base64 inside the protected source, which keeps it out of the way of
      * anything that expects printable text and lets --vault-strings treat it as one more literal. */
-    program = php_base64_decode((const unsigned char *) encoded, encoded_length);
-    if (!program) {
-        zend_throw_error(NULL, "Envelock: the virtualized program is not valid base64");
-        RETURN_THROWS();
+    /* A program is a pure function of its bytes, so one prepared earlier in this request for the same
+     * encoded string is the same program. The prepared copy is never modified while it runs, and it is
+     * a separate allocation, so a nested call that grows the table cannot move it. */
+    if (envelock_vm_cache) {
+        prepared = (envelock_vm_program *) zend_hash_find_ptr(envelock_vm_cache, encoded);
+    }
+    if (!prepared) {
+        zend_string *program = php_base64_decode((const unsigned char *) ZSTR_VAL(encoded),
+                                                  ZSTR_LEN(encoded));
+        if (!program) {
+            zend_throw_error(NULL, "Envelock: the virtualized program is not valid base64");
+            RETURN_THROWS();
+        }
+        if (!envelock_vm_prepare(program, &uncached, &error)) {
+            zend_string_release(program);
+            if (!EG(exception)) {
+                zend_throw_error(NULL, "Envelock: the virtualized function could not run: %s",
+                                 error ? error : "unknown reason");
+            }
+            RETURN_THROWS();
+        }
+        if (!envelock_vm_cache) {
+            ALLOC_HASHTABLE(envelock_vm_cache);
+            zend_hash_init(envelock_vm_cache, 8, NULL, envelock_vm_cache_dtor, 0);
+        }
+        if (zend_hash_num_elements(envelock_vm_cache) < ENVELOCK_VM_CACHE_MAX) {
+            prepared = (envelock_vm_program *) emalloc(sizeof(*prepared));
+            *prepared = uncached;
+            zend_hash_add_new_ptr(envelock_vm_cache, encoded, prepared);
+        } else {
+            prepared = &uncached;            /* freed after this call, as before the cache */
+        }
     }
     ZVAL_NULL(&result);
-    if (!envelock_vm_execute((const unsigned char *) ZSTR_VAL(program), ZSTR_LEN(program),
-            args ? Z_ARRVAL_P(args) : NULL, &result, &error)) {
-        zend_string_release(program);
+    ran = envelock_vm_run(prepared, args ? Z_ARRVAL_P(args) : NULL, &result, &error);
+    if (prepared == &uncached) {
+        envelock_vm_program_free(&uncached);
+    }
+    if (!ran) {
         /* Preserve an exception raised by the PHP operation or its error handler; replacing it
          * with a generic VM error silently changes catch behavior. */
         if (!EG(exception)) {
@@ -1250,6 +1409,5 @@ PHP_FUNCTION(__envelock_vm)
         }
         RETURN_THROWS();
     }
-    zend_string_release(program);
     RETURN_ZVAL(&result, 0, 0);
 }

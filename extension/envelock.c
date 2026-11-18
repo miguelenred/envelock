@@ -100,8 +100,11 @@ static struct {
 ZEND_BEGIN_MODULE_GLOBALS(envelock)
     HashTable verified;
     HashTable keys;
+    HashTable packages;          /* per WORKER: container SHA-256 -> its package digest (32 bytes) */
     HashTable loaded;
     HashTable roots;
+    HashTable releases;          /* per-REQUEST (project|developer) -> first release seen, to refuse an
+                                  * old release reached through a directory symlink (release-mixing, C-11). */
     HashTable litvault;          /* filename -> array of this file's vaulted string literals (FLAG_VAULT) */
     HashTable litvault_enc;      /* filename -> envelock_enc_vault (FLAG_VAULT_ENC, objective O7) */
     HashTable sealed_roots;      /* per-WORKER set of every sealed-package root this worker has seen,
@@ -109,9 +112,19 @@ ZEND_BEGIN_MODULE_GLOBALS(envelock)
                                   * has not yet loaded a sealed file (closes an order-dependent gap). */
     zend_bool request_ready;
     int sealed_active;            /* >0 once a sealed package has loaded this request */
+    zend_bool clock_synced;       /* the anti-rollback record was re-read from disk this request */
+    const void *hook_seen;        /* per request: the zend_compile_file last classified ... */
+    int hook_own;                 /* ... and whether its code is PHP's own OPcache/Phar (HOST-1) */
+    uint32_t debugger_modules;    /* per request: module count the debugger answer was taken at ... */
+    const char *debugger_found;   /* ... and the debugger/profiler module found then (or NULL) */
 ZEND_END_MODULE_GLOBALS(envelock)
 ZEND_DECLARE_MODULE_GLOBALS(envelock)
 #define ENVELOCK_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(envelock, v)
+
+static void envelock_vault_wipe(zval *list);   /* destructor of the per-request plain vaults */
+static zend_string *envelock_lexical_norm(zend_string *name);
+void envelock_vm_request_start(void);   /* envelock_vm.c: its per-request table of prepared programs */
+void envelock_vm_request_end(void);
 
 /* Memory hardening (envelock.harden_memory); defined with the helpers further down. */
 static int envelock_harden_enabled = 0;
@@ -126,6 +139,11 @@ static void envelock_key_dtor(zval *zv)
     pefree(key, 1);
 }
 
+static void envelock_package_dtor(zval *zv)
+{
+    pefree(Z_PTR_P(zv), 1);              /* a digest of public header fields, nothing secret */
+}
+
 static PHP_GINIT_FUNCTION(envelock)
 {
 #if defined(COMPILE_DL_ENVELOCK) && defined(ZTS)
@@ -133,15 +151,22 @@ static PHP_GINIT_FUNCTION(envelock)
 #endif
     zend_hash_init(&envelock_globals->verified, 64, NULL, NULL, 1);
     zend_hash_init(&envelock_globals->keys, 8, NULL, envelock_key_dtor, 1);
+    zend_hash_init(&envelock_globals->packages, 64, NULL, envelock_package_dtor, 1);
     zend_hash_init(&envelock_globals->sealed_roots, 4, NULL, NULL, 1);
     envelock_globals->request_ready = 0;
     envelock_globals->sealed_active = 0;   /* not zeroed by TSRM on every platform (ZTS) */
+    envelock_globals->clock_synced = 0;
+    envelock_globals->hook_seen = NULL;
+    envelock_globals->hook_own = 0;
+    envelock_globals->debugger_modules = UINT32_MAX;
+    envelock_globals->debugger_found = NULL;
 }
 
 static PHP_GSHUTDOWN_FUNCTION(envelock)
 {
     zend_hash_destroy(&envelock_globals->verified);
     zend_hash_destroy(&envelock_globals->keys);   /* cleanses every cached key */
+    zend_hash_destroy(&envelock_globals->packages);
     zend_hash_destroy(&envelock_globals->sealed_roots);
 }
 
@@ -180,20 +205,22 @@ static int envelock_ed25519_small_order(const unsigned char key[32])
  * verified it in *signer: that identity is bound into the per-folder/per-file tracking so a
  * developer cannot pass off a container under another developer's project (ENV-04). The signer
  * index is stored in the verified cache (as index+1) so a cache hit still returns it. */
-static int envelock_signature_ok(const unsigned char *blob, size_t length, int *signer)
+static int envelock_signature_ok(const unsigned char *blob, size_t length, int *signer,
+                                 unsigned char digest[32])
 {
-    unsigned char digest[32];
     void *cached;
     int s;
+    /* `digest` is a parameter, so sizeof(digest) would be a pointer's size: the cache key is the
+     * whole 32-byte SHA-256, spelled out (a draft of this change keyed it by 8 bytes). */
     if (!envelock_sha256(blob, length, digest)) return 0;
-    cached = zend_hash_str_find_ptr(&ENVELOCK_G(verified), (const char *)digest, sizeof(digest));
+    cached = zend_hash_str_find_ptr(&ENVELOCK_G(verified), (const char *)digest, 32);
     if (cached) { *signer = (int)(uintptr_t)cached - 1; return 1; }
     for (s = 0; s < envelock_identity.signer_count; s++) {
         if (envelock_verify(blob, length, envelock_identity.signing_public[s])) {
             if (zend_hash_num_elements(&ENVELOCK_G(verified)) >= ENVELOCK_VERIFIED_MAX) {
                 zend_hash_clean(&ENVELOCK_G(verified));
             }
-            zend_hash_str_update_ptr(&ENVELOCK_G(verified), (const char *)digest, sizeof(digest),
+            zend_hash_str_update_ptr(&ENVELOCK_G(verified), (const char *)digest, 32,
                                      (void *)(uintptr_t)(s + 1));
             *signer = s;
             return 1;
@@ -206,12 +233,37 @@ static int envelock_signature_ok(const unsigned char *blob, size_t length, int *
  * plaintext), reusing or learning its package key. The key is stored BEFORE any plaintext
  * exists: an out-of-memory bailout in the cache insert cannot strand decrypted bytes. On
  * failure out must be cleared by the caller. */
+/* The package digest of a container whose SHA-256 is `container` (computed by envelock_signature_ok
+ * for these very bytes). It hashed the whole recipient table again for every protected file -- up to
+ * 127 KB with 1 024 recipients -- although it is a function of the bytes, which `container` already
+ * identifies; it is remembered per worker now (audit 2026-11-17). */
+static int envelock_package_of(const unsigned char *blob, size_t length,
+                               const unsigned char container[32], unsigned char package[32])
+{
+    unsigned char *known = zend_hash_str_find_ptr(&ENVELOCK_G(packages), (const char *)container, 32);
+    if (known) {
+        memcpy(package, known, 32);
+        return 1;
+    }
+    if (!envelock_package_digest(blob, length, package)) return 0;
+    if (zend_hash_num_elements(&ENVELOCK_G(packages)) >= ENVELOCK_VERIFIED_MAX) {
+        zend_hash_clean(&ENVELOCK_G(packages));
+    }
+    known = pemalloc(32, 1);
+    memcpy(known, package, 32);
+    if (!zend_hash_str_add_ptr(&ENVELOCK_G(packages), (const char *)container, 32, known)) {
+        pefree(known, 1);
+    }
+    return 1;
+}
+
 static int envelock_open(const unsigned char *blob, size_t length,
-    unsigned char *out, size_t capacity, size_t *out_length, unsigned char key_out[32])
+    unsigned char *out, size_t capacity, size_t *out_length, unsigned char key_out[32],
+    const unsigned char container[32])
 {
     unsigned char package[32], key[32];
     const unsigned char *cached = NULL;
-    int r, found = 0, ok, have_package = envelock_package_digest(blob, length, package);
+    int r, found = 0, ok, have_package = envelock_package_of(blob, length, container, package);
     if (have_package) {
         cached = zend_hash_str_find_ptr(&ENVELOCK_G(keys), (const char *)package, sizeof(package));
     }
@@ -331,6 +383,16 @@ PHP_INI_BEGIN()
      * fails closed on the first request instead of silently caching decrypted opcodes. file_cache
      * and preloading are always refused, since they persist decrypted opcodes to disk / SHM. */
     PHP_INI_ENTRY("envelock.allow_opcache", "0", PHP_INI_SYSTEM, NULL)
+    /* Whether this loader will run BYTECODE packages (pack --bytecode). A bytecode image is executed
+     * by the engine right after deserialization, so it is as powerful as native code from its signer:
+     * the deserializer is a signed-input trust boundary (docs/AUDITORIA.md), fine for a single trusted
+     * developer but a larger surface on a host that runs packages from several developers. Default on
+     * so existing bytecode deployments keep working; a multi-developer server can set it to 0 to accept
+     * SOURCE packages only, which keep every per-opcode safety the engine normally applies (audit
+     * 2026-11, C-16). Source packages are unaffected by this directive. */
+    /* "" = auto: bytecode allowed on a single-developer host, refused on a multi-developer host unless
+     * the operator opts in (C-16). An explicit "0"/"1" overrides the auto choice. */
+    PHP_INI_ENTRY("envelock.allow_bytecode", "", PHP_INI_SYSTEM, NULL)
     /* Paths allowed to run as PLAIN PHP under a --sealed tree: a PATH_SEPARATOR-separated list of
      * absolute path prefixes. A sealed package refuses all cleartext PHP by default; a CMS, however,
      * legitimately runs some cleartext under its tree — its config file and the PHP it GENERATES at
@@ -406,6 +468,7 @@ PHP_INI_END()
 #define ENVELOCK_ID_DEVELOPER 64U
 #define ENVELOCK_ID_MINIMUM 56U       /* developer_pub 32 | project 16 | serial 8 */
 #define ENVELOCK_ID_MINIMUM_V2 24U    /* legacy: project 16 | serial 8 */
+#define ENVELOCK_ID_CHECKSUM 32U      /* C-29: SHA-256 trailing an ENVLKID4 (1.1) identity file */
 #define ENVELOCK_IDENTITY_MAX_FILE (ENVELOCK_ID_HEADER + \
     (unsigned)ENVELOCK_MAX_RECIPIENTS_ID * ENVELOCK_ID_RECIPIENT + \
     (unsigned)ENVELOCK_MAX_DEVELOPERS * ENVELOCK_ID_DEVELOPER + \
@@ -414,10 +477,11 @@ static const char *envelock_load_identity(const char *path)
 {
     static const unsigned char magic[8] = {'E', 'N', 'V', 'L', 'K', 'I', 'D', '3'};
     static const unsigned char magic_v2[8] = {'E', 'N', 'V', 'L', 'K', 'I', 'D', '2'};
+    static const unsigned char magic_v4[8] = {'E', 'N', 'V', 'L', 'K', 'I', 'D', '4'};
     static const unsigned char zero32[32] = {0};
-    /* One byte larger than the maximum valid file, so an over-long file is detected
-     * without reading past the buffer. */
-    unsigned char buffer[ENVELOCK_IDENTITY_MAX_FILE + 1];
+    /* One byte larger than the maximum valid file, so an over-long file is detected without reading past
+     * the buffer. +32 for an ENVLKID4 (1.1) file's trailing SHA-256 checksum (C-29). */
+    unsigned char buffer[ENVELOCK_IDENTITY_MAX_FILE + ENVELOCK_ID_CHECKSUM + 1];
     const unsigned char *recipients, *developers, *minimums;
     const char *insecure;
     FILE *file;
@@ -439,12 +503,30 @@ static const char *envelock_load_identity(const char *path)
     }
     got = fread(buffer, 1, sizeof(buffer), file);
     fclose(file);
-    if (got < ENVELOCK_ID_HEADER || got > ENVELOCK_IDENTITY_MAX_FILE ||
-        (memcmp(buffer, magic, 8) != 0 && memcmp(buffer, magic_v2, 8) != 0)) {
+    if (got < ENVELOCK_ID_HEADER || got > ENVELOCK_IDENTITY_MAX_FILE + ENVELOCK_ID_CHECKSUM ||
+        (memcmp(buffer, magic, 8) != 0 && memcmp(buffer, magic_v2, 8) != 0 &&
+         memcmp(buffer, magic_v4, 8) != 0)) {
         OPENSSL_cleanse(buffer, sizeof(buffer));
         return "malformed (not an Envelock identity file)";
     }
-    has_dev = (memcmp(buffer, magic, 8) == 0);               /* v3 binds minimums to a developer */
+    /* C-29: an ENVLKID4 (1.1) file ends in a SHA-256 of everything before it, so a bit flip — e.g. in a
+     * minimum serial, which the old format accepted silently — is caught. Verify it and drop it; what
+     * remains is exactly the pre-1.1 (ENVLKID3) layout the rest of this function parses. */
+    if (memcmp(buffer, magic_v4, 8) == 0) {
+        unsigned char sum[32];
+        if (got < ENVELOCK_ID_HEADER + ENVELOCK_ID_CHECKSUM ||
+            !envelock_sha256(buffer, got - ENVELOCK_ID_CHECKSUM, sum) ||
+            CRYPTO_memcmp(sum, buffer + got - ENVELOCK_ID_CHECKSUM, ENVELOCK_ID_CHECKSUM) != 0) {
+            OPENSSL_cleanse(buffer, sizeof(buffer));
+            return "the identity file checksum does not match (corrupted or truncated)";
+        }
+        got -= ENVELOCK_ID_CHECKSUM;
+    }
+    if (got > ENVELOCK_IDENTITY_MAX_FILE) {                  /* body bound, after any checksum was dropped */
+        OPENSSL_cleanse(buffer, sizeof(buffer));
+        return "malformed (not an Envelock identity file)";
+    }
+    has_dev = (memcmp(buffer, magic, 8) == 0) || (memcmp(buffer, magic_v4, 8) == 0);  /* v3/v4 bind minimums */
     min_stride = has_dev ? ENVELOCK_ID_MINIMUM : ENVELOCK_ID_MINIMUM_V2;
     rc = ((unsigned int)buffer[8] << 8) | (unsigned int)buffer[9];
     dc = ((unsigned int)buffer[10] << 8) | (unsigned int)buffer[11];
@@ -663,22 +745,34 @@ static zend_result envelock_post_startup(void)
     return SUCCESS;
 }
 
+/* envelock_compile_hook_is_php_own() for the hook in place now, remembered for the request: it walks
+ * every loaded image (dl_iterate_phdr) two to four times, and it ran for every protected file. The
+ * code a function pointer belongs to cannot change while that pointer stays the hook (no module is
+ * unloaded during a request), and a different hook is classified afresh. */
+static int envelock_hook_is_php_own_now(void)
+{
+    if (ENVELOCK_G(hook_seen) != (const void *) zend_compile_file) {
+        ENVELOCK_G(hook_own) = envelock_compile_hook_is_php_own();
+        ENVELOCK_G(hook_seen) = (const void *) zend_compile_file;
+    }
+    return ENVELOCK_G(hook_own);
+}
+
 static const char *envelock_integrity_check(void)
 {
     /* A compile hook installed above ours receives the handle Envelock has just decrypted, which
      * defeats the whole loader, and there is no name to look for: catching it means noticing that
      * zend_compile_file is no longer the function we put there at MINIT.
      *
-     * One legitimate exception, and it is not a compromise so much as the shape of the engine:
-     * OPcache re-asserts itself as the outermost compile hook and Envelock cannot sit above it
-     * (see envelock_shm_cache). So an operator who has opted into envelock.allow_opcache — which
-     * asserts they blacklisted the protected tree, and which the loader separately enforces per
-     * file — has already accepted a hook above this one, and refusing here would only contradict
-     * that. The other exception is a hook whose code is PHP's own OPcache or Phar
-     * (envelock_compile_hook_is_php_own, HOST-1). Anyone else gets the strict answer. */
+     * The only exception is a hook whose code is PHP's own OPcache or Phar
+     * (envelock_compile_hook_is_php_own, HOST-1) -- which is also what lets envelock.allow_opcache
+     * work, since OPcache re-asserts itself as the outermost compile hook (see envelock_shm_cache) --
+     * and only when no foreign hook was found at start-up. Anyone else gets the strict answer.
+     * (Until 2026-11-17 allow_opcache=1 with OPcache caching skipped this whole check, so ANY hook
+     * -- ionCube, SourceGuardian, one installed at RINIT -- was accepted in the recommended
+     * production setup: HOST-1's "refused for good" did not hold there.) */
     if (envelock_own_compile_file != NULL && zend_compile_file != envelock_own_compile_file &&
-        !(ENVELOCK_INI_BOOL("envelock.allow_opcache") && envelock_shm_cache()) &&
-        (envelock_foreign_hook_at_startup || !envelock_compile_hook_is_php_own())) {
+        (envelock_foreign_hook_at_startup || !envelock_hook_is_php_own_now())) {
         return "another extension installed a compile hook above Envelock's";
     }
     /* A zend_ast_process hook walks the syntax tree of every file that is compiled. envelock_debugger()
@@ -691,10 +785,14 @@ static const char *envelock_integrity_check(void)
     /* A tracer attached with ptrace(2) can read the decrypted source out of memory and can stop the
      * process between the decryption and the compilation. envelock.harden_memory blocks a same-uid
      * attach, but not one by a tracer that already has CAP_SYS_PTRACE, and not one that was already
-     * attached before the flag was set. -1 means "could not determine" and is not a refusal: on a
-     * platform without /proc/self/status there is nothing to answer from, and saying "traced" would
-     * break every deployment there. */
-    if (envelock_tracer_pid() > 0) return "the process is being traced (ptrace attached)";
+     * attached before the flag was set. On Windows the same question is "is a debugger attached?"
+     * (IsDebuggerPresent / CheckRemoteDebuggerPresent; until 2026-11-17 Windows answered -1 here, so
+     * paranoid mode never refused a debugged php.exe or w3wp.exe). -1 means "could not determine" and
+     * is not a refusal: on a platform with neither there is nothing to answer from, and saying
+     * "traced" would break every deployment there. */
+    if (envelock_tracer_pid() > 0) {
+        return "the process is being traced (a debugger or ptrace tracer is attached)";
+    }
     /* A replacement of zend_execute_ex runs for every op_array; the interrupt handler runs at
      * every VM interrupt. Both see the program after Envelock has decrypted it. execute_ex is
      * compared against the engine's own, which is what "not hooked" means; the interrupt handler
@@ -724,13 +822,24 @@ static const char *envelock_debugger(void)
     static const char *const names[] = {"xdebug", "vld", "uopz", "runkit7", "xhprof",
         "tideways", "tideways_xhprof", "ddtrace", "spx", "pcov", "blackfire", "memprof"};
     size_t i;
+    uint32_t modules = zend_hash_num_elements(&module_registry);
     if (sapi_module.name && strcmp(sapi_module.name, "phpdbg") == 0) return "phpdbg";
     /* An AST process hook receives the full syntax tree of every compiled file. */
     if (zend_ast_process != NULL) return "a zend_ast_process hook";
+    /* The twelve registry lookups ran for every protected file. Within a request modules are only
+     * ever ADDED (dl()), which changes the count, so the answer is remembered for this request and
+     * this count; RINIT forgets it, because a dl() module is unloaded at the end of its request and
+     * another one may come back under the same count (audit 2026-11-17). */
+    if (ENVELOCK_G(debugger_modules) == modules) return ENVELOCK_G(debugger_found);
+    ENVELOCK_G(debugger_found) = NULL;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (zend_hash_str_exists(&module_registry, names[i], strlen(names[i]))) return names[i];
+        if (zend_hash_str_exists(&module_registry, names[i], strlen(names[i]))) {
+            ENVELOCK_G(debugger_found) = names[i];
+            break;
+        }
     }
-    return NULL;
+    ENVELOCK_G(debugger_modules) = modules;
+    return ENVELOCK_G(debugger_found);
 }
 
 /* FFI and dl() let PHP running in this process read the decrypted source straight out of memory
@@ -876,10 +985,21 @@ static const char *envelock_check_manifest(const char *name, size_t root, const 
         if (file) fclose(file);
         return "manifest enforcement: " ENVELOCK_MANIFEST_NAME " is missing or not a regular file";
     }
-    buf = (unsigned char *)malloc(ENVELOCK_MANIFEST_MAX + 1);
-    if (!buf) { fclose(file); return "manifest enforcement: out of memory"; }
-    len = fread(buf, 1, ENVELOCK_MANIFEST_MAX + 1, file);
-    fclose(file);
+    /* Sized from the file, not the 16 MiB maximum: this runs once per package on EVERY request, and a
+     * fixed 16 MiB buffer meant an mmap and an munmap of 16 MiB each time for a manifest of a few kB
+     * (audit 2026-11-17). Anything past the maximum is still read (one byte more) and refused below. */
+    {
+        long long size = envelock_file_size(file);
+        size_t cap = (size < 0 || (unsigned long long)size >= ENVELOCK_MANIFEST_MAX)
+                     ? (size_t)ENVELOCK_MANIFEST_MAX + 1 : (size_t)size + 1;
+        buf = (unsigned char *)malloc(cap);
+        if (!buf) { fclose(file); return "manifest enforcement: out of memory"; }
+        len = fread(buf, 1, cap, file);
+        fclose(file);
+        if (size >= 0 && (unsigned long long)size < ENVELOCK_MANIFEST_MAX && len > (size_t)size) {
+            reason = "manifest enforcement: the manifest changed while it was being read"; goto done;
+        }
+    }
     /* magic(8) ver(1) rsv(1) project(16) release(16) serial(8) count(4) [entries] sig(64) */
     if (len == 0 || len > ENVELOCK_MANIFEST_MAX ||
         len < 54 + ENVELOCK_SIG_SIZE || memcmp(buf, "ENVLKMAN", 8) != 0 || buf[8] != 2) {
@@ -891,9 +1011,39 @@ static const char *envelock_check_manifest(const char *name, size_t root, const 
      * delete A's security files (guard.php, middleware) while passing enforcement (ENV-2026-25). The
      * package's developer is `dev`; accept only signer slots that belong to that developer (its primary
      * and recovery keys are equivalent — same developer index). */
-    for (s = 0; s < envelock_identity.signer_count; s++) {
-        if (dev >= 0 && envelock_identity.signer_developer_index[s] == dev &&
-            envelock_verify(buf, len, envelock_identity.signing_public[s])) { ok = 1; break; }
+    /* The signature is verified once per worker, like a container's: this runs for EVERY request (once
+     * per package), and with the manifest on by default each request paid a full Ed25519 verification
+     * (~120-155 us) per package for bytes it had already verified (audit 2026-11-17). The verified
+     * cache records SHA-256(manifest) -- under a 33-byte key ending in 'M', so it can never match a
+     * container's 32-byte entry -- with the signer slot; the trust store is fixed for the process, so
+     * identical bytes verify identically. The bytes are still read and hashed, and the release
+     * binding and the per-file presence checks below still run, on every request. */
+    {
+        unsigned char mkey[33];
+        int have_key = envelock_sha256(buf, len, mkey);
+        mkey[32] = 'M';
+        if (have_key) {
+            void *hit = zend_hash_str_find_ptr(&ENVELOCK_G(verified), (const char *)mkey, sizeof(mkey));
+            if (hit) {
+                s = (int)(uintptr_t)hit - 1;
+                ok = dev >= 0 && s >= 0 && s < envelock_identity.signer_count &&
+                     envelock_identity.signer_developer_index[s] == dev;
+            }
+        }
+        for (s = ok ? s : 0; !ok && s < envelock_identity.signer_count; s++) {
+            if (dev >= 0 && envelock_identity.signer_developer_index[s] == dev &&
+                envelock_verify(buf, len, envelock_identity.signing_public[s])) {
+                ok = 1;
+                if (have_key) {
+                    if (zend_hash_num_elements(&ENVELOCK_G(verified)) >= ENVELOCK_VERIFIED_MAX) {
+                        zend_hash_clean(&ENVELOCK_G(verified));
+                    }
+                    zend_hash_str_update_ptr(&ENVELOCK_G(verified), (const char *)mkey, sizeof(mkey),
+                                             (void *)(uintptr_t)(s + 1));
+                }
+                break;
+            }
+        }
     }
     if (!ok) { reason = "manifest enforcement: the manifest is not signed by the package's own developer"; goto done; }
     /* Bind the manifest to THIS package's release: project at offset 10, release at 26 (see
@@ -945,6 +1095,21 @@ static const char *envelock_check_manifest(const char *name, size_t root, const 
             free(entry);
             reason = "manifest enforcement: a file listed in the signed manifest is missing, a symlink, or not a regular file (the package is incomplete or tampered)";
             goto done;
+        }
+        /* The per-request check is existence + regular-file only (re-hashing every file each request
+         * would be too costly, H-04). That let a protected file be truncated to 0 bytes — it still
+         * "exists" as a regular file — and slip through, failing later with a confusing "class not
+         * found". Catch the zero-length case for free from the lstat we already did: a 0-byte file is
+         * tampered unless the signed manifest recorded it as empty (audit 2026-11, C-22). */
+        if (st.st_size == 0) {
+            static const unsigned char EMPTY_SHA256[32] = {
+                0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
+                0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55};
+            if (memcmp(buf + off + plen, EMPTY_SHA256, 32) != 0) {
+                free(entry);
+                reason = "manifest enforcement: a file in the signed manifest is empty but should not be (truncated or tampered)";
+                goto done;
+            }
         }
         free(entry);
         off += plen + 32;
@@ -1051,22 +1216,34 @@ static int envelock_parse_vault(const unsigned char *text, size_t total, zval *v
     pos += 4;
     if (count > (table_bytes - 4) / 4) return 0;      /* each entry is at least a 4-byte length */
     array_init(vault);
-    for (i = 0; i < count; i++) {
-        uint32_t len;
-        if (pos + 4 > table_end) goto bad;
-        len = envelock_be32(text + pos);
-        pos += 4;
-        if (len > table_end - pos) goto bad;
-        add_index_stringl(vault, (zend_ulong)i, (const char *)text + pos, len);
-        pos += len;
+    {
+        volatile int ok = 1;
+        /* The copies are decrypted literals: if the request runs out of memory half-way through
+         * (an allocation bails out), the ones already made are wiped before the bail-out goes on. */
+        zend_try {
+            for (i = 0; i < count; i++) {
+                uint32_t len;
+                if (pos + 4 > table_end) { ok = 0; break; }
+                len = envelock_be32(text + pos);
+                pos += 4;
+                if (len > table_end - pos) { ok = 0; break; }
+                add_index_stringl(vault, (zend_ulong)i, (const char *)text + pos, len);
+                pos += len;
+            }
+        } zend_catch {
+            envelock_vault_wipe(vault);
+            ZVAL_UNDEF(vault);
+            _zend_bailout("envelock.c", __LINE__);
+        } zend_end_try();
+        if (!ok) {
+            envelock_vault_wipe(vault);      /* decrypted literals: wiped before they are freed */
+            ZVAL_UNDEF(vault);
+            return 0;
+        }
     }
     *source_off = table_end;
     *source_len = total - table_end;
     return 1;
-bad:
-    zval_ptr_dtor(vault);
-    ZVAL_UNDEF(vault);
-    return 0;
 }
 
 /* Objective O7: parse the encrypted vault prefix (see envelock_enc_vault). Same contract as
@@ -1084,11 +1261,12 @@ static int envelock_parse_vault_enc(const unsigned char *text, size_t total,
     *out = NULL;
     /* `total` is the container's PLAINTEXT, which carries no signature: the tag was consumed by
      * the container decryption. Only the 4-byte length prefix and the table have to fit in it, so
-     * anything past `total - 8` is malformed or truncated. Subtracting the signature size here
-     * (as an earlier draft did) rejected every table smaller than 64 bytes of slack. */
+     * anything past `total - 4` is malformed or truncated; the source after it may be EMPTY, as in
+     * the plain vault. (`total - 8`, used until 2026-11-17, refused every source under 4 bytes, and
+     * subtracting the signature size, as an earlier draft did, every table under 64 bytes of slack.) */
     if (total < 8) return 0;
     table_bytes = envelock_be32(text);
-    if (table_bytes < 4 + 12 + 48 || table_bytes > total - 8) return 0;
+    if (table_bytes < 4 + 12 + 48 || table_bytes > total - 4) return 0;
     pos = 4;
     table_end = 4 + (size_t)table_bytes;
     if (table_end > total) return 0;
@@ -1105,6 +1283,11 @@ static int envelock_parse_vault_enc(const unsigned char *text, size_t total,
     v->offsets = ecalloc(count ? count : 1, sizeof(*v->offsets));
     v->values = ecalloc(count ? count : 1, sizeof(*v->values));
     if (!v->offsets || !v->values) goto fail;
+    /* Every allocation BEFORE the data key exists: an out-of-memory bail-out after the unwrap would
+     * leave the key in a vault nobody frees (audit 2026-11-17). Filled in at the end. */
+    v->table_length = (size_t)table_bytes;
+    v->table = emalloc(v->table_length);
+    if (!v->table) goto fail;
 
     /* key_nonce 12 | wrapped_key 48 (32-byte key + 16-byte tag), authenticated by GCM. */
     if (pos + 12 + 48 > table_end) goto fail;
@@ -1122,7 +1305,9 @@ static int envelock_parse_vault_enc(const unsigned char *text, size_t total,
         len = envelock_be32(text + pos);
         pos += 4;
         /* len covers nonce(12) + tag(16) + ciphertext, so a zero-length literal still costs 28. */
-        if (len < 12 + 16 || pos + len > table_end) {
+        /* `len > table_end - pos`, not `pos + len > table_end`: with a 32-bit size_t the sum wraps
+         * for a signer-crafted length and then drives an emalloc of ~4 GiB (audit 2026-11-17). */
+        if (len < 12 + 16 || len > table_end - pos) {
             goto fail; }
         /* Relative to the table body, which starts at text+4 — the part v->table is a copy of,
          * so the offsets stay valid after the copy. Entry 0 lands at 4+12+48 = 64. */
@@ -1133,9 +1318,6 @@ static int envelock_parse_vault_enc(const unsigned char *text, size_t total,
 
     /* Copy the table out: `text` is the decrypted container, which is wiped when the compile
      * finishes, and the vault has to outlive it for the whole request. */
-    v->table_length = (size_t)table_bytes;
-    v->table = emalloc(v->table_length);
-    if (!v->table) goto fail;
     memcpy(v->table, text + 4, v->table_length);
 
     *source_off = table_end;
@@ -1169,7 +1351,7 @@ static zend_string *envelock_enc_vault_get(envelock_enc_vault *v, uint32_t idx)
     if (v->offsets[idx] < 4 || v->offsets[idx] + 4 > v->table_length) return NULL;
     entry = v->table + v->offsets[idx];
     len = envelock_be32(entry - 4);
-    if (len < 12 + 16 || v->offsets[idx] + (size_t)len > v->table_length) return NULL;
+    if (len < 12 + 16 || (size_t)len > v->table_length - v->offsets[idx]) return NULL;   /* no wrap */
     cipher_len = (size_t)len - 12 - 16;
 
     plain = emalloc(cipher_len + 1);
@@ -1189,6 +1371,47 @@ static zend_string *envelock_enc_vault_get(envelock_enc_vault *v, uint32_t idx)
     if (!result) return NULL;
     v->values[idx] = result;
     return result;
+}
+
+/* An absolute path: '/...' on POSIX; on Windows also '\...', 'C:\...' or 'C:/...'. */
+static int envelock_path_is_absolute(const zend_string *name)
+{
+    const char *p = ZSTR_VAL(name);
+    size_t n = ZSTR_LEN(name);
+    if (n > 0 && p[0] == '/') return 1;
+#ifdef PHP_WIN32
+    if (n > 0 && p[0] == '\\') return 1;
+    if (n > 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':'
+        && (p[2] == '/' || p[2] == '\\')) return 1;
+#endif
+    return 0;
+}
+
+/* C-11's "was a directory symlink traversed to reach this file?". The resolved path (opened_path, a
+ * realpath) is compared with the requested name LEXICALLY normalised ('.', '..' and repeated
+ * separators; on Windows also case and '\' against '/', envelock_path_char): only a link makes the two
+ * differ. The raw comparison used before was true for every path with '..' in it (Composer's
+ * __DIR__ . '/../vendor/...') and, on Windows, for nearly every include (mixed separators), so a
+ * second release of one project+developer in a request -- the ENV-AUD-17 hotfix module reached by its
+ * real path -- was refused as release-mixing (audit 2026-11-17). A RELATIVE name was resolved through
+ * include_path or the current folder, which cannot be reproduced here: it still counts as reached
+ * through a link (the conservative answer, as before). */
+static int envelock_reached_through_link(zend_file_handle *file_handle)
+{
+    zend_string *norm;
+    size_t i;
+    int differs;
+    if (!file_handle->filename || !file_handle->opened_path) return 0;
+    if (zend_string_equals(file_handle->filename, file_handle->opened_path)) return 0;
+    if (!envelock_path_is_absolute(file_handle->filename)) return 1;
+    norm = envelock_lexical_norm(file_handle->filename);
+    differs = ZSTR_LEN(norm) != ZSTR_LEN(file_handle->opened_path);
+    for (i = 0; !differs && i < ZSTR_LEN(norm); i++) {
+        if (envelock_path_char((unsigned char)ZSTR_VAL(norm)[i]) !=
+            envelock_path_char((unsigned char)ZSTR_VAL(file_handle->opened_path)[i])) differs = 1;
+    }
+    zend_string_release(norm);
+    return differs;
 }
 
 /* Checks that need the (already verified) header, made BEFORE any decryption. Returns NULL or
@@ -1248,6 +1471,37 @@ static const char *envelock_policy(const envelock_header *h, zend_file_handle *f
         if (h->flags & ENVELOCK_FLAG_ENFORCE_MANIFEST) {
             const char *bad = envelock_check_manifest(ZSTR_VAL(name), root, h, dev);
             if (bad) { zend_string_release(key); return bad; }
+        }
+        /* C-11: a subfolder swapped for a symlink to an OLD release of the same project+developer runs
+         * the old file. Each file is at the path it was packaged with and its own folder is
+         * self-consistent, so the per-folder `roots` check above never sees the mix. Refuse ONLY when
+         * BOTH hold:
+         *   (1) a directory symlink was traversed to reach this file — its resolved path (opened_path)
+         *       differs from the path it was requested by (filename); and
+         *   (2) a DIFFERENT release of the same project+developer was already loaded this request.
+         * (1) alone is a legitimate whole-tree symlink deploy (Capistrano's current -> releases/N: every
+         * file redirects, but to ONE release). (2) alone is a legitimate cross-package include of one
+         * developer's hotfix module reached by its real path (ENV-AUD-17: different release, no symlink).
+         * Only together are they the release-mixing swap. Per-request, per-thread state (no cross-worker
+         * race). The release map is recorded for every new folder so (2) can be judged. */
+        {
+            unsigned char rkey[16 + sizeof(int)];
+            zval *prev_release;
+            int redirected = envelock_reached_through_link(file_handle);
+            memcpy(rkey, h->project, 16);
+            memcpy(rkey + 16, &dev, sizeof(int));
+            prev_release = zend_hash_str_find(&ENVELOCK_G(releases), (const char *)rkey, sizeof(rkey));
+            if (redirected && prev_release &&
+                memcmp(Z_STRVAL_P(prev_release), h->release, 16) != 0) {
+                zend_string_release(key);
+                return "a protected file was reached through a directory symlink that points into a "
+                       "different release of the same project (release-mixing)";
+            }
+            if (!prev_release) {
+                zval rel_value;
+                ZVAL_STRINGL(&rel_value, (const char *)h->release, 16);
+                zend_hash_str_add(&ENVELOCK_G(releases), (const char *)rkey, sizeof(rkey), &rel_value);
+            }
         }
         ZVAL_STRINGL(&value, (const char *)identity, sizeof(identity));
         seen = zend_hash_add_new(&ENVELOCK_G(roots), key, &value);
@@ -1398,6 +1652,56 @@ static zend_op_array *envelock_compile_string(zend_string *source, const char *f
     return envelock_previous_compile_string(source, filename, position);
 }
 
+/* Refuse (E_COMPILE_ERROR, does not return) an UNPROTECTED file when it must not run: its path is
+ * under a sealed root, or a sealed package is active this request.
+ *
+ * Refuse the plain file if EITHER the requested path (filename, lexically normalized so an
+ * '<tree>/../plain.php' include that resolves outside the tree is allowed) OR the resolved path
+ * (opened_path) is under a sealed root: a symlink placed inside the sealed folder pointing to external
+ * plain PHP resolves opened_path outside the tree, but its requested path is inside it, so checking
+ * only opened_path let it through (ENV-AUD-04). Checked unconditionally (not gated on sealed_active
+ * this request): envelock_under_sealed_root consults the per-worker sealed-roots set, so a plain file
+ * requested directly as the entry script inside a sealed tree is refused even before any sealed file
+ * has loaded this request, once the worker has seen the sealed package. The set is empty (and this is
+ * a cheap no-op) when no sealed package has ever loaded in this worker.
+ *
+ * The second case is the important one: while sealed, NO unprotected PHP runs, wherever it lives —
+ * so an LFI, an uploaded /tmp/evil.php, or a phar://wrapper include cannot execute plain code merely
+ * by sitting OUTSIDE the tree (ENV-2026-28). The operator's sealed_cleartext allowlist is the only
+ * exception (its config and the PHP a CMS generates at run time). */
+static void envelock_refuse_plain_if_sealed(zend_file_handle *file_handle)
+{
+    int under_root = 0;
+    /* Nothing to refuse when this worker has never seen a sealed package and none is active: every
+     * plain file of every application paid a lexical normalisation (two allocations) and a scan of
+     * an empty set before (audit 2026-11-17). */
+    if (ENVELOCK_G(sealed_active) <= 0 && zend_hash_num_elements(&ENVELOCK_G(sealed_roots)) == 0) {
+        return;
+    }
+    if (file_handle->filename) {
+        zend_string *norm = envelock_lexical_norm(file_handle->filename);
+        under_root = envelock_under_sealed_root(norm);
+        zend_string_release(norm);
+    }
+    if (!under_root && file_handle->opened_path)
+        under_root = envelock_under_sealed_root(file_handle->opened_path);
+    if (under_root || ENVELOCK_G(sealed_active) > 0) {
+        int allowed = 0;
+        if (file_handle->filename) {
+            zend_string *norm = envelock_lexical_norm(file_handle->filename);
+            allowed = envelock_sealed_cleartext_allowed(norm);
+            zend_string_release(norm);
+        }
+        if (!allowed && file_handle->opened_path)
+            allowed = envelock_sealed_cleartext_allowed(file_handle->opened_path);
+        if (!allowed) {
+            zend_error_noreturn(E_COMPILE_ERROR,
+                "Envelock: sealed package active: unprotected PHP is refused (allowlist a "
+                "legitimate path via envelock.sealed_cleartext)");
+        }
+    }
+}
+
 static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int type)
 {
     char *blob = NULL;
@@ -1411,55 +1715,25 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
     unsigned char content_key[32];
     const unsigned char *owner = NULL;
     int signer = -1;
+    unsigned char container[32];       /* SHA-256 of this protected file, set by envelock_signature_ok */
 
     /* Use Zend's original stream: preserves include_path, open_basedir and stream state. */
     if (zend_stream_fixup(file_handle, &blob, &blob_length) == FAILURE) {
+        /* Delegated with the same sealed check as any plain file: the compiler behind us calls
+         * fixup AGAIN on this handle, and a second read can succeed (a user stream wrapper, a
+         * transient error on a network filesystem), so delegating unchecked let plain PHP compile
+         * under a sealed tree or during a sealed request (audit 2026-11-17). */
+        envelock_refuse_plain_if_sealed(file_handle);
         return envelock_previous_compile_file(file_handle, type);
     }
+    /* C-31: a protected file starts with EITHER stub — ENVELOCK_STUB_V3 (1.1: fails closed with HTTP
+     * 500 and a non-zero exit when the loader is absent) or the pre-1.1 ENVELOCK_STUB. Both are the same
+     * length, so the header offset and the AAD (the file's own prefix bytes) are unchanged; recognising
+     * both keeps already-deployed packages running after a loader upgrade. */
     if (blob_length < sizeof(ENVELOCK_STUB) - 1 ||
-        memcmp(blob, ENVELOCK_STUB, sizeof(ENVELOCK_STUB) - 1) != 0) {
-        /* Refuse the plain file if EITHER the requested path (filename, lexically normalized so an
-         * '<tree>/../plain.php' include that resolves outside the tree is allowed) OR the resolved
-         * path (opened_path) is under a sealed root: a symlink placed inside the sealed folder
-         * pointing to external plain PHP resolves opened_path outside the tree, but its requested
-         * path is inside it, so checking only opened_path let it through (ENV-AUD-04).
-         * Checked unconditionally (not gated on sealed_active this request): envelock_under_sealed_root
-         * consults the per-worker sealed-roots set, so a plain file requested directly as the entry
-         * script inside a sealed tree is refused even before any sealed file has loaded this request,
-         * once the worker has seen the sealed package. The set is empty (and this is a cheap no-op)
-         * when no sealed package has ever loaded in this worker. */
-        {
-            int under_root = 0;
-            if (file_handle->filename) {
-                zend_string *norm = envelock_lexical_norm(file_handle->filename);
-                under_root = envelock_under_sealed_root(norm);
-                zend_string_release(norm);
-            }
-            if (!under_root && file_handle->opened_path)
-                under_root = envelock_under_sealed_root(file_handle->opened_path);
-            /* Refuse this plain PHP if it is under a sealed root (the per-worker set catches even a
-             * directly-requested entry script before any sealed file has loaded this request), OR if a
-             * sealed package is ALREADY ACTIVE this request. The second case is the important one: while
-             * sealed, NO unprotected PHP runs, wherever it lives — so an LFI, an uploaded /tmp/evil.php,
-             * or a phar://wrapper include cannot execute plain code merely by sitting OUTSIDE the tree
-             * (ENV-2026-28). The operator's sealed_cleartext allowlist is the only exception (its config
-             * and the PHP a CMS generates at run time). */
-            if (under_root || ENVELOCK_G(sealed_active) > 0) {
-                int allowed = 0;
-                if (file_handle->filename) {
-                    zend_string *norm = envelock_lexical_norm(file_handle->filename);
-                    allowed = envelock_sealed_cleartext_allowed(norm);
-                    zend_string_release(norm);
-                }
-                if (!allowed && file_handle->opened_path)
-                    allowed = envelock_sealed_cleartext_allowed(file_handle->opened_path);
-                if (!allowed) {
-                    zend_error_noreturn(E_COMPILE_ERROR,
-                        "Envelock: sealed package active: unprotected PHP is refused (allowlist a "
-                        "legitimate path via envelock.sealed_cleartext)");
-                }
-            }
-        }
+        (memcmp(blob, ENVELOCK_STUB, sizeof(ENVELOCK_STUB) - 1) != 0 &&
+         memcmp(blob, ENVELOCK_STUB_V3, sizeof(ENVELOCK_STUB_V3) - 1) != 0)) {
+        envelock_refuse_plain_if_sealed(file_handle);
         return envelock_previous_compile_file(file_handle, type);
     }
     if (envelock_persistent_cache()) {
@@ -1544,11 +1818,20 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
          * has been accepted, so a refused request cannot push the watermark forward and a
          * deployment with no license is untouched. */
         if (envelock_clock_path) {
-            if ((refusal = envelock_clock_refusal(envelock_clock_watermark, tolerance)) != NULL) {
+            /* C-10: refusal + advance under ONE lock (closes the ZTS read/advance race); the advance
+             * itself re-reads the record under an flock so no FPM worker lowers another's watermark.
+             * The first protected file of every request also re-reads the record BEFORE the refusal:
+             * the record is loaded at MINIT, i.e. in the FPM master / Apache parent, so every worker
+             * forked later started from the master's start-up value and judged a clock set back
+             * against that, ignoring what other workers had saved since -- a new worker ran for up
+             * to the tolerance (an hour) on a clock set back weeks, and always ran its first file
+             * (audit 2026-11-17, reproduced). */
+            int resync = !ENVELOCK_G(clock_synced);
+            ENVELOCK_G(clock_synced) = 1;
+            if ((refusal = envelock_clock_guard(envelock_clock_path, &envelock_clock_watermark,
+                                                tolerance, resync)) != NULL) {
                 zend_error_noreturn(E_COMPILE_ERROR, "Envelock: license rejected: %s", refusal);
             }
-            envelock_clock_advance(envelock_clock_path, &envelock_clock_watermark,
-                                   tolerance > 0 ? tolerance : 3600, 1);
         }
     }
     /* Exact layout (header, path, table and declared length against the real blob) BEFORE
@@ -1559,14 +1842,15 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
     /* Per-installation trust store. The signature (independent of the recipient) is verified
      * once against the trusted signers (or found in the per-worker cache of already verified
      * containers); only then are the header's path, release and flags trusted. */
-    if (!envelock_signature_ok((const unsigned char *)blob, blob_length, &signer)) {
+    if (!envelock_signature_ok((const unsigned char *)blob, blob_length, &signer, container)) {
         zend_error_noreturn(E_COMPILE_ERROR,
             "Envelock: invalid protected file or not addressed to this installation");
     }
     if (!ENVELOCK_G(request_ready)) {
         zend_hash_init(&ENVELOCK_G(loaded), 64, NULL, NULL, 0);
         zend_hash_init(&ENVELOCK_G(roots), 4, NULL, ZVAL_PTR_DTOR, 0);
-        zend_hash_init(&ENVELOCK_G(litvault), 8, NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(&ENVELOCK_G(releases), 4, NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(&ENVELOCK_G(litvault), 8, NULL, envelock_vault_wipe, 0);
         zend_hash_init(&ENVELOCK_G(litvault_enc), 8, NULL, envelock_enc_vault_free, 0);
         ENVELOCK_G(sealed_active) = 0;
         ENVELOCK_G(request_ready) = 1;
@@ -1594,6 +1878,23 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
      * built-in web server, RSS grew about 25 kB per request and was flat once the block moved here.
      * Upstream OPcache does the same for its own file cache. */
     if (h.flags & ENVELOCK_FLAG_BYTECODE) {
+        /* C-16 hardening: a bytecode image runs in the engine right after deserialization, so a
+         * malformed-but-signed image from ANY trusted signer could crash the worker. The directive is
+         * "auto" by default (empty): bytecode is allowed on a single-developer host — that one developer
+         * is fully trusted anyway — but REFUSED on a MULTI-developer host unless the operator explicitly
+         * enables it, so one developer's bytecode cannot crash a shared server. An explicit 0/1 wins. */
+        {
+            const char *ab = INI_STR("envelock.allow_bytecode");
+            int allow_bc = (ab && ab[0]) ? ENVELOCK_INI_BOOL("envelock.allow_bytecode")
+                                         : (envelock_identity.developer_count <= 1);
+            if (!allow_bc) {
+                zend_error_noreturn(E_COMPILE_ERROR,
+                    "Envelock: bytecode packages are refused here. This host trusts more than one "
+                    "developer and envelock.allow_bytecode is not enabled; a bytecode image runs in the "
+                    "engine right after deserialization, so set envelock.allow_bytecode=1 only if you "
+                    "trust every package signer on this host, or ship a SOURCE package instead");
+            }
+        }
 #if !ENVELOCK_HAVE_BYTECODE
         zend_error_noreturn(E_COMPILE_ERROR,
             "Envelock: this loader was built without bytecode support for this PHP version; "
@@ -1604,7 +1905,7 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
             zend_error_noreturn(E_COMPILE_ERROR, "Envelock: out of memory for the bytecode image");
         }
         if (!envelock_open((const unsigned char *)blob, blob_length, work, h.size,
-                           &source_length, NULL) || source_length != h.size) {
+                           &source_length, NULL, container) || source_length != h.size) {
             OPENSSL_cleanse(work, h.size);
             efree(work);
             zend_error_noreturn(E_COMPILE_ERROR,
@@ -1654,12 +1955,13 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
     /* The ciphertext is decrypted IN PLACE in the handle's own buffer (zend_stream_fixup:
      * emalloc'd, blob_length plus ZEND_MMAP_AHEAD bytes), so the file never exists twice in
      * memory; without re-verifying (key pairs were checked at MINIT). Every Zend allocation
-     * (caches, request records) happens before decrypting; none from there to compiling. */
+     * (caches, request records) happens before decrypting; the vault parsers, which do allocate
+     * after it, run under the zend_try below, which wipes the plaintext on any bail-out. */
     text = (unsigned char *)h.ciphertext;
     /* O7: the content key is needed to unwrap an encrypted vault's data key, so ask for it.
      * Cleared below whether or not the file turns out to have a vault. */
     if (!envelock_open((const unsigned char *)blob, blob_length, text, h.size, &source_length,
-                       content_key) ||
+                       content_key, container) ||
         source_length != h.size) {
         OPENSSL_cleanse(text, h.size);              /* unauthenticated bytes, never used */
         OPENSSL_cleanse(content_key, sizeof(content_key));   /* a cached key was copied in first */
@@ -1677,41 +1979,55 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
          * parsers are mutually exclusive even though both flags are set. */
         int have_vault_enc = (h.flags & ENVELOCK_FLAG_VAULT_ENC) != 0;
         envelock_enc_vault *enc_vault = NULL;
+        /* Set once the plain vault is a complete array, so the bail-out path below wipes exactly
+         * that (a half-built one is wiped by envelock_parse_vault itself). volatile: it changes
+         * between the setjmp of zend_try and a possible longjmp. */
+        volatile int vault_built = 0;
+        /* Used after the zend_try below: a volatile copy, so `owner` is not live across the setjmp
+         * (GCC's -Wclobbered flagged it; no longjmp path reads it, but nothing has to be assumed). */
+        const unsigned char *volatile owner_kept = owner;
+        ZVAL_UNDEF(&vault);
         if (have_vault_enc) {
             have_vault = 0;
-            if (!envelock_parse_vault_enc(text, h.size, content_key, &enc_vault,
-                                          &source_off, &source_length)) {
-                OPENSSL_cleanse(text, h.size);
-                OPENSSL_cleanse(content_key, sizeof(content_key));
-                zend_error_noreturn(E_COMPILE_ERROR,
-                    "Envelock: invalid protected file (encrypted vault table)");
-            }
-        } else if (have_vault &&
-                   !envelock_parse_vault(text, h.size, &vault, &source_off, &source_length)) {
-            OPENSSL_cleanse(text, h.size);
-            OPENSSL_cleanse(content_key, sizeof(content_key));
-            zend_error_noreturn(E_COMPILE_ERROR, "Envelock: invalid protected file (vault table)");
         }
-        /* The content key has done its job (the vault's data key is unwrapped now); the vault
-         * carries its own from here on, so do not leave this one on the stack. */
-        OPENSSL_cleanse(content_key, sizeof(content_key));
-        /* Move the plaintext source to the start and zero everything after it (table prefix,
-         * left-over plaintext and Zend's look-ahead padding). The SAME handle is then compiled as a
-         * real file (not eval: paths, returns and strict_types preserved); a new filename-type
-         * handle could be reopened, and its buffer orphaned, by a later compile hook. */
-        memmove(blob, text + source_off, source_length);
-        memset(blob + source_length, 0, blob_length + ZEND_MMAP_AHEAD - source_length);
-        file_handle->len = source_length;
-
+        /* Everything from here to the end of the compile runs under ONE zend_try. The vault parsers
+         * allocate (the plain vault's strings, the encrypted vault's tables), and a request at its
+         * memory_limit bails out of an allocation: that unwound past this function, and Zend freed the
+         * handle's buffer -- the whole decrypted source -- without wiping it, into heap chunks later
+         * requests reuse (audit 2026-11-17; the earlier comment here said nothing allocates between
+         * decrypting and compiling, which the vaults made untrue). Every bail-out now wipes first. */
         zend_try {
+            if (have_vault_enc) {
+                if (!envelock_parse_vault_enc(text, h.size, content_key, &enc_vault,
+                                              &source_off, &source_length)) {
+                    zend_error_noreturn(E_COMPILE_ERROR,
+                        "Envelock: invalid protected file (encrypted vault table)");
+                }
+            } else if (have_vault) {
+                if (!envelock_parse_vault(text, h.size, &vault, &source_off, &source_length)) {
+                    zend_error_noreturn(E_COMPILE_ERROR, "Envelock: invalid protected file (vault table)");
+                }
+                vault_built = 1;
+            }
+            /* The content key has done its job (the vault's data key is unwrapped now); the vault
+             * carries its own from here on, so do not leave this one on the stack. */
+            OPENSSL_cleanse(content_key, sizeof(content_key));
+            /* Move the plaintext source to the start and zero everything after it (table prefix,
+             * left-over plaintext and Zend's look-ahead padding). The SAME handle is then compiled as a
+             * real file (not eval: paths, returns and strict_types preserved); a new filename-type
+             * handle could be reopened, and its buffer orphaned, by a later compile hook. */
+            memmove(blob, text + source_off, source_length);
+            memset(blob + source_length, 0, blob_length + ZEND_MMAP_AHEAD - source_length);
+            file_handle->len = source_length;
             result = envelock_previous_compile_file(file_handle, type);
         } zend_catch {
-            if (have_vault) zval_ptr_dtor(&vault);
+            if (vault_built) envelock_vault_wipe(&vault);
             if (enc_vault) {
                 zval holder;
                 ZVAL_PTR(&holder, enc_vault);
                 envelock_enc_vault_free(&holder);
             }
+            OPENSSL_cleanse(content_key, sizeof(content_key));
             OPENSSL_cleanse(blob, blob_length + ZEND_MMAP_AHEAD);
             /* zend_bailout() is _zend_bailout(__FILE__, __LINE__): it would embed the absolute
              * path of the build directory (and so the builder's user name) in the shipped module.
@@ -1721,14 +2037,16 @@ static zend_op_array *envelock_compile_file(zend_file_handle *file_handle, int t
         /* The compiled code holds its own copies: clear the source before Zend frees it. */
         OPENSSL_cleanse(blob, blob_length + ZEND_MMAP_AHEAD);
         if (result && result->filename) {                /* a trusted caller from now on */
-            zend_hash_update_ptr(&ENVELOCK_G(loaded), result->filename, (void *)owner);
+            zend_hash_update_ptr(&ENVELOCK_G(loaded), result->filename, (void *)owner_kept);
+            /* A second include of the same file replaces its vault: the table's destructor
+             * (envelock_vault_wipe) wipes the old one. */
             if (have_vault) zend_hash_update(&ENVELOCK_G(litvault), result->filename, &vault);
             if (enc_vault) {
                 zend_hash_update_ptr(&ENVELOCK_G(litvault_enc), result->filename, enc_vault);
                 enc_vault = NULL;                        /* the table owns it from here */
             }
         } else if (have_vault) {
-            zval_ptr_dtor(&vault);                       /* no op_array to attach the table to */
+            envelock_vault_wipe(&vault);                 /* no op_array to attach the table to */
         }
         if (enc_vault) {                                 /* no op_array to attach the vault to */
             zval holder;
@@ -1789,6 +2107,28 @@ static void envelock_harden_memory(void)
     envelock_protect_bytes(&envelock_identity, sizeof(envelock_identity));
 }
 
+#if defined(PHP_WIN32)
+/* The Windows half of "non-dumpable" (envelock_restrict_process_access, envelock_file.c). Applied at a
+ * request, never at MINIT: Apache's parent loads PHP and runs MINIT too, and it hands its listening
+ * sockets to a child it has just started (WSADuplicateSocket, which opens the child with
+ * PROCESS_DUP_HANDLE) while that child is still starting up -- a child that had already shut its own
+ * access list at MINIT would refuse its parent. A child serves requests only once it has its sockets.
+ * The process list once per process; each thread's own list once, on the first request it serves. */
+static volatile LONG envelock_process_restricted = 0;
+ZEND_TLS int envelock_thread_restricted = 0;
+static void envelock_restrict_windows(void)
+{
+    if (!envelock_thread_restricted) {
+        envelock_thread_restricted = 1;
+        (void) envelock_restrict_thread_access();
+    }
+    if (envelock_process_restricted == 0 &&
+        InterlockedCompareExchange(&envelock_process_restricted, 1, 0) == 0) {
+        (void) envelock_restrict_process_access();
+    }
+}
+#endif
+
 PHP_MINIT_FUNCTION(envelock)
 {
 #if defined(ZTS) && defined(COMPILE_DL_ENVELOCK)
@@ -1819,7 +2159,12 @@ PHP_MINIT_FUNCTION(envelock)
     if (envelock_identity_error) {
         zend_error(E_WARNING, "Envelock: identity file rejected: %s; protected files will not run",
             envelock_identity_error);
-    } else if (ENVELOCK_INI_BOOL("envelock.harden_memory")) {
+    } else if (ENVELOCK_INI_BOOL("envelock.harden_memory")
+               && envelock_identity.recipient_count > 0 && envelock_identity.signer_count > 0) {
+        /* Only once an identity is actually LOADED. With no envelock.identity there are no keys to
+         * protect, and hardening would needlessly make EVERY PHP process on the server non-dumpable
+         * and block /proc/self access for unrelated code — the manual already says "once a server
+         * identity is loaded" (audit 2026-11, C-25). */
         envelock_harden_enabled = 1;      /* keys are in memory now; protect and re-apply in RINIT */
         envelock_harden_memory();
     }
@@ -1934,12 +2279,20 @@ PHP_RINIT_FUNCTION(envelock)
      * (their memory belonged to that request). */
     ENVELOCK_G(request_ready) = 0;
     ENVELOCK_G(sealed_active) = 0;   /* each request starts with no sealed package active (C9) */
+    ENVELOCK_G(clock_synced) = 0;    /* re-read the anti-rollback record at this request's first file */
+    ENVELOCK_G(hook_seen) = NULL;
+    ENVELOCK_G(debugger_modules) = UINT32_MAX;   /* look at the loaded modules again */
+    envelock_licence_request_start();
+    envelock_vm_request_start();
     /* Re-assert non-dumpable: PHP-FPM does setuid() to the pool user after MINIT, which resets the
      * dumpable flag to 1. prctl(PR_SET_DUMPABLE) is process-wide and idempotent, so just call it
      * every request rather than gating on a process-wide `static int` that several ZTS threads could
      * race on (C11 data race / UB) (ENV-AUD-18). The cost is one cheap syscall per request. */
     if (envelock_harden_enabled) {
         envelock_set_undumpable();
+#if defined(PHP_WIN32)
+        envelock_restrict_windows();
+#endif
     }
     /* The authoritative, fail-closed decision is made per file at compile time
      * (envelock_compile_file), which is the only point that distinguishes a protected
@@ -1950,24 +2303,44 @@ PHP_RINIT_FUNCTION(envelock)
 
 PHP_RSHUTDOWN_FUNCTION(envelock)
 {
-    if (ENVELOCK_G(request_ready)) {
-        /* The vault holds decrypted source literals: wipe them before freeing, like the source
-         * buffer. RSHUTDOWN runs after all user code (shutdown functions and destructors have already
-         * run), so a literal still referenced by $GLOBALS or a static property (refcount > 1) is no
-         * longer read by anything — only released during the remaining teardown — and wiping its
-         * bytes is safe. The earlier refcount==1 guard left exactly those copies uncleansed
-         * (ENV-AUD-06); now every non-interned vault string is wiped. */
-        zval *list, *item;
-        ZEND_HASH_FOREACH_VAL(&ENVELOCK_G(litvault), list) {
-            if (Z_TYPE_P(list) != IS_ARRAY) continue;
-            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(list), item) {
-                if (Z_TYPE_P(item) == IS_STRING && !ZSTR_IS_INTERNED(Z_STR_P(item))) {
-                    OPENSSL_cleanse(ZSTR_VAL(Z_STR_P(item)), ZSTR_LEN(Z_STR_P(item)));
-                }
-            } ZEND_HASH_FOREACH_END();
+    /* Nothing here on purpose. Envelock is registered after the session module, so its RSHUTDOWN
+     * runs BEFORE session's, and session's runs the application's save handler (user code): tearing
+     * the request state down here meant that handler ran with the sealed check off (eval() and plain
+     * includes accepted in a sealed request), with __envelock_lit() answering "", and with a protected
+     * include re-creating the request tables that nothing destroyed again (their vault literals freed
+     * unwiped). The teardown is in the post-deactivate hook below, which runs after EVERY module's
+     * RSHUTDOWN, once no user code can run any more (audit 2026-11-17). */
+    return SUCCESS;
+}
+
+/* Wipe every non-interned string of one file's plain vault, then release the array. Used for every
+ * way a vault array dies: the request teardown, a second include of the same file replacing it, and
+ * the error paths -- the last two used to free decrypted literals without wiping them. */
+static void envelock_vault_wipe(zval *list)
+{
+    if (Z_TYPE_P(list) == IS_ARRAY) {
+        zval *item;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(list), item) {
+            if (Z_TYPE_P(item) == IS_STRING && !ZSTR_IS_INTERNED(Z_STR_P(item))) {
+                OPENSSL_cleanse(ZSTR_VAL(Z_STR_P(item)), ZSTR_LEN(Z_STR_P(item)));
+            }
         } ZEND_HASH_FOREACH_END();
+    }
+    zval_ptr_dtor(list);
+}
+
+static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(envelock)
+{
+    if (ENVELOCK_G(request_ready)) {
+        /* The vault holds decrypted source literals: they are wiped before freeing, like the source
+         * buffer (the litvault table's destructor is envelock_vault_wipe). This runs after all user
+         * code (shutdown functions, destructors and the session save handler have run), so a literal
+         * still referenced by $GLOBALS or a static property (refcount > 1) is no longer read by
+         * anything, and wiping its bytes is safe; every non-interned vault string is wiped
+         * (ENV-AUD-06). __envelock_lit hands out independent copies, so the app never holds these. */
         zend_hash_destroy(&ENVELOCK_G(loaded));
         zend_hash_destroy(&ENVELOCK_G(roots));
+        zend_hash_destroy(&ENVELOCK_G(releases));
         zend_hash_destroy(&ENVELOCK_G(litvault));
         /* O7: wipes the data key, the still-encrypted table and every literal decrypted during
          * the request (envelock_enc_vault_free does all three). */
@@ -1975,13 +2348,14 @@ PHP_RSHUTDOWN_FUNCTION(envelock)
         ENVELOCK_G(sealed_active) = 0;
         ENVELOCK_G(request_ready) = 0;
     }
+    envelock_vm_request_end();       /* any code may call __envelock_vm, protected or not */
     return SUCCESS;
 }
 
 PHP_MINFO_FUNCTION(envelock)
 {
     php_info_print_table_start();
-    php_info_print_table_row(2, "Envelock", "1.0.0 / offline");
+    php_info_print_table_row(2, "Envelock", "1.1.0 / offline");
     php_info_print_table_row(2, "Format", "X25519+HKDF-SHA256+AES-256-GCM + Ed25519 / v2");
     php_info_print_table_row(2, "Trust store",
         (envelock_identity.recipient_count > 0 && envelock_identity.signer_count > 0)
@@ -2028,6 +2402,15 @@ static PHP_FUNCTION(__envelock_lit)
     {
         zend_execute_data *caller = execute_data->prev_execute_data;
         if (!caller || !caller->func || !ZEND_USER_CODE(caller->func->common.type)) {
+            RETURN_EMPTY_STRING();
+        }
+        /* A DYNAMIC call — $f($x), call_user_func('__envelock_lit', ...), array_map(...) — also has a
+         * user-code caller frame, so the check above lets it through. The compiled --vault-strings
+         * access always calls this by its literal name, so refuse any dynamic call: otherwise a
+         * one-argument dynamic-call sink (array_map and friends) reached from a cleartext file turns
+         * into "read the whole vault" in one call (audit 2026-11, C-08). The mini-VM entry guards
+         * itself the same way (envelock_vm.c). */
+        if (ZEND_CALL_INFO(execute_data) & ZEND_CALL_DYNAMIC) {
             RETURN_EMPTY_STRING();
         }
         fn = caller->func->op_array.filename;
@@ -2083,6 +2466,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_envelock_bc_load_check, 0, 1, _I
     ZEND_ARG_TYPE_INFO(0, image, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 PHP_FUNCTION(envelock_bc_load_check);
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_envelock_bc_emit_legacy_calls, 0, 1, MAY_BE_STRING | MAY_BE_FALSE)
+    ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+PHP_FUNCTION(envelock_bc_emit_legacy_calls);
 #endif
 PHP_FUNCTION(__envelock_vm);   /* O4: the mini-VM entry point (envelock_vm.c) */
 
@@ -2166,6 +2553,8 @@ static const zend_function_entry envelock_functions[] = {
     PHP_FE(envelock_bc_run, arginfo_envelock_bc_run)
     /* TEST ONLY — deserializes without executing, to exercise the crash-safety guard. */
     PHP_FE(envelock_bc_load_check, arginfo_envelock_bc_load_check)
+    /* TEST ONLY — emits like the emitters before C-05, to prove the loader's own C-05 defence. */
+    PHP_FE(envelock_bc_emit_legacy_calls, arginfo_envelock_bc_emit_legacy_calls)
 #endif
     PHP_FE(envelock_secret_memory, arginfo_envelock_secret_memory)
     PHP_FE_END
@@ -2180,11 +2569,11 @@ zend_module_entry envelock_module_entry = {
     PHP_RINIT(envelock),
     PHP_RSHUTDOWN(envelock),
     PHP_MINFO(envelock),
-    "1.0.0",
+    "1.1.0",
     PHP_MODULE_GLOBALS(envelock),
     PHP_GINIT(envelock),
     PHP_GSHUTDOWN(envelock),
-    NULL,
+    ZEND_MODULE_POST_ZEND_DEACTIVATE_N(envelock),   /* the request teardown (see RSHUTDOWN) */
     STANDARD_MODULE_PROPERTIES_EX
 };
 

@@ -47,4 +47,13 @@ const char *envelock_clock_refusal(uint64_t watermark, uint64_t tolerance);
  * Serialised under ZTS. Returns 1 if the file was written. */
 int envelock_clock_advance(const char *path, uint64_t *watermark, uint64_t step, int may_create);
 
+/* C-10: the rollback refusal and the advance as ONE locked read-modify-write (the refusal's read of
+ * the watermark happens under the same lock the advance takes, closing a ZTS read/advance race).
+ * With `resync` the record on disk is read first and adopted when higher (the loader passes it for
+ * the first protected file of each request: a worker must not judge the clock against the value the
+ * master loaded at start-up). Returns the refusal reason, or NULL when the clock is acceptable (the
+ * advance then runs). */
+const char *envelock_clock_guard(const char *path, uint64_t *watermark, uint64_t tolerance,
+                                 int resync);
+
 #endif /* ENVELOCK_CLOCK_H */

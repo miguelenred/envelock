@@ -90,6 +90,14 @@ _VC_OK = (0, 1638, 3010)        # installed / a newer one already present / inst
 def check_php(cmd: str) -> tuple[str, str]:
     """Can cmd strip comments / obfuscate? ('ok', version) for PHP 8+ with the tokenizer; else
     (reason, detail) with reason not_found | no_vcruntime | old | no_tokenizer | error."""
+    # A bare name ("php", the default before detection has found one) is looked up in the PATH
+    # folders only, as the encoder does (ENC-3): handed to CreateProcess as is, Windows first searches
+    # the assistant's own folder and the CURRENT folder, so a php.exe planted there (Downloads, say)
+    # ran -- the T-3 promise "never runs a PHP from the current folder" did not hold (audit 2026-11-17).
+    try:
+        cmd = a.resolve_program(cmd)
+    except ValueError as error:
+        return "not_found", str(error)
     try:
         out = subprocess.run([cmd, "-r", _PHP_PROBE], capture_output=True, text=True,  # nosec B603
                              timeout=30, stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW)
@@ -572,7 +580,7 @@ def pack(owner: Path, owner_password: bytes | None, recipients: list[Path], proj
          obfuscate_properties: bool = False, no_ffi: bool = False,
          sealed: bool = False, enforce_manifest: bool = False,
          obfuscate_flow: bool = False, vault_strings: bool = False,
-         allow_secret_assets: bool = False) -> dict:
+         manifest: bool = False, allow_secret_assets: bool = False) -> dict:
     owner_config = _read_config(Path(owner), "envelock-owner", owner_password)
     # Explicit length check: zip() would otherwise truncate silently to the shorter list, packing
     # for fewer recipients than asked with no error (audit ENV-02).
@@ -591,7 +599,7 @@ def pack(owner: Path, owner_password: bytes | None, recipients: list[Path], proj
         compact=compact, encode_strings=encode_strings, obfuscate_methods=obfuscate_methods,
         obfuscate_properties=obfuscate_properties, no_ffi=no_ffi, sealed=sealed,
         enforce_manifest=enforce_manifest, obfuscate_flow=obfuscate_flow,
-        vault_strings=vault_strings, allow_secret_assets=allow_secret_assets,
+        vault_strings=vault_strings, manifest=manifest, allow_secret_assets=allow_secret_assets,
     )
 
 
@@ -605,3 +613,86 @@ def recommend(source: Path, php_ext: list[str] | None = None) -> dict:
     extensions = a.DEFAULT_EXTENSIONS | {"." + x.lower().lstrip(".") for x in (php_ext or [])}
     rec = a.recommend_options(source, extensions)
     return {"recommendation": rec, "report": a.format_recommendation(rec)}
+
+
+# --- verify a deployed package ----------------------------------------------------------------
+
+def verify(package: Path, descriptor: Path, descriptor_password: bytes | None = None) -> dict:
+    """Check a packed folder against its signed manifest, using the signing public key taken from a
+    developer descriptor (public, no password) or from an owner key (private; a password only if the
+    owner file is encrypted). Returns verify_package's report: ok, project_id, release_id, serial,
+    files, missing, added, changed. Raises ValueError if there is no signed manifest or the signature
+    does not verify (same checks as the CLI's `verify`)."""
+    descriptor = Path(descriptor)
+    if file_kind(descriptor) == "envelock-developer-public":
+        pub = a.read_config(descriptor, "envelock-developer-public")["signing_public"]
+    else:
+        pub = _read_config(descriptor, "envelock-owner", descriptor_password)["signing_public"]
+    return a.verify_package(Path(package), pub)
+
+
+# --- deployment licences ----------------------------------------------------------------------
+
+def machine_id() -> str:
+    """This host's machine fingerprint (hex), to bind a licence to it (CLI: `licence machine-id`)."""
+    return a.machine_fingerprint().hex()
+
+
+def host_id() -> dict:
+    """This host's domain and IPv4 fingerprints (CLI: `licence host-id`). `ipv4` is an empty list
+    with an `ip_error` message on hosts without a usable address. On a web server the loader compares
+    SERVER_NAME (the configured server name), which is usually NOT this machine's own name."""
+    name = a.host_domain()
+    info = {"domain": name, "domain_hash": a.domain_hash(name).hex()}
+    try:
+        info["ipv4"] = a.host_ipv4_addresses()
+        info["ip_hash"] = a.host_ips_hash().hex()
+    except ValueError as error:
+        info["ipv4"] = []
+        info["ip_error"] = str(error)
+    return info
+
+
+def licence_inspect(path: Path) -> dict:
+    """A licence's constraints WITHOUT checking its signature (the loader does that), matching the
+    CLI's `licence inspect`: format, expiry, and each binding as a hex value or 'any'."""
+    import time
+    info = a.parse_licence(a.bounded_read(Path(path), a.LICENCE_SIZE + 1))
+    return {
+        "format": info["format"],
+        "expires": (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(info["expires"]))
+                    if info["expires"] else "never"),
+        "machine": info["machine"].hex() if info["machine"] != a.ZERO32 else "any",
+        "domain": info["domain"].hex() if info["domain"] != a.ZERO32 else "any",
+        "ip": info["ip"].hex() if info["ip"] != a.ZERO32 else "any",
+    }
+
+
+def licence_issue(owner: Path, owner_password: bytes | None, out: Path, *, days: int | None = None,
+                  expires: str | None = None, machine: str | None = None, domain: str | None = None,
+                  ip: str | None = None, force: bool = False) -> dict:
+    """Sign a deployment licence with the owner key and write it to `out`, mirroring the CLI's
+    `licence issue`: the same field resolution (resolve_licence_fields, including the audited all-zero
+    binding refusals) and the same refusal to overwrite an existing licence unless `force`. A licence
+    is NOT secret — its integrity is the signature — so it is written world-readable and atomically.
+    Returns a summary including any `warnings` the caller should show (e.g. a binding a Windows loader
+    cannot check)."""
+    out = Path(out)
+    if out.exists() and not force:
+        raise ValueError(f"{out.name} already exists (tick 'Overwrite' to replace it)")
+    owner_config = _read_config(Path(owner), "envelock-owner", owner_password)
+    expires_ts, machine_b, domain_b, ip_b, warnings = a.resolve_licence_fields(
+        days=days, expires=expires, machine=machine, domain=domain, ip=ip)
+    blob = a.issue_licence(owner_config, expires=expires_ts, machine=machine_b,
+                           domain=domain_b, ip=ip_b)
+    a.write_public(out, blob)
+    import time
+    return {
+        "path": str(out),
+        "expires": (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(expires_ts))
+                    if expires_ts else "never"),
+        "machine": machine_b.hex() if machine_b != a.ZERO32 else "any",
+        "domain": domain_b.hex() if domain_b != a.ZERO32 else "any",
+        "ip": ip_b.hex() if ip_b != a.ZERO32 else "any",
+        "warnings": warnings,
+    }

@@ -109,7 +109,7 @@ void envelock_arena_init(size_t size_hint)
 #endif
     /* Fallback (no mapping, or the guard page could not be set): plain heap, no guard page. The bump
      * pointer is still bounded by arena_capacity in envelock_alloc and envelock_arena_check. */
-    arena_base = (char *) malloc(want);
+    arena_base = (char *) calloc(1, want);   /* zeroed, like a fresh mapping */
     if (arena_base == NULL) {
         arena_capacity = 0;
         arena_mapped = 0;
@@ -169,6 +169,14 @@ void envelock_arena_destroy(void)
 void envelock_arena_reset(void)
 {
     if (arena_base != NULL) {
+        /* Zero what the last file used before the next one reuses the arena. Persist leaves gaps
+         * it never writes (alignment, the padding after each copy), and those are serialized as
+         * they are, so the arena must not hand the next file the bytes of the previous one
+         * (audit 2026-11-17). This is one part of H-09; the bytes persist copies out of the compiler's
+         * own structures are made deterministic in envelock_bc.c (the zeroing window) and in
+         * envelock_persist.c (valueless zvals, zend_type padding, UNUSED operands). */
+        size_t used = envelock_arena_used();
+        memset(arena_base, 0, used < arena_capacity ? used : arena_capacity);
         ZCG(mem) = arena_base;
     }
 }

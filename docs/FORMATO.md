@@ -1,6 +1,6 @@
 # Envelock v2 format
 
-Experimental format, common to Windows/Linux/macOS. It does not depend on endianness, pointer size or the serialization of Zend's internal structures. Incompatible changes must use a different format/version signature.
+Binary format, common to Windows/Linux/macOS. It does not depend on endianness, pointer size or the serialization of Zend's internal structures. Incompatible changes must use a different format/version signature.
 
 In v2 the content key is **wrapped per recipient** with asymmetric cryptography: nobody can decrypt a package without holding the recipient's X25519 private key. The loader is **generic** (it embeds no secret); its private key and the trusted signer are read from an external identity file (see `MANUAL.md`). Having the public engine or another developer's keys does not allow decrypting packages meant for others.
 
@@ -10,13 +10,19 @@ In v2 the content key is **wrapped per recipient** with asymmetric cryptography:
 fixed PHP stub | 70-byte header | relative path | recipient table (N×124) | ciphertext | GCM tag 16 | Ed25519 signature 64
 ```
 
-The exact stub, terminated with LF, is:
+The stub Envelock 1.1 writes, terminated with LF, is:
+
+```php
+<?php /* Envelock 1.1 */ http_response_code(500);exit(1);__halt_compiler();
+```
+
+Packages made before 1.1 carry the earlier stub, which the loader still accepts (both are exactly the same length, so the header offset is unchanged):
 
 ```php
 <?php /* Envelock */ exit("Envelock loader required\n"); __halt_compiler();
 ```
 
-Without the extension, PHP ends with a message, without printing the binary payload. The stub contains `__halt_compiler()` to stop the normal parser; the original source is NOT transformed into a script that uses `eval()`.
+Without the extension, the 1.1 stub sets the HTTP status to 500 and exits with a non-zero process code, so a loader-less server **fails closed** (the pre-1.1 stub instead printed a message and exited 0, which a cron/CLI run or a web health check could misread as success); neither prints the binary payload. The stub contains `__halt_compiler()` to stop the normal parser; the original source is NOT transformed into a script that uses `eval()`.
 
 The header begins immediately after the stub's LF. All subsequent offsets are relative to the start of that header:
 
@@ -134,22 +140,23 @@ The v2 loader accepts **only** the `ENVLK02` magic and version 2. A v1 package (
 It is consumed by the loader via the `envelock.identity` directive in `php.ini`. It is **secret** (it contains private keys) and is never distributed. It separates the **recipient** keys from the **trust store** of trusted developers (a per-installation trust list, never taken from the package):
 
 ```text
-magic "ENVLKID3" (8)
+magic "ENVLKID4" (8)        # 1.1 (C-29); pre-1.1 "ENVLKID3" and legacy "ENVLKID2" are still read
 recipient_count  uint16 BE (1..64)
 developer_count  uint16 BE (1..64)
 recipients:  recipient_count × (x25519_priv 32 | x25519_pub 32)
 developers:  developer_count × (ed25519_primary 32 | ed25519_recovery 32)
-minimums:    optional, until the end of the file:
+minimums:    optional, until the checksum (or the end of the file in ENVLKID3/ENVLKID2):
              n × (developer_primary_pub 32 | project UUID 16 | serial uint64 BE), n ≤ 256
+checksum:    SHA-256 (32) over everything above (ENVLKID4 only; absent in ENVLKID3/ENVLKID2)
 ```
 
 An all-zero `ed25519_recovery` means "no recovery key". The loader flattens the developers into a list of trusted signers (primary and, if present, recovery). Trust is **global per installation**: a package is accepted if it is addressed to any of the recipient keys and is signed by **any** trusted signer (primary or recovery). `developer_id = SHA256(primary_Ed25519_public_key)` identifies each developer (for configuring, referencing and auditing; it does not travel in the package). The loader rejects the file if other local users can read it: on POSIX, if it is readable by group or others or does not belong to the process user; on Windows, if its owner or any access entry is not the account PHP runs as, SYSTEM, Administrators or OWNER RIGHTS. Each recipient's public key must be derived from its private key, or the file is rejected.
 
-A **minimum** refuses packages of that project whose serial is lower (no rollback to an older signed release); it is set with `minimum set`. Each minimum is **bound to the developer** that set it: its `developer_primary_pub` field records the primary key of the developer whose signed package justified it (or, for an admin-set `--project/--serial` minimum, all zeros = unbound). The loader applies a minimum to a package only when the minimum is unbound or was set by the **same** developer that signed the package, so on a host trusting several developers one cannot set a rollback bar on another's project (ENV-AUD-14). The legacy `ENVLKID2` layout (24-byte, unbound minimums) is still read; `minimum set` rewrites the file in the current format.
+A **minimum** refuses packages of that project whose serial is lower (no rollback to an older signed release); it is set with `minimum set`. Each minimum is **bound to the developer** that set it: its `developer_primary_pub` field records the primary key of the developer whose signed package justified it (or, for an admin-set `--project/--serial` minimum, all zeros = unbound). The loader applies a minimum to a package only when the minimum is unbound or was set by the **same** developer that signed the package, so on a host trusting several developers one cannot set a rollback bar on another's project (ENV-AUD-14). The pre-1.1 `ENVLKID3` body and the legacy `ENVLKID2` layout (24-byte, unbound minimums) are still read; `minimum set` rewrites the file in the current format (`ENVLKID4`, with the trailing SHA-256, so a bit flip — e.g. in a minimum serial, which the old format accepted silently — is caught and the loader refuses to run).
 
 ## Metadata and updates
 
-`envelock-package.json` contains IDs, the serial, the options used and counts, without keys. It is informational and is not consulted to decrypt (only `minimum set --package` reads its project and serial). Each file carries its own header, path, table and signature. Within one request the loader refuses files of different projects or releases under the same package folder, so a file from another release cannot be swapped in; it does not enforce an atomic update: replace the package as a coherent whole (for example by switching a symbolic link).
+`envelock-package.json` contains IDs, the serial, the options used and counts, without keys. It is informational and is not consulted by anything that decides: not to decrypt, and not by `minimum set --package` either, which reads the project and serial from the signed header of a protected file of the package (verified against the identity's trusted developers). Each file carries its own header, path, table and signature. Within one request the loader refuses files of different projects or releases under the same package folder, so a file from another release cannot be swapped in; it does not enforce an atomic update: replace the package as a coherent whole (for example by switching a symbolic link).
 
 ## Encrypted private configurations (encoder)
 

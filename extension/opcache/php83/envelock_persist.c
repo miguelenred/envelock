@@ -299,6 +299,12 @@ static void envelock_persist_zval(zval *z)
 			break;
 		default:
 			ZEND_ASSERT(Z_TYPE_P(z) < IS_STRING);
+			/* Envelock (H-09): undef, null, false and true carry no value, and the engine leaves those
+			 * bytes as they were -- often a zval on the compiler's stack (zend_emit_final_return's NULL),
+			 * so a stale pointer reached the image and one source packed to different images. */
+			if (Z_TYPE_P(z) <= IS_TRUE) {
+				memset(&z->value, 0, sizeof(z->value));
+			}
 			break;
 	}
 }
@@ -371,7 +377,19 @@ uint32_t envelock_get_class_name_map_ptr(zend_string *type_name)
 	return 0;
 }
 
+/* Envelock (H-09): a zend_type is a pointer and a 32-bit mask, padded to 16 bytes on a 64-bit host, and
+ * the compiler fills one by struct assignment from a temporary on its stack -- padding included, so
+ * those 4 bytes were whatever the stack held. */
+static void envelock_type_clear_padding(zend_type *type)
+{
+	size_t used = offsetof(zend_type, type_mask) + sizeof(type->type_mask);
+	if (sizeof(zend_type) > used) {
+		memset((char *) type + used, 0, sizeof(zend_type) - used);
+	}
+}
+
 static void envelock_persist_type(zend_type *type) {
+	envelock_type_clear_padding(type);
 	if (ZEND_TYPE_HAS_LIST(*type)) {
 		zend_type_list *list = ZEND_TYPE_LIST(*type);
 		if (ZEND_TYPE_USES_ARENA(*type) || envelock_in_shm(list)) {
@@ -381,10 +399,17 @@ static void envelock_persist_type(zend_type *type) {
 			list = envelock_memdup_put_free(list, ZEND_TYPE_LIST_SIZE(list->num_types));
 		}
 		ZEND_TYPE_SET_PTR(*type, list);
+		/* Envelock (H-09): the 4 bytes between num_types and types[] -- the compiler builds a union's list
+		 * on its stack (do_alloca) and memcpy()s it whole. */
+		if (offsetof(zend_type_list, types) > offsetof(zend_type_list, num_types) + sizeof(list->num_types)) {
+			memset((char *) list + offsetof(zend_type_list, num_types) + sizeof(list->num_types), 0,
+			       offsetof(zend_type_list, types) - offsetof(zend_type_list, num_types) - sizeof(list->num_types));
+		}
 	}
 
 	zend_type *single_type;
 	ZEND_TYPE_FOREACH(*type, single_type) {
+		envelock_type_clear_padding(single_type);
 		if (ZEND_TYPE_HAS_LIST(*single_type)) {
 			envelock_persist_type(single_type);
 			continue;
@@ -398,6 +423,43 @@ static void envelock_persist_type(zend_type *type) {
 			}
 		}
 	} ZEND_TYPE_FOREACH_END();
+}
+
+/* Envelock (H-09): an operand of type UNUSED often carries a value all the same -- a jump target, an
+ * argument number, a class-fetch kind -- and not always where the VM's operand flags say so: the static
+ * property opcodes are declared ANY yet keep the class-fetch kind (static::, self::) in op2.num, and RECV
+ * and CHECK_UNDEF_ARGS read theirs by hand (a broader version of this cleared those and crashed
+ * static::$count++). Only the three operand kinds that are by definition a fixed meaning with no value
+ * are cleared: $this (THIS), an appended [] (NEXT) and a constructor call (CONSTRUCTOR, op2 of
+ * INIT_STATIC_METHOD_CALL for parent::__construct()), and only where the operand has a declared type
+ * list. There the value is whatever the compiler's znode held, copied whole from a stack temporary
+ * nobody wrote (measured: pieces of a path, and halves of stale pointers that ASLR changes). */
+static bool envelock_unused_kind_is_empty(uint32_t operand_flags)
+{
+	uint32_t kind = operand_flags & ZEND_VM_OP_MASK;
+	return (operand_flags & ZEND_VM_OP_SPEC) != 0
+		&& (kind == ZEND_VM_OP_THIS || kind == ZEND_VM_OP_NEXT || kind == ZEND_VM_OP_CONSTRUCTOR);
+}
+
+static void envelock_clear_unused_operands(zend_op *opline)
+{
+	uint32_t flags;
+	if (opline->opcode == ZEND_OP_DATA) {
+		return;
+	}
+	flags = zend_get_opcode_flags(opline->opcode);
+	if (opline->op1_type == IS_UNUSED && envelock_unused_kind_is_empty(ZEND_VM_OP1_FLAGS(flags))) {
+		opline->op1.num = 0;
+	}
+	if (opline->op2_type == IS_UNUSED && envelock_unused_kind_is_empty(ZEND_VM_OP2_FLAGS(flags))) {
+		opline->op2.num = 0;
+	}
+	/* RECV_VARIADIC's op2: the compiler emits RECV and RECV_VARIADIC from one uninitialised znode and then
+	 * writes op2 (the type mask) for RECV only; neither the VM nor OPcache reads RECV_VARIADIC's (checked in
+	 * zend_compile.c, zend_vm_def.h and ext/opcache of 8.2-8.5). */
+	if (opline->opcode == ZEND_RECV_VARIADIC && opline->op2_type == IS_UNUSED) {
+		opline->op2.num = 0;
+	}
 }
 
 static void envelock_persist_op_array_ex(zend_op_array *op_array, envelock_persistent_script* main_persistent_script)
@@ -559,6 +621,7 @@ static void envelock_persist_op_array_ex(zend_op_array *op_array, envelock_persi
 		int offset = 0;
 
 		for (; opline < end ; opline++, offset++) {
+			envelock_clear_unused_operands(opline);	/* Envelock (H-09) */
 #if ZEND_USE_ABS_CONST_ADDR
 			if (opline->op1_type == IS_CONST) {
 				opline->op1.zv = (zval*)((char*)opline->op1.zv + ((char*)op_array->literals - (char*)orig_literals));

@@ -1,6 +1,6 @@
 {
   "errors": [],
-  "generated_at": "2026-11-02T12:24:03Z",
+  "generated_at": "2026-11-17T22:34:22Z",
   "metrics": {
     "./scripts/bench.py": {
       "CONFIDENCE.HIGH": 0,
@@ -11,7 +11,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 52,
+      "loc": 67,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -24,7 +24,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 281,
+      "loc": 493,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -50,7 +50,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 160,
+      "loc": 168,
       "nosec": 0,
       "skipped_tests": 5
     },
@@ -63,9 +63,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4135,
+      "loc": 8050,
       "nosec": 0,
-      "skipped_tests": 17
+      "skipped_tests": 21
     },
     "encoder/envelock.py": {
       "CONFIDENCE.HIGH": 0,
@@ -76,9 +76,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2313,
+      "loc": 5455,
       "nosec": 0,
-      "skipped_tests": 3
+      "skipped_tests": 7
     },
     "gui/_e2e.py": {
       "CONFIDENCE.HIGH": 0,
@@ -89,9 +89,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 82,
+      "loc": 101,
       "nosec": 0,
-      "skipped_tests": 0
+      "skipped_tests": 2
     },
     "gui/actions.py": {
       "CONFIDENCE.HIGH": 0,
@@ -102,9 +102,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 398,
+      "loc": 537,
       "nosec": 0,
-      "skipped_tests": 5
+      "skipped_tests": 3
     },
     "gui/envelock_gui.py": {
       "CONFIDENCE.HIGH": 0,
@@ -115,7 +115,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 787,
+      "loc": 1167,
       "nosec": 0,
       "skipped_tests": 1
     }

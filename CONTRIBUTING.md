@@ -1,6 +1,6 @@
 # Contributing
 
-This is an experimental security implementation. Changes must include a threat model, regression tests and explicit limits; claims of absolute protection are not accepted.
+This is a prototype security implementation. Changes must include a threat model, regression tests and explicit limits; claims of absolute protection are not accepted.
 
 ## Environment
 

@@ -68,7 +68,9 @@ static zend_always_inline bool envelock_fc_inside(const void *p, size_t bytes)
 {
 	const char *c = (const char *) p;
 
-	return c >= envelock_fc_base && c <= envelock_fc_base + envelock_fc_size
+	/* No region (the walk has not been set up) holds nothing: refused rather than computed from NULL
+	 * (clang --analyze, external audit 2026-11-12). */
+	return envelock_fc_base != NULL && c >= envelock_fc_base && c <= envelock_fc_base + envelock_fc_size
 		&& bytes <= (size_t) (envelock_fc_base + envelock_fc_size - c);
 }
 
@@ -414,6 +416,22 @@ static zend_always_inline void envelock_fc_note_opline(zend_op *opline)
 	}
 }
 
+/* C-05: DO_UCALL and DO_ICALL hard-code the callee's kind (user or internal) as the COMPILER judged
+ * it, and the VM trusts that: DO_UCALL enters the callee's op_array, DO_ICALL calls its handler. Inside
+ * an image that judgement is not reliable. zend_get_call_op() sends a callee down its USER branch
+ * whenever ZEND_COMPILE_IGNORE_INTERNAL_FUNCTIONS is set (the emitter needs it, BC-10) even when the
+ * callee is internal, and PHP 8.3.6's compiler (the one Ubuntu 24.04 ships) resolves a static call to
+ * an internal class despite IGNORE_INTERNAL_CLASSES: DateTime::createFromFormat() came out as DO_UCALL
+ * and entered an op_array that does not exist (SIGSEGV). DO_FCALL is the same call with the kind
+ * checked at run time, so every call of the image is made generic before its handler is chosen,
+ * whatever emitter or engine produced it (images packed before the fix included). */
+static zend_always_inline void envelock_fc_generic_call(zend_op *opline)
+{
+	if (opline->opcode == ZEND_DO_UCALL || opline->opcode == ZEND_DO_ICALL) {
+		opline->opcode = ZEND_DO_FCALL;
+	}
+}
+
 /* The handler of every opline is chosen by THIS process' VM from the validated opline, exactly as
  * pass_two does (BC-12): the image's handler value is an index into zend_opcode_handlers that
  * zend_deserialize_opcode_handler() would use unchecked. The VM reads (opline + 1)->op1_type for
@@ -424,6 +442,7 @@ static void envelock_fc_set_handlers(zend_op_array *op_array)
 	zend_op *opline = op_array->opcodes, *end = opline + op_array->last;
 
 	for (; opline < end; opline++) {
+		envelock_fc_generic_call(opline);
 		if (opline + 1 < end) {
 			ZEND_VM_SET_OPCODE_HANDLER(opline);
 		} else {

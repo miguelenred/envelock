@@ -1,5 +1,215 @@
 # Changelog
 
+## 1.1 — 2026-11-16 (consolidated-audit follow-up)
+
+A second-pass review consolidated 16 external reports into 36 findings. 1.0.0 already fixed or decided
+most of them; this release closes the rest. Two change the on-disk format, so **1.1 is a format bump**:
+a 1.1 loader reads 1.0 packages and identity files unchanged, but a 1.0 loader does **not** read 1.1
+ones. **Roll out the loader first, then re-pack and re-export the identity with the 1.1 encoder.**
+
+**Loader (`extension/`).**
+- **Bytecode no longer crashes on internal static methods (C-05).** `DateTime::createFromFormat`,
+  `Closure::bind`/`fromCallable`, `Fiber::suspend`, `DateTimeZone::listIdentifiers` and
+  `SplFixedArray::fromArray` in a `--bytecode` package segfaulted at execution. Cause, read in PHP's
+  own `zend_compile.c`: under `ZEND_COMPILE_IGNORE_INTERNAL_FUNCTIONS` (which the emitter needs, BC-10)
+  `zend_get_call_op()` sends a callee it resolved down its USER branch even when it is internal, and
+  emits `ZEND_DO_UCALL`; PHP 8.3.6 — the version Ubuntu 24.04 ships — resolves a static call to an
+  internal class despite `IGNORE_INTERNAL_CLASSES`. The first fix of this release (an
+  `execute_internal` hook while compiling) only removes `DO_ICALL`; its test passed because the test
+  matrix (8.2.35, 8.3.36, 8.4.27, 8.5.12) does not resolve such calls, and a dynamic test of the 1.1.0
+  source on PHP 8.3.6 still crashed (2026-11-17). Now fixed twice: the emitter compiles with a
+  pass-through `zend_execute_ex`, so the compiler emits only the generic `DO_FCALL`; and the loader
+  rewrites any `DO_UCALL`/`DO_ICALL` to `DO_FCALL` before choosing handlers, so images packed by an
+  unfixed emitter run too. `scripts/check_bc_layers.py` requires both in every layer. Verified on a
+  PHP 8.3.6 build: with the 1.1.0 source the regression tests crash (SIGSEGV); without the loader
+  rewrite an image emitted the old way (test-only `envelock_bc_emit_legacy_calls`) still crashes; with
+  the fix all pass. Tests: `test_bytecode_internal_static_methods_do_not_crash`,
+  `test_bytecode_internal_calls_match_cleartext_in_every_context` (every kind of op_array),
+  `test_bytecode_loader_makes_legacy_call_opcodes_generic`, and the checker's mutation tests.
+- **Release-mixing through a directory symlink is refused (C-11).** A package subfolder replaced by a
+  symlink to an OLD release of the same project+developer ran the old file. The loader now refuses a file
+  reached through a symlink that lands in a DIFFERENT release of the same project+developer; a whole-tree
+  symlink deploy (Capistrano `current -> releases/N`) and a one-developer cross-package hotfix include
+  (ENV-AUD-17) keep working. `test_php_release_mixing_via_directory_symlink_is_refused`.
+- **Anti-rollback clock: no stale or racy watermark (C-10).** The rollback check and the advance run
+  under one lock (closing a ZTS read/advance race); the advance re-reads the state file under an `flock`
+  and never lowers a value another PHP-FPM worker already persisted.
+- **Bytecode off by default on multi-developer hosts (C-16).** `envelock.allow_bytecode` now defaults to
+  "auto": allowed on a single-developer host, refused on a host trusting several developers unless the
+  operator sets `envelock.allow_bytecode=1`, so one developer's image cannot crash a shared server.
+  Single-developer deployments are unchanged. `test_bytecode_auto_off_on_a_multi_developer_host`.
+- **A loader-less server now fails closed (C-31, format).** Without the Envelock extension a protected
+  file's stub used to `exit(0)` and respond HTTP 200, so a cron/CLI/health check read it as success. The
+  1.1 stub sets HTTP 500 and exits non-zero; the loader accepts both stubs, so already-deployed packages
+  keep running. `test_php_without_loader_fails_closed`, `test_php_pre_1_1_stub_package_still_runs`.
+- **Identity-file integrity (C-29, format).** `identity.bin` now carries a trailing SHA-256 (format
+  `ENVLKID4`), so a bit flip — e.g. in a minimum serial, which the old format accepted silently — is
+  caught and the loader refuses to run. The pre-1.1 `ENVLKID3` format is still read.
+  `test_php_identity_checksum_catches_corruption_and_reads_old_format`.
+
+**Encoder / assistant (`encoder/`, `gui/`).**
+- **`pack` warns that `--include-protection` without `--no-prepend` is bypassable (C-30)** by a
+  server-configured `auto_prepend_file`/`auto_append_file`.
+- The GUI assistant gained **Verify** and **Licence** tabs plus a shared licence resolver (C-33); see
+  `docs/ASSISTANT.md`.
+- `pack` printed the C-30 warning **twice**, from two copies of the same check with different wording
+  (a duplicated test of the same name hid it); it prints it once.
+- The invariant that both stubs have the same length is a real check, not an `assert` that
+  `python -O` strips.
+
+**Release evidence and test suite (second audit of the 1.1.0 source, 2026-11-17).**
+- **Stale audit evidence (H-1).** `docs/reports/` dated from 2026-11-02: every hash in `targets.json`
+  was stale and `ruff.json`/`bandit.json` no longer matched the code, because nothing in the release
+  process ran `scripts/regen-reports.sh`. Regenerated; `targets.json` now pins every first-party source
+  the evidence covers (it pinned 11 files and not the bytecode layer), with line endings normalised and
+  the format/identity magic read from the encoder (it still said `ENVLKID2`); the pins are taken before
+  the test run, which otherwise recorded its own failure. `check_release.py --require-complete` refuses
+  a tree whose pinned sources changed after the evidence, and `docs/BUILDING.md` §8 has the step.
+- **Test suite.** A duplicated test name hid one test and broke the CI's ruff check (H-2); the suite
+  could not even be collected on a host without PHP (a `skipif` probe raised, H-3); with collection
+  fixed, 35 tests that need a PHP CLI but had no skip appeared besides the 2 the audit listed (H-4):
+  without PHP every test now passes or skips. An unused variable (H-5) completed an assertion the test
+  meant to make; an unsorted import block (H-6). ruff 0.17.2 and bandit 1.9.4 are clean.
+  `test_server_loader_exposes_no_bytecode_emit_or_run_surface` assumed an NTS PHP and failed on
+  8.4 ZTS, where the bytecode layer is left out of every build (ENV-2026-03): on ZTS it now requires
+  the pack-side build to expose neither function, and it refuses a module that did not load (every
+  "must not expose" passed for one).
+
+**Code audit of the 1.1.0 source (2026-11-17).** Every finding was checked against the code and, where
+it could be, reproduced; each fix has a test that fails without it (checked by undoing the fix).
+- Loader:
+  - **`envelock.allow_opcache=1` no longer accepts every compile hook.** With OPcache caching, the
+    recommended production setup, the check that refuses a hook above Envelock's was skipped
+    altogether, so ionCube, SourceGuardian or a hook installed at run time received the decrypted
+    handle. Only OPcache's and Phar's own code is accepted there now (HOST-1 completed).
+  - **Anti-rollback clock in forked workers.** The record was loaded once, in the FPM master (or Apache
+    parent): a worker judged the clock against the master's start-up value, ignoring what other
+    workers had saved since, and ran for up to the tolerance (an hour) on a clock set back weeks —
+    reproduced. The first protected file of each request now re-reads the record. On Windows the
+    record had no inter-process lock (a long-lived `php-cgi` could lower it) and its open followed a
+    reparse point planted after the path check; both fixed. A record the workers cannot write is
+    reported once in the PHP log instead of failing silently on every file.
+  - **The request state outlives every RSHUTDOWN.** Envelock's RSHUTDOWN ran before the session
+    module's, whose save handler is user code: there a sealed package's `eval()` was accepted, a
+    vaulted literal read as "", and a protected include re-created request tables nothing freed. The
+    teardown runs in post-deactivate now.
+  - **Decrypted bytes wiped on every exit.** A request at its `memory_limit` could bail out of the vault
+    parsers between decrypting and compiling, and Zend freed the whole decrypted source unwiped; plain
+    vault literals were also freed unwiped when a file was included twice or failed to compile.
+  - **C-11 without false positives.** Any difference between the requested name and the resolved path
+    counted as a directory symlink, so a `..` include (Composer's `__DIR__.'/../...'`) of a hotfix
+    release, and on Windows almost every include, was refused; the names are now compared lexically
+    normalised. A relative name still counts as reached through a link.
+  - Encrypted vault: a source under 4 bytes was refused. Licence: the domain and IP slots are checked
+    against their flags like the others. The sealed check also applies when reading the file fails.
+    32-bit builds: two vault length checks could wrap. A failed `ftruncate` of the secret arena was
+    reported as `memfd_secret`; Windows now reports `VirtualLock`.
+  - **Windows: `envelock.harden_memory` and `envelock.paranoid` do something.** `harden_memory` only
+    locked the keys in RAM there, so the account PHP runs as could read its memory, dump it or attach
+    a debugger. From the first request the process (and each request thread) now gets an access list
+    under which only SYSTEM — or an administrator using SeDebugPrivilege, as root on Linux — can read,
+    write or debug it, start a thread in it or duplicate a handle from it; seeing, waiting for and
+    ending it still work. The paranoid tracer check answered "could not tell" on Windows; a debugger
+    attached to the process is now refused like a ptrace tracer. Both measured by tests that fail
+    against the earlier DLL. Limits in `docs/MANUAL.md` (the parent `w3wp.exe`/Apache keeps its
+    handle).
+  - **The anti-rollback record's lock never waits.** It was a blocking `flock`: any process running as
+    the PHP user that held it stalled every protected request. It is tried for about 20 ms; without it
+    the request reads anyway and skips that save.
+  - Smaller costs per protected file, each remembered only while its inputs cannot change: the package
+    digest of a container (it hashed the whole recipient table, up to 127 KB, on every file), the
+    debugger-extension lookups (per request, by module count, so a `dl()` mid-request is still seen),
+    the sealed-package check for plain files when nothing is sealed. The manifest buffer is sized from
+    the file instead of 16 MiB.
+  - **The mini-VM prepares a program once per request.** Every call of a virtualized function decoded
+    its base64, re-validated the whole program and zeroed a 64 KiB stack; a prepared program is now
+    reused by later and recursive calls (malformed programs are still refused on every call), and the
+    stack starts at 16 slots and grows: a one-line virtualized function went from 1.65 to 0.15 µs per
+    call (PHP 8.4, WSL1). Names are read from the constant pool directly, which also
+    clears the static analyser's notes on `envelock_vm.c` (external audit 2026-11-12).
+  - `config.m4` builds with `-Werror=sizeof-array-argument` and `-Werror=sizeof-pointer-memaccess`: a
+    draft of these fixes keyed the signature cache by `sizeof` of an array parameter (8 bytes of the
+    SHA-256); the compiler warned, and now it refuses to build.
+  - `docs/MANUAL.md` lists the directives read only when PHP starts (a per-pool `php_admin_value` for
+    them is ignored).
+- Bytecode layer:
+  - PHP 8.5: a class whose closure property default a same-file subclass inherits could not be packed
+    (the shared expression was serialized twice).
+  - Persistent constants are no longer folded at pack time (`PHP_OS_FAMILY`, the host libraries'
+    versions… read the packer's values), as OPcache's own file cache does.
+  - The emitter compiles with the engine's `compile_file`, not through OPcache's hook: with
+    `opcache.enable_cli=1` in the packing PHP it crashed on every file.
+  - **Reproducible images (H-09).** An image carried bytes the engine never wrote — structure padding
+    (`zend_class_entry`, `zend_type`, `zend_early_binding`, AST lists), the value of a null/true/false
+    zval, the operand of an operand the VM ignores — copied from the request heap or the compiler's
+    stack, plus a per-process counter in its runtime-definition keys. Measured with valgrind: 68 runs
+    of undefined bytes in one 16 KiB image, and 154 bytes (stale pointers, pieces of a path) differing
+    between two packs of one file; an image could hold bytes of the file packed before it. Everything
+    allocated while one file is compiled is now zeroed, those fields are cleared in persist, and the
+    counter starts from 0 per file. Operands are cleared only where the value provably means nothing
+    (`$this`, `[]`, a constructor call, `RECV_VARIADIC`'s op2): a first, broader rule zeroed operands
+    the VM reads by hand and crashed `static::$x++`, which the new test caught. Valgrind finds no
+    undefined byte, and every one of the 103 compilable `.php` files of PHP 8.4's own source tree gives
+    the same image in separate processes and after another file.
+  - `scripts/check_bc_layers.py` checks every `php<NN>` layer (it globbed `php8*`), the `UNSERIALIZE_*`
+    macros, the bodies of the hardening helpers, and every fix above.
+  - `docs/MANUAL.md`: an OPcache JIT or an observer extension (APM agent) on the server changes the
+    build identity, so images must be packed with the same JIT and observers.
+- Encoder:
+  - **`pack` on Windows gave every packed file an owner-only ACL** (Python's `mkdtemp`), so an IIS
+    application pool could not read the package; the staging folder now has the folder's normal
+    permissions.
+  - **Password files written by PowerShell** (UTF-16 or UTF-8 with a BOM) are read as their text: the
+    BOM and NULs passed a 5-character password as 16 and locked the key to that exact file. A key made
+    that way before still opens with the same file.
+  - Identity updates on POSIX keep the file's owner and mode (a rootless loader could no longer read
+    its identity after `minimum set`); a runtime manifest over the loader's 16 MiB limit is refused at
+    pack instead of at run time; `--obfuscate-properties` leaves classes that read their property
+    names (`foreach ($this ...)`, `(array)`, `get_mangled_object_vars`, `var_export`…);
+    `server-install --identity` accepts only an identity file; `licence issue` refuses an empty
+    `--machine`/`--domain`/`--ip` (it issued an unbound licence); `write_public` makes every folder it
+    creates traversable; `verify` gains `--project` and `--min-serial` (a whole package swapped for
+    another of the same developer passed).
+- Assistant, scripts and release gate:
+  - The assistant shows the warnings `pack` prints to stderr (syntax errors, files it could not
+    obfuscate, C-30), runs a bare `php` only from PATH (never the current folder), and saves keys at a
+    full path it shows.
+  - `check_release.py`: a terms file inside a staged tree is refused (`--terms FILE` checks a tree
+    against one kept outside), symbolic links are refused everywhere, zstd/cab/compress/lzip/LZ4
+    archives are recognised, a BOM in the terms file no longer disables its first term, and
+    `--require-complete` refuses sources the evidence does not pin.
+  - `regen-reports.sh` records the OpenSSL the loader is built against (it recorded PHP's 1.1.1k),
+    describes the exerciser accurately, empties the JUnit host name (it published the machine's name)
+    and runs its privacy check with the terms file.
+  - `build-windows.ps1` turns off PowerShell's progress bar while the build module downloads: in
+    Windows PowerShell 5.1 `Invoke-WebRequest` redraws it for every chunk, and the 34 MB PHP SDK took
+    10–30 minutes (2.9 s without it), which looked like a dead network.
+  - `build-unix.sh` refuses a module embedding a home folder, user name or build path;
+    `package-pie-assets.py` refuses a binary whose PHP build id does not match its folder;
+    `envelock-preflight.php` names only loaders that exist, survives a disabled `phpinfo`, and over the
+    web answers for an hour after upload and hides full paths.
+
+**Speed (same audit).** Nothing that is checked was removed or weakened; only work whose inputs cannot
+have changed is no longer repeated.
+- The runtime manifest's Ed25519 signature — on by default since `--enforce-manifest` became the
+  default — was verified on **every request**, once per package (~120–155 µs). It is verified once per
+  worker now and found by its SHA-256 afterwards; the release binding and the per-file presence check
+  still run every request.
+- Machine- and IP-bound licences recomputed the host's fingerprints for **every protected file**
+  (about twenty system calls each: a netlink dump, `/sys/class/net`, `/etc/machine-id`). The machine
+  fingerprint is now computed once per process — which also makes machine-bound packages work in an
+  FPM pool with `chroot` — and the IP fingerprint once per request.
+- The "is this compile hook PHP's own?" check walked every loaded image for every file; it is
+  remembered per request.
+- Measured on WSL1 (PHP 8.4, `php-cgi`, 300-file default pack, warm requests): with a machine+IP-bound
+  licence 84 → 44 ms per request; without a licence no measurable change in wall time (one Ed25519
+  verification fewer per request, about 1 % there). Details in `docs/RENDIMIENTO.md`.
+
+The remaining findings were already fixed in 1.0.0 (C-01 token recommender, C-02/C-03 self-source and
+cleartext-entry detection, C-04 include-protection cross-check, C-06 asset check, C-08, C-12, C-15,
+C-17–C-28, C-32 …) or are documented design decisions (C-07; C-16 execution of a *signed* image; C-26;
+C-34; C-35; C-36; and the C-09/C-14 limitations stated in the CLI help and `docs/RENDIMIENTO.md`).
+
 ## 1.0.0 — 2026-11-12 (first release: anti-root architecture and full obfuscation)
 
 Envelock's first release. On top of the strongest source cipher in its class, it makes the PHP source

@@ -11,6 +11,8 @@
 #if defined(__linux__)
 # include <fcntl.h>
 # include <unistd.h>
+#elif defined(_WIN32)
+# include <windows.h>
 #endif
 
 /* Largest /proc/self/status we will read. The file is ~1.5 kB in practice and every line we care
@@ -72,6 +74,23 @@ int envelock_tracer_pid_from(const char *status)
     }
     close(fd);
     return envelock_parse_tracer_pid(buffer, used);
+#elif defined(_WIN32)
+    /* Windows has no TracerPid, but it does say whether a debugger is attached: a local one
+     * (IsDebuggerPresent, the PEB flag) or one in another process (CheckRemoteDebuggerPresent, the
+     * debug port). There is no pid to report, so "traced" is 1. This answered "could not tell" on
+     * Windows, so envelock.paranoid there never refused a debugged process (audit 2026-11-17). A
+     * debugger that clears the PEB flag and hides its port is not seen -- advisory, like the rest. */
+    BOOL remote = FALSE;
+    if (status != NULL) {
+        return -1;                    /* a captured status file means the Linux parser's test */
+    }
+    if (IsDebuggerPresent()) {
+        return 1;
+    }
+    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remote) && remote) {
+        return 1;
+    }
+    return 0;
 #else
     /* No /proc/self/status. Report unknown, never "not traced": the caller decides what an
      * unknown answer is worth on this platform. */

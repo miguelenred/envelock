@@ -33,8 +33,9 @@
  * wants to refuse), or 0 when the process is not traced. Returns -1 when the answer could not be
  * determined at all — no /proc, an unreadable status file, no TracerPid line — because "we could
  * not tell" must not be reported as "no tracer": a caller that fails open here fails the whole
- * objective. Linux only; on any other platform this returns -1, and callers treat -1 as unknown
- * rather than as an accusation.
+ * objective. On Windows (no /proc) it reports a debugger attached to this process
+ * (IsDebuggerPresent / CheckRemoteDebuggerPresent) as 1, else 0; on any other platform it returns
+ * -1, and callers treat -1 as unknown rather than as an accusation.
  *
  * `status` is the file to read, so the parsing can be exercised against a captured status file
  * instead of only against the live kernel. Pass NULL for /proc/self/status.

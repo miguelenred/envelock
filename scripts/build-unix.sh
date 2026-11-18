@@ -96,6 +96,18 @@ if command -v strip >/dev/null 2>&1; then
 else
   echo "warning: strip not found; module ships with a full symbol table (names only, API stays hidden)" >&2
 fi
+# Privacy gate, the twin of build-windows.ps1's: the shipped module must not carry a path of this
+# machine -- the builder's home folder (and with it the user name), the build or repository folder.
+# A static OpenSSL (ENVELOCK_OPENSSL_STATIC) compiles its install prefix in (ENGINESDIR, MODULESDIR),
+# so one built under $HOME shipped the maintainer's user name and nothing stopped it; check_release
+# skips compiled files, so this is the only gate (audit 2026-11-17).
+for needle in "${HOME:-}" "$scratch" "$root" "${USER:+/$USER/}"; do
+  case "$needle" in ""|"/") continue ;; esac
+  if LC_ALL=C grep -aqF "$needle" "$module"; then
+    echo "PRIVACY: the module embeds a build-machine path or user name ($needle); refusing to ship it" >&2
+    exit 1
+  fi
+done
 # Post-build security gate. The production module must export ONLY get_module; it must never expose
 # the envelock_* internals (the decrypt/key-unwrap API — M-01) or any bytecode emit/run symbol. The
 # hardening is applied above but was never asserted, so any regression (an inherited flag, a stray

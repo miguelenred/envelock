@@ -26,11 +26,11 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import struct
 import subprocess  # nosec B404 # only runs the operator's php CLI (--strip-comments/--obfuscate)
 import sys
-import tempfile
 import time
 import unicodedata
 import uuid
@@ -45,7 +45,19 @@ from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-STUB = b'<?php /* Envelock */ exit("Envelock loader required\\n"); __halt_compiler();\n'
+# The plaintext prefix of every protected file: valid PHP that, WITHOUT the loader, fails closed, then
+# __halt_compiler() so the encrypted payload after it is never parsed. It is also part of the AES-GCM
+# AAD (via its bytes in the file), so the loader re-derives the AAD from each file's own prefix — which
+# is what lets the stub change without breaking already-packed files.
+# C-31: the 1.1 stub sets HTTP 500 and exits NON-ZERO (the pre-1.1 stub exited 0, so a cron/CLI run or a
+# web health check read a loader-less server as success). STUB_V2 is the pre-1.1 stub, still recognised
+# so packages made before 1.1 keep working. Both are the SAME length, so the header offset (len(STUB))
+# is unchanged and the loader accepts either.
+STUB = b'<?php /* Envelock 1.1 */ http_response_code(500);exit(1);__halt_compiler();\n'
+STUB_V2 = b'<?php /* Envelock */ exit("Envelock loader required\\n"); __halt_compiler();\n'
+STUBS = (STUB, STUB_V2)          # every stub the tools recognise; bytes.startswith accepts the tuple
+if len(STUB) != len(STUB_V2):    # not an assert: `python -O` strips those, and this invariant must hold
+    raise RuntimeError("a stub change must keep the length (the header offset is len(STUB))")
 MAGIC = b"ENVLK02\0"
 FORMAT_VERSION = 2
 # magic 8 | version 1 | flags 1 | path_length 2 | project 16 | release 16 | count 2 |
@@ -86,15 +98,20 @@ TAG_SIZE = 16
 # "unbound" (applies to any developer): legacy v2 minimums and admin-set --project/--serial minimums.
 # A recovery public of all zeros means "no recovery key". The loader trusts a package
 # signed by any developer's primary OR recovery key. developer_id = SHA256(primary_pub).
-IDENTITY_MAGIC = b"ENVLKID3"       # 8 bytes (current)
+IDENTITY_MAGIC = b"ENVLKID3"       # 8 bytes (pre-1.1 body; still read)
 IDENTITY_MAGIC_V2 = b"ENVLKID2"    # legacy, read-only (24-byte minimums, unbound)
+IDENTITY_MAGIC_V4 = b"ENVLKID4"    # 1.1 (C-29): the ENVLKID3 body + a trailing SHA-256 so a bit flip
+#                                  # (e.g. in a minimum serial) is caught, not silently accepted. Written
+#                                  # by default now; a 1.1+ loader reads it. Body after the magic is V3's.
+IDENTITY_CHECKSUM = 32             # SHA-256 appended to an ENVLKID4 file
 IDENTITY_RECIPIENT = 32 + 32  # 64
 IDENTITY_DEVELOPER = 32 + 32  # 64
 MAX_IDENTITIES = 64
 IDENTITY_MINIMUM = 32 + 16 + 8  # 56 (developer_pub | project | serial)
 IDENTITY_MINIMUM_V2 = 16 + 8    # 24 (legacy: project | serial)
 MAX_MINIMUMS = 256
-IDENTITY_MAX_FILE = 12 + MAX_IDENTITIES * (IDENTITY_RECIPIENT + IDENTITY_DEVELOPER) + MAX_MINIMUMS * IDENTITY_MINIMUM
+IDENTITY_MAX_FILE = (12 + MAX_IDENTITIES * (IDENTITY_RECIPIENT + IDENTITY_DEVELOPER)
+                     + MAX_MINIMUMS * IDENTITY_MINIMUM + IDENTITY_CHECKSUM)  # +checksum for ENVLKID4
 ZERO32 = b"\x00" * 32
 DEFAULT_EXTENSIONS = {".php", ".phtml", ".inc", ".php8"}
 DENIED_PARTS = {
@@ -165,6 +182,25 @@ def secret_write(path: Path, data: bytes, like: Path | None = None) -> None:
         fd = _windows_create_new(path, _windows_secret_sddl())
     else:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if like is not None and like.exists():
+            # POSIX twin of the Windows branch: the replacement keeps the owner, group and (owner/
+            # group-only) mode of the file it replaces. Without this an identity installed for a
+            # rootless loader (server-install --owner-user, 0400) came back root:root 0600 after
+            # `minimum set` / `recipient add` run as root, and the loader could no longer read it
+            # (audit 2026-11-17). Before a single byte of the secret is written; failing to keep the
+            # owner changes nothing.
+            try:
+                st = os.stat(like)
+                if (st.st_uid, st.st_gid) != (os.getuid(), os.getgid()):
+                    os.fchown(fd, st.st_uid, st.st_gid)
+                os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o660 or 0o600)
+            except OSError as error:
+                os.close(fd)
+                path.unlink()
+                raise ValueError(
+                    f"Could not give the new file the owner and permissions of {like.name} "
+                    f"({error}); run the command as that file's owner or as root. Nothing was changed."
+                ) from error
     with os.fdopen(fd, "wb") as f:
         f.write(data)
         f.flush()
@@ -579,7 +615,15 @@ def write_public(path: Path, data: bytes) -> None:
     protected owner-only ACL left the PHP service account unable to read it, ENC-13), and on POSIX
     the mode is set on the open descriptor (fchmod), never through a path a symlink could redirect
     (ENC-2)."""
-    parent_existed = path.parent.exists()
+    # Every folder this call creates, not only the immediate parent: under the CLI's umask 077 the
+    # intermediate ones were left 0700 too, so a non-root reader still could not reach the file
+    # (audit 2026-11-17).
+    created = []
+    folder = path.parent
+    while not folder.exists() and folder != folder.parent:
+        created.append(folder)
+        folder = folder.parent
+    parent_existed = not created
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / (path.name + ".tmp-" + secrets.token_hex(4))
     try:
@@ -602,10 +646,11 @@ def write_public(path: Path, data: bytes) -> None:
     # licence and fail closed -- the exact mis-deploy ENV-2026-20 set out to remove. If WE created
     # the parent, make it traversable (0755). A pre-existing parent is left as the admin set it.
     if os.name != "nt" and not parent_existed:
-        try:
-            os.chmod(path.parent, 0o755)  # nosec B103 - must be traversable by the PHP user (ENV-2026-20)
-        except OSError:
-            pass
+        for made in created:
+            try:
+                os.chmod(made, 0o755)  # nosec B103 - must be traversable by the PHP user (ENV-2026-20)
+            except OSError:
+                pass
 
 
 def bounded_read(path: Path, limit: int, private: bool = False) -> bytes:
@@ -683,12 +728,41 @@ def _stdin_is_console() -> bool:
     return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
 
 
+def _password_file_text(raw: bytes) -> bytes:
+    """The password a password file holds, as the UTF-8 bytes typing it would give. Windows
+    PowerShell 5.1 writes UTF-16 with a BOM (`>`, Out-File) or UTF-8 with a BOM (Set-Content
+    -Encoding utf8): read raw, the BOM and every NUL became part of the password, so "short" passed
+    the 16-character minimum and the key could never be opened by typing the password (audit
+    2026-11-17). A file without a BOM is taken byte for byte, as before."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            text = raw.decode("utf-16")
+        except UnicodeDecodeError as error:
+            raise ValueError("The password file starts like UTF-16 but is not valid UTF-16") from error
+        return text.lstrip("﻿").rstrip("\r\n").encode("utf-8")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.rstrip(b"\r\n")
+
+
+def _legacy_password_file() -> bytes | None:
+    """What a key made BEFORE that fix was encrypted with when the password file had a BOM (its raw
+    bytes), so such a key still opens with the same file; None when no file is in use or it has no
+    BOM (then the two readings agree)."""
+    location = os.getenv("ENVELOCK_PASSWORD_FILE")
+    if not location:
+        return None
+    raw = bounded_read(Path(location), 4096, private=True)
+    legacy = raw.rstrip(b"\r\n")
+    return legacy if legacy != _password_file_text(raw) else None
+
+
 def password_from_user(confirm: bool = False) -> bytes:
     location = os.getenv("ENVELOCK_PASSWORD_FILE")
     if location:
         path = Path(location)
         # private=True enforces 0600-or-stricter via fstat on the opened file (no TOCTOU, NU-02).
-        password = bounded_read(path, 4096, private=True).rstrip(b"\r\n")
+        password = _password_file_text(bounded_read(path, 4096, private=True))
     else:
         if not _stdin_is_console():
             raise ValueError(
@@ -855,14 +929,25 @@ def read_config_with_password(
         salt, nonce = bytes.fromhex(obj["salt"]), bytes.fromhex(obj["nonce"])
         if len(salt) != 16 or len(nonce) != 12:
             raise ValueError("Invalid encrypted key header")
-        password = password_from_user() if password is None else password
-        key = Scrypt(salt=salt, length=32, n=2**17, r=8, p=1).derive(password)
-        try:
-            obj = json.loads(
-                AESGCM(key).decrypt(nonce, bytes.fromhex(obj["ciphertext"]), CONFIG_AAD)
-            )
-        except InvalidTag as error:
-            raise ValueError("Wrong password or tampered configuration") from error
+        asked = password is None
+        password = password_from_user() if asked else password
+        candidates = [password]
+        if asked:
+            legacy = _legacy_password_file()
+            if legacy is not None:
+                candidates.append(legacy)
+        ciphertext, opened = bytes.fromhex(obj["ciphertext"]), None
+        for candidate in candidates:
+            key = Scrypt(salt=salt, length=32, n=2**17, r=8, p=1).derive(candidate)
+            try:
+                opened = json.loads(AESGCM(key).decrypt(nonce, ciphertext, CONFIG_AAD))
+            except InvalidTag:
+                continue
+            password = candidate
+            break
+        if opened is None:
+            raise ValueError("Wrong password or tampered configuration")
+        obj = opened
     else:
         password = None
     return validate_config(obj, kind), password
@@ -1026,9 +1111,28 @@ def developer_public(owner: dict) -> dict:
     return developer
 
 
+def _validate_developer_like(obj: dict) -> dict:
+    """Validate a developer identity that may be a full envelock-owner OR a public
+    envelock-developer-public descriptor (export-developer). An identity/trust store reads only the
+    PUBLIC signing (and optional recovery) keys from it, so the private signing key never has to be
+    copied to the server (audit 2026-11, C-12)."""
+    kind = obj.get("kind") if isinstance(obj, dict) else None
+    return validate_config(obj, "envelock-developer-public" if kind == "envelock-developer-public"
+                           else "envelock-owner")
+
+
+def read_developer_like(path: Path) -> dict:
+    """Read a developer identity for building a trust store: a full envelock-owner (encrypted or not;
+    only its public keys are used) or a public envelock-developer-public descriptor (C-12)."""
+    raw = json.loads(bounded_read(path, 64 * 1024))
+    if isinstance(raw, dict) and raw.get("kind") == "envelock-developer-public":
+        return validate_config(raw, "envelock-developer-public")
+    return read_config(path, "envelock-owner")   # owner: decrypts/prompts if the file is encrypted
+
+
 def make_identity(recipient: dict, owner: dict) -> dict:
     validate_config(recipient, "envelock-recipient")
-    validate_config(owner, "envelock-owner")
+    _validate_developer_like(owner)
     identity = {
         "kind": "envelock-identity",
         "format": FORMAT_VERSION,
@@ -1090,18 +1194,36 @@ def build_identity_store(recipients: list[bytes], developers: list[bytes],
         if len(dev_pub) != 32:
             raise ValueError("Minimum developer key with incorrect size")
         blocks.append(dev_pub + project + struct.pack(">Q", serial))
-    return (
-        IDENTITY_MAGIC
+    # C-29: write the 1.1 format (ENVLKID4) — the ENVLKID3 body with ENVLKID4 magic, plus a trailing
+    # SHA-256 over all of it so accidental corruption (including a flipped minimum serial, which the
+    # old format accepted silently) is detected on load. The body layout is byte-for-byte V3's.
+    body = (
+        IDENTITY_MAGIC_V4
         + struct.pack(">HH", len(recipients), len(developers))
         + b"".join(recipients)
         + b"".join(developers)
         + b"".join(blocks)
     )
+    return body + hashlib.sha256(body).digest()
+
+
+def _identity_body(data: bytes) -> bytes:
+    """C-29: a 1.1 identity file (ENVLKID4) ends in a SHA-256 of everything before it. Verify it and
+    return the file in ENVLKID3 body form (checksum stripped, magic normalised) so every existing parser
+    reads it unchanged; raise on a mismatch (corruption, e.g. a flipped minimum serial). Older files pass
+    through unchanged, so this is safe — and idempotent — at the top of every reader."""
+    if data[:8] == IDENTITY_MAGIC_V4:
+        if (len(data) < 12 + IDENTITY_CHECKSUM
+                or hashlib.sha256(data[:-IDENTITY_CHECKSUM]).digest() != data[-IDENTITY_CHECKSUM:]):
+            raise ValueError("The identity file is corrupted (checksum does not match)")
+        return IDENTITY_MAGIC + data[8:-IDENTITY_CHECKSUM]
+    return data
 
 
 def _identity_minimum_layout(data: bytes) -> tuple[int, int]:
-    """(stride, has_developer) for the minimum entries, by magic. Reads both the current format and
-    the legacy ENVLKID2 (24-byte, unbound) files; build_* always writes the current one."""
+    """(stride, has_developer) for the minimum entries, by magic. Reads the current and legacy formats;
+    a 1.1 ENVLKID4 file is first reduced to ENVLKID3 body form (checksum verified) by _identity_body."""
+    data = _identity_body(data)
     if data[:8] == IDENTITY_MAGIC:
         return IDENTITY_MINIMUM, True
     if data[:8] == IDENTITY_MAGIC_V2:
@@ -1112,6 +1234,7 @@ def _identity_minimum_layout(data: bytes) -> tuple[int, int]:
 def parse_identity_store(data: bytes) -> tuple[list[bytes], list[bytes]]:
     """Inverse of build_identity_store. Returns (recipients, developers) raw entries. Accepts the
     current and the legacy identity format."""
+    data = _identity_body(data)          # C-29: strip & verify an ENVLKID4 checksum, normalise to V3 body
     stride, _ = _identity_minimum_layout(data)
     if len(data) < 12:
         raise ValueError("Unrecognized identity file")
@@ -1134,6 +1257,7 @@ def identity_minimums(data: bytes) -> dict[tuple[bytes, bytes], int]:
     minimum. The key includes the developer so two developers that share a project id keep INDEPENDENT
     minimums: keying by project alone let a second developer's minimum silently replace the first's
     (audit ENV-03), even though the wire format and the loader bind each minimum to its developer."""
+    data = _identity_body(data)          # C-29: strip & verify an ENVLKID4 checksum, normalise to V3 body
     stride, has_dev = _identity_minimum_layout(data)
     recipients, developers = parse_identity_store(data)
     off = 12 + len(recipients) * IDENTITY_RECIPIENT + len(developers) * IDENTITY_DEVELOPER
@@ -1151,6 +1275,22 @@ def identity_minimums(data: bytes) -> dict[tuple[bytes, bytes], int]:
     return out
 
 
+def _applicable_minimums(minimums: dict[tuple[bytes, bytes], int], proj: bytes,
+                         developer_pub: bytes) -> list[int]:
+    """Serials of the minimums that actually constrain a package of (proj, developer_pub): the bound
+    minimum for that developer, the unbound one (ZERO32, which applies to everyone), and — when
+    developer_pub is itself unbound — every bound minimum of the project, since an unbound minimum
+    must clear them all to raise the effective bar (audit 2026-11, C-32)."""
+    return [s for (p, d), s in minimums.items()
+            if p == proj and (d == developer_pub or d == ZERO32 or developer_pub == ZERO32)]
+
+
+def effective_minimum(data: bytes, project: str, developer_pub: bytes = ZERO32) -> int:
+    """The highest minimum that applies to a package of (project, developer_pub); 0 if none."""
+    applicable = _applicable_minimums(identity_minimums(data), uuid.UUID(project).bytes, developer_pub)
+    return max(applicable, default=0)
+
+
 def set_minimum(existing: bytes, project: str, serial: int, developer_pub: bytes = ZERO32,
                 allow_downgrade: bool = False) -> bytes:
     """Refuse, from now on, packages of project with a serial lower than serial. developer_pub binds
@@ -1163,12 +1303,27 @@ def set_minimum(existing: bytes, project: str, serial: int, developer_pub: bytes
         raise ValueError("Invalid developer key")
     recipients, developers = parse_identity_store(existing)
     minimums = identity_minimums(existing)
-    key = (uuid.UUID(project).bytes, developer_pub)   # per (project, developer), not project alone
+    proj = uuid.UUID(project).bytes
+    key = (proj, developer_pub)                       # per (project, developer), not project alone
     current = minimums.get(key)
     if current is not None and serial < current and not allow_downgrade:
         raise ValueError(
             f"refusing to lower the minimum for this project ({current} -> {serial}); "
             "pass --allow-downgrade to do it on purpose"
+        )
+    # C-32: even when THIS entry does not exist yet, another applicable minimum (a developer-bound one
+    # when setting the unbound entry, or the unbound one when setting a bound entry) may already
+    # enforce a higher bar, so recording a lower serial here would not raise the effective minimum and
+    # the old message ("releases below N are refused") was misleading.
+    other_floor = max((s for (p, d), s in minimums.items()
+                       if (p, d) != key and p == proj
+                       and (d == developer_pub or d == ZERO32 or developer_pub == ZERO32)),
+                      default=None)
+    if other_floor is not None and serial < other_floor and not allow_downgrade:
+        source = "the unbound minimum" if developer_pub != ZERO32 else "a developer-bound minimum"
+        raise ValueError(
+            f"this project already has a higher effective minimum ({other_floor}) from {source}; "
+            f"recording {serial} would not raise it. Pass --allow-downgrade to record it anyway"
         )
     minimums[key] = serial
     return build_identity_store(recipients, developers, minimums)
@@ -1188,7 +1343,7 @@ def identity_signers(data: bytes) -> list[bytes]:
 
 def verified_header_and_signer(blob: bytes, signers: list[bytes]) -> tuple[dict, bytes]:
     """Like verified_header but also returns the trusted signer key that verified the signature."""
-    if not blob.startswith(STUB) or len(blob) < len(STUB) + HEADER.size + TAG_SIZE + SIGNATURE_SIZE:
+    if not blob.startswith(STUBS) or len(blob) < len(STUB) + HEADER.size + TAG_SIZE + SIGNATURE_SIZE:
         raise ValueError("Invalid protected file")
     signed, signature = blob[:-SIGNATURE_SIZE], blob[-SIGNATURE_SIZE:]
     for signer in signers:
@@ -1229,7 +1384,7 @@ def first_protected_file(package_dir: Path) -> bytes:
                     head = handle.read(len(STUB))
             except OSError:
                 continue
-            if head == STUB:
+            if head in STUBS:
                 return bounded_read(path, MAX_SOURCE + 8 * 1024 * 1024)
     raise ValueError("No protected file found in the package folder")
 
@@ -1243,12 +1398,34 @@ def server_install_identities(recipient_paths: list[Path], owner_path: Path) -> 
     """Build the identity bundle `server-install` writes. SECRET.
 
     Split out from the command so the bundle itself is testable without root, which the command
-    is not: the point of the subcommand is the ownership and the mode it leaves behind.
+    is not: the point of the subcommand is the ownership and the mode it leaves behind. owner_path
+    may be a full owner or a public developer descriptor (C-12).
     """
-    owner = read_config(owner_path, "envelock-owner")
+    developer = read_developer_like(owner_path)
     return identity_bundle_bytes(
-        [make_identity(read_config(path, "envelock-recipient"), owner) for path in recipient_paths]
+        [make_identity(read_config(path, "envelock-recipient"), developer) for path in recipient_paths]
     )
+
+
+def _create_install_dirs(out: Path, owner_uid: int) -> list[Path]:
+    """Create the identity file's missing parent folders and return the ones this call created. For a
+    non-root owner (--owner-user), make the created folders traversable (0711) so that user can reach
+    the 0400 identity inside: the root umask would otherwise leave them 0700 root:root, which the pool
+    user cannot enter, and the command would claim success while the file stays unreadable (audit
+    2026-11, C-20). Root keeps ownership, so the pool user still cannot write the folder or replace the
+    identity. A PRE-EXISTING folder is never touched (its owner chose its permissions)."""
+    missing: list[Path] = []
+    probe = out.parent
+    while not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt" and owner_uid != os.geteuid():
+        for directory in missing:
+            # Bandit B103 is intended here: traverse-only (no list, no write) for the pool user to reach
+            # its 0400 identity; root keeps ownership, so nobody else can read, list, replace or write.
+            os.chmod(directory, 0o711)  # nosec B103
+    return missing
 
 
 def server_install(data: bytes, out: Path, owner_uid: int = 0, owner_gid: int = 0,
@@ -1288,7 +1465,7 @@ def server_install(data: bytes, out: Path, owner_uid: int = 0, owner_gid: int = 
                 "(--owner-user <you>). As written it would end up owned by the wrong user or with "
                 "permissions that expose the keys. Nothing was written."
             )
-    out.parent.mkdir(parents=True, exist_ok=True)
+    _create_install_dirs(out, owner_uid)
     if os.name == "nt":
         _server_install_windows(data, out)
         return
@@ -1362,9 +1539,10 @@ def _server_install_windows(data: bytes, out: Path) -> None:
 
 
 def add_recipient_to_store(existing: bytes | None, recipient: dict, owner: dict) -> bytes:
-    """Create or extend a server identity (trust store) with one recipient + its developer."""
+    """Create or extend a server identity (trust store) with one recipient + its developer. The
+    developer may be a full owner or a public descriptor (C-12): only its public keys are used."""
     validate_config(recipient, "envelock-recipient")
-    validate_config(owner, "envelock-owner")
+    _validate_developer_like(owner)
     recipients, developers = parse_identity_store(existing) if existing else ([], [])
     minimums = identity_minimums(existing) if existing else {}
     entry = bytes.fromhex(recipient["x25519_private"]) + bytes.fromhex(recipient["x25519_public"])
@@ -1464,7 +1642,7 @@ def inspect_path(path: Path) -> dict:
     """
     data = bounded_read(path, MAX_SOURCE + 8 * 1024 * 1024)
     stub = len(STUB)
-    if data[:stub] == STUB:
+    if data[:stub] in STUBS:
         package = parse_package(data)
         table = package["table"]
         return {
@@ -1485,7 +1663,7 @@ def inspect_path(path: Path) -> dict:
                            for i in range(package["count"])],
             "source_bytes": package["size"],
         }
-    if data[:8] in (IDENTITY_MAGIC, IDENTITY_MAGIC_V2):
+    if data[:8] in (IDENTITY_MAGIC, IDENTITY_MAGIC_V2, IDENTITY_MAGIC_V4):
         recipients, developers = parse_identity_store(data)
         return {
             "kind": "envelock-identity-store",
@@ -1508,7 +1686,22 @@ def inspect_path(path: Path) -> dict:
                 for (project, dev_pub), serial in sorted(identity_minimums(data).items())
             ],
         }
-    # Not a protected package or an identity store: the only remaining kind is a JSON config.
+    if data[:8] == LICENCE_BIN_MAGIC:
+        # A signed license (its signature is not checked here — use 'licence verify' for that). Only
+        # its non-secret constraints are shown (audit 2026-11, C-33: inspect now recognises it).
+        lic = parse_licence(data)
+        return {
+            "kind": "envelock-licence",
+            "format": lic["format"],
+            "expires": (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(lic["expires"]))
+                        if lic["expires"] else "never"),
+            "machine": lic["machine"].hex() if lic["machine"] != ZERO32 else "any",
+            "domain": lic["domain"].hex() if lic["domain"] != ZERO32 else "any",
+            "ip": lic["ip"].hex() if lic["ip"] != ZERO32 else "any",
+            "note": "signature not verified here; the loader verifies it at start-up against the "
+                    "developers trusted in the server's identity file",
+        }
+    # Not a protected package, identity store or license: the only remaining kind is a JSON config.
     # Any non-JSON input (binary, wrong encoding) becomes a clean error, never a raw
     # UnicodeDecodeError/JSONDecodeError traceback (ENV-18: inspect validates its input).
     try:
@@ -1587,6 +1780,7 @@ def build_manifest(root: Path, project_id: bytes, release_id: bytes, serial: int
 # the operator `verify` flow.
 MANIFEST_BIN_NAME = "envelock-manifest.bin"
 MANIFEST_BIN_MAGIC = b"ENVLKMAN"
+MANIFEST_BIN_MAX = 16 * 1024 * 1024          # = ENVELOCK_MANIFEST_MAX in extension/envelock.c
 
 
 def build_manifest_bin(root: Path, project_id: bytes, release_id: bytes, serial: int,
@@ -1604,13 +1798,26 @@ def build_manifest_bin(root: Path, project_id: bytes, release_id: bytes, serial:
     body = (MANIFEST_BIN_MAGIC + bytes([FORMAT_VERSION, 0]) + project_id + release_id
             + struct.pack(">QI", serial, len(entries)))
     body += b"".join(struct.pack(">H", len(rel)) + rel + digest for rel, digest in entries)
+    # The loader refuses a runtime manifest larger than this (ENVELOCK_MANIFEST_MAX, envelock.c) as
+    # malformed, which would refuse EVERY file of the package at run time; refuse it here, at pack,
+    # where it can still be fixed (audit 2026-11-17: a huge tree packed with exit 0).
+    if len(body) + 64 > MANIFEST_BIN_MAX:
+        raise ValueError(
+            f"The runtime manifest would be {len(body) + 64} bytes, over the loader's limit of "
+            f"{MANIFEST_BIN_MAX} ({len(entries)} files): split the package, shorten its paths, or "
+            f"pack with --no-manifest")
     return body + signer.sign(body)
 
 
-def verify_package(package_dir: Path, signing_public_hex: str) -> dict:
+def verify_package(package_dir: Path, signing_public_hex: str, project: str | None = None,
+                   min_serial: int | None = None) -> dict:
     """Check a deployed package against its signed manifest. Raises ValueError if the manifest is
     missing/invalid or its signature does not verify with signing_public_hex; otherwise returns a
-    report whose 'ok' is True only when every file is present and unchanged and none were added."""
+    report whose 'ok' is True only when every file is present and unchanged and none were added --
+    and, when given, the package is of `project` and its serial is at least `min_serial`. Without
+    those pins a whole package folder swapped for ANOTHER package of the same developer (an older,
+    vulnerable release, or another project) is consistent with its own manifest and passes (audit
+    2026-11-17): the signature proves who packed it, not which package belongs there."""
     manifest_path = package_dir / "envelock-manifest"
     if not manifest_path.is_file():
         if (package_dir / MANIFEST_BIN_NAME).is_file():
@@ -1672,11 +1879,19 @@ def verify_package(package_dir: Path, signing_public_hex: str) -> dict:
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))
     changed = sorted(k for k in expected if k in actual and actual[k] != expected[k])
-    return {
-        "ok": not (missing or extra or changed),
+    pins = []
+    if project is not None and str(uuid.UUID(project)) != body["project_id"]:
+        pins.append(f"project {body['project_id']} is not the expected {uuid.UUID(project)}")
+    if min_serial is not None and not (isinstance(body["serial"], int) and body["serial"] >= min_serial):
+        pins.append(f"serial {body['serial']} is below the expected minimum {min_serial} (an older release)")
+    report = {
+        "ok": not (missing or extra or changed or pins),
         "project_id": body["project_id"], "release_id": body["release_id"], "serial": body["serial"],
         "files": len(expected), "missing": missing, "added": extra, "changed": changed,
     }
+    if project is not None or min_serial is not None:
+        report["pinned"] = pins
+    return report
 
 
 def kem_info(project_id: bytes, release_id: bytes, ephemeral_pub: bytes, recipient_pub: bytes) -> bytes:
@@ -1722,7 +1937,7 @@ def build_table(
 def parse_package(data: bytes) -> dict:
     """Parse and validate the layout of a protected file (not its signature)."""
     stub, fixed = len(STUB), len(STUB) + HEADER.size
-    if not data.startswith(STUB) or len(data) < fixed:
+    if not data.startswith(STUBS) or len(data) < fixed:
         raise ValueError("Invalid protected package")
     magic, version, flags, path_length, project, release, count, nonce, size, serial = HEADER.unpack(
         data[stub:fixed]
@@ -1765,7 +1980,7 @@ def protect(
     against the minimum set in the server's identity file."""
     if len(source) > MAX_SOURCE:
         raise ValueError("PHP file larger than 16 MiB")
-    if source.startswith(STUB):
+    if source.startswith(STUBS):
         raise ValueError("Source is already protected")
     if len(table) % RECIPIENT_SIZE or not table:
         raise ValueError("Invalid recipient table")
@@ -1812,7 +2027,7 @@ def open_protected(blob: bytes, identity) -> bytes:
 
 
 def _open_protected(blob: bytes, recipients: list, signers: list) -> bytes:
-    if not blob.startswith(STUB) or len(blob) < len(STUB) + HEADER.size + TAG_SIZE + SIGNATURE_SIZE:
+    if not blob.startswith(STUBS) or len(blob) < len(STUB) + HEADER.size + TAG_SIZE + SIGNATURE_SIZE:
         raise ValueError("Invalid format")
     signed, signature = blob[:-SIGNATURE_SIZE], blob[-SIGNATURE_SIZE:]
     for signer in signers:
@@ -1846,15 +2061,28 @@ def forbidden(path: Path) -> bool:
     return any(p.casefold() in DENIED_PARTS or p.casefold().startswith(".env") for p in path.parts)
 
 
-def validate_portable_path(path: Path) -> str:
+def validate_portable_path(path: Path, target: str = "portable") -> str:
+    """Canonical (NFC, case-folded) name of a packed file, after refusing names that cannot exist on
+    the target. target="portable" (default) refuses anything a Windows OR POSIX server would reject;
+    target="linux" keeps only the universally-fatal checks (control characters, "/" handled by the
+    walker) and ALLOWS the Windows device names and characters that a Linux deployment accepts, so a
+    legitimate aux.php / con.php / nul.php no longer blocks a Linux-only pack (audit 2026-11, C-21)."""
+    windows = target != "linux"
     for part in path.parts:
-        if (
+        if any(ord(c) < 32 for c in part):                 # control characters: refused for any target
+            raise ValueError(f"Path not portable: {path.as_posix()} contains control characters")
+        # Empty / "." / ".." components are refused for EVERY target: they are not legitimate file
+        # names and ".." is a traversal. (protect() enforces this too; keep both — C-21 relaxes the
+        # Windows-only rules for target=linux, and this must not relax with them.)
+        if part in ("", ".", ".."):
+            raise ValueError(f"Path not portable: {path.as_posix()} has an empty, '.' or '..' component")
+        if windows and (
             part.rstrip(" .") != part
             or any(c in part for c in '<>:"\\|?*')
-            or any(ord(c) < 32 for c in part)              # control characters (ENC-25)
             or part.split(".")[0].rstrip(" ").casefold() in WINDOWS_RESERVED
         ):
-            raise ValueError(f"Path not portable to Windows: {path.as_posix()}")
+            raise ValueError(f"Path not portable to Windows: {path.as_posix()} "
+                             "(pass --target linux if this package ships only to a Linux server)")
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
 
 
@@ -1949,6 +2177,47 @@ SECRET_CONTENT_RE = re.compile(
 SECRET_FORMATS_RE = re.compile(
     r"(?is)\bmachine\s+\S+\s+(?:login\s+\S+\s+)?password\s+\S"
     r"|\b[a-z][a-z0-9+.-]*://[^\s/:@'\"]+:[^\s/@'\"]+@[^\s/@'\"]")
+# A credential key (SECRET_CONTENT_RE) only matters when a real VALUE follows it. In normal
+# JavaScript the value is an EXPRESSION, not a secret: `token: getCsrf()` (a call), `{user:u,
+# password:p}` (object shorthand / a variable), `password: $pass` (a variable). Flagging those made
+# any .js asset need a blanket --allow-secret-assets (audit 2026-11, C-15). This tells a literal
+# value (a quoted string, or a bareword such as hunter2 / AKIA / 0123abcd) from such an expression.
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _asset_value_is_literal_secret(rest: str) -> bool:
+    """True when the text right after a credential key's `:`/`=` is a literal value (a quoted string
+    or a bareword), rather than a JavaScript expression (a call, a variable, an object shorthand)."""
+    v = rest.lstrip(" \t")
+    if v[:1] == ">":                        # the `=` we matched was really `=>` (PHP/arrow): skip it
+        v = v[1:].lstrip(" \t")
+    if not v:
+        return False                       # empty value: `password:` with nothing after
+    first = v[0]
+    if first in "\"'":                      # quoted string literal -> secret if it has any content
+        end = v.find(first, 1)
+        content = v[1:] if end < 0 else v[1:end]
+        return content.strip() != ""
+    if first in "$([{":                     # $var, a call, an array or an object -> expression, not a literal
+        return False
+    m = _IDENT_RE.match(v)
+    if m:
+        ident, after = m.group(0), v[m.end():].lstrip(" \t")
+        if after[:1] == "(":                # function call: getCsrf()
+            return False
+        if len(ident) < 4 and after[:1] in ",)}":   # object shorthand / short reference: password: p}
+            return False
+    return True                             # hunter2, AKIA, 0123456789abcdef, or any other literal
+
+
+def _asset_has_credentials(text: str) -> bool:
+    """A credential KEY whose value is a real literal, or a netrc/URL credential format."""
+    if SECRET_FORMATS_RE.search(text):
+        return True
+    for m in SECRET_CONTENT_RE.finditer(text):
+        if _asset_value_is_literal_secret(text[m.end():m.end() + 200]):
+            return True
+    return False
 
 
 def validate_asset(path: Path, data: bytes, allow_secret_assets: bool = False) -> None:
@@ -1964,13 +2233,21 @@ def validate_asset(path: Path, data: bytes, allow_secret_assets: bool = False) -
     # never be copied in clear. Decode like json does (UTF-8/16/32, with or without BOM), so a
     # UTF-16 copy made by Windows PowerShell is caught as well.
     text = data.decode(json.detect_encoding(data), errors="ignore")
-    if data[:8] in (IDENTITY_MAGIC, IDENTITY_MAGIC_V2) or any(marker in text for marker in SECRET_MARKERS):
+    if data[:8] in (IDENTITY_MAGIC, IDENTITY_MAGIC_V2, IDENTITY_MAGIC_V4) or any(marker in text for marker in SECRET_MARKERS):
         raise ValueError(f"Asset contains private key material: {path.as_posix()}")
-    # PHP tags on the decoded text, not only the raw bytes: a UTF-16 template with <?php is caught,
-    # and a short open tag (<? ..., but not <?xml) is readable PHP too (ENV-12).
-    lower = text.lower()
-    if ("<?php" in lower or "<?=" in lower or re.search(r"<\?(?!php\b|xml\b)", lower)
-            or b"<?php" in data.lower() or b"<?=" in data):
+    # Readable PHP in an unencrypted asset is a real leak, but a short open tag "<?" also occurs by
+    # chance in binary files (a "<?...?>" pair turns up in most images/fonts/archives above a few KB),
+    # which made this reject almost every binary asset (audit 2026-11, C-06). Test for PHP tags only
+    # when the asset is actually TEXT, decided by a STRICT decode in its detected encoding: real PHP
+    # source — a UTF-16 template included — decodes cleanly, while an image/font/archive raises and is
+    # skipped. And the short open tag must be followed by whitespace or "=" (so a lone "<?" or "<?xml"
+    # in markup or data is not taken for PHP). A readable-PHP asset is a non-.php text file, which is
+    # UTF-8/16 in practice; a non-UTF-8 source as an asset is an accepted edge (use --php-ext).
+    try:
+        source_text = data.decode(json.detect_encoding(data))
+    except (UnicodeDecodeError, LookupError):
+        source_text = None            # not decodable text: an image/font/archive, cannot be PHP source
+    if source_text is not None and re.search(r"<\?(?:php\b|=|\s)", source_text.lower()):
         raise ValueError(
             f"Asset contains readable PHP: {path.as_posix()}; use --php-ext or exclude it"
         )
@@ -1987,7 +2264,7 @@ def validate_asset(path: Path, data: bytes, allow_secret_assets: bool = False) -
     # secret in a custom name (config.data, settings.conf.local) ship silently (audit NU-05). The
     # text is already decoded above for the marker/PHP checks, so this adds no new I/O; a false
     # positive is cleared with --allow-secret-assets after review.
-    if not allow_secret_assets and (SECRET_CONTENT_RE.search(text) or SECRET_FORMATS_RE.search(text)):
+    if not allow_secret_assets and _asset_has_credentials(text):
         raise ValueError(
             f"Asset looks like it contains credentials: {path.as_posix()}. Assets are NOT encrypted; "
             "keep secrets out of the package (use environment variables or a secret manager), or pass "
@@ -2306,10 +2583,16 @@ foreach ($in["files"] as $name => $b64) {
         // never as a string literal, never as any other identifier. Static and promoted properties
         // and multi-declarations ("private $a, $b;") are left alone. Property names are
         // case-sensitive. A local variable $name is unrelated (accessed as $name, not $this->name).
+        // Also every other way a class reads its own property NAMES (audit 2026-11-17: these renamed
+        // silently, e.g. a toArray() built with foreach ($this as $k => $v) changed its keys):
+        // get_mangled_object_vars, var_export/__set_state, print_r/var_dump, ArrayObject/
+        // ArrayIterator over an object, and below, an (array) cast and foreach ($this as ...).
         $barred = array_flip(['__get','__set','__isset','__unset','__call','__callstatic','__sleep',
             '__wakeup','__serialize','__unserialize','get_object_vars','get_class_vars','compact',
             'extract','get_defined_vars','serializable','reflectionproperty','reflectionobject',
-            'reflectionclass','serialize']);
+            'reflectionclass','serialize','get_mangled_object_vars','var_export','__set_state',
+            'print_r','var_dump','debug_zval_dump','arrayobject','arrayiterator',
+            'recursivearrayiterator']);
         for ($ci = 0; $ci < $n; $ci++) {
             if ($t[$ci][0] !== T_CLASS) continue;
             if ($t[$prev($ci)][0] === T_DOUBLE_COLON || $t[$prev($ci)][0] === T_NEW) continue;
@@ -2339,6 +2622,12 @@ foreach ($in["files"] as $name => $b64) {
                     if ($nx < $n && ($t[$nx][0] === T_VARIABLE || $t[$nx][1] === "{" || $t[$nx][0] === T_CURLY_OPEN)) { $skipClass = true; break; }
                 } elseif ($id === T_STRING && isset($barred[strtolower($c)])) { $skipClass = true; break; }
                 elseif ($id === T_USE && $next($k) < $n && $t[$next($k)][1] !== "(") { $skipClass = true; break; }  // trait use (H2)
+                elseif ($id === T_ARRAY_CAST) { $skipClass = true; break; }   // (array) $obj: names as keys
+                elseif ($id === T_FOREACH) {                                     // foreach ($this as $name => ...)
+                    $f1 = $next($k); $f2 = $f1 < $n ? $next($f1) : $n; $f3 = $f2 < $n ? $next($f2) : $n;
+                    if ($f3 < $n && $t[$f1][1] === "(" && $t[$f2][0] === T_VARIABLE
+                            && $t[$f2][1] === '$this' && $t[$f3][0] === T_AS) { $skipClass = true; break; }
+                }
             }
             if ($skipClass) continue;
             // A nested class's $this->prop is its own, not this class's (ENV-2026-15): exclude nested
@@ -2577,7 +2866,17 @@ def _run_php(php: str, code: str, payload: dict, what: str, extra_args: list[str
         result = subprocess.run(  # nosec B603 # fixed argument list, no shell
             # display_errors=stderr: the JSON protocol owns STDOUT, so a PHP notice (e.g. a PHP 8.5
             # deprecation) must never land there and corrupt it; our own errors already use STDERR.
-            [exe, *(extra_args or []), "-d", "display_errors=stderr", "-r", _PHP_BOOTSTRAP],
+            # memory_limit=-1: every pass through here is a BUILD step that hands a whole batch of
+            # files to PHP at once; the host's default 128M (a php.ini-less Windows ZIP, say) would
+            # fail a large tree with "Allowed memory size exhausted". The batch size bounds peak
+            # memory, not this limit (audit 2026-11, C-13). Idempotent with the bytecode/virtualize
+            # callers that already pass it in extra_args.
+            # auto_prepend_file/auto_append_file empty: a prepend configured in the operator's php.ini
+            # (a profiler, a framework bootstrap) would otherwise run in this build-time process and
+            # write to STDOUT, corrupting the JSON the program returns (audit 2026-11, C-33/N-14).
+            [exe, *(extra_args or []), "-d", "memory_limit=-1", "-d", "display_errors=stderr",
+             "-d", "auto_prepend_file=", "-d", "auto_append_file=",
+             "-r", _PHP_BOOTSTRAP],
             input=str(len(program)).encode() + b"\n" + program + json.dumps(payload).encode(),
             capture_output=True, timeout=600,
             # No console window flashing when called from the windowed assistant (Windows only).
@@ -3900,6 +4199,59 @@ def _flatten_pass(files: dict[str, bytes], php: str = "php") -> tuple[dict[str, 
     return out, stats
 
 
+# A plain pack (no source-rewriting option) never parses the PHP, so a file with a syntax error was
+# packed with exit 0 and only failed in production; the transforming passes already parse and would
+# stop the pack (audit 2026-11, C-17). This lints every packed file with the real tokenizer and
+# returns {name: message} for those that do not parse. Advisory: it never fails the pack (the
+# operator's CLI php can be older than the server's, and a false "syntax error" must not block a
+# deploy), and it is skipped silently when no php CLI is available.
+_LINT_PHP = r"""
+if (!function_exists("token_get_all")) { fwrite(STDERR, "needs the tokenizer"); exit(2); }
+error_reporting(E_ALL & ~E_DEPRECATED);
+$in = json_decode(stream_get_contents(STDIN), true, 512, JSON_THROW_ON_ERROR);
+$out = [];
+foreach ($in["files"] as $name => $b64) {
+    $src = base64_decode($b64, true);
+    if ($src === false) { continue; }
+    try { token_get_all($src, TOKEN_PARSE); }
+    catch (\Throwable $e) { $out[$name] = $e->getMessage(); }
+}
+echo json_encode(["errors" => $out], JSON_UNESCAPED_SLASHES);
+"""
+
+
+def _lint_sources(sources: dict[str, bytes], php: str = "php") -> dict[str, str]:
+    """Best-effort PHP syntax check of the packed files: {name: message} for files that do not parse.
+    Returns {} when no usable php CLI is found (the check is advisory and never blocks the pack)."""
+    if not sources:
+        return {}
+    try:
+        res = _run_php(php, _LINT_PHP,
+                       {"files": {n: base64.b64encode(d).decode() for n, d in sources.items()}},
+                       "the syntax check")
+    except (ValueError, OSError, json.JSONDecodeError):
+        return {}
+    return res.get("errors") or {}
+
+
+def _make_staging(parent: Path) -> Path:
+    """A fresh, uniquely named staging folder in `parent`, with the folder's normal permissions.
+    Not tempfile.mkdtemp: since Python 3.12.4 it gives the folder, on Windows, a PROTECTED owner-only
+    ACL (SYSTEM, Administrators, owner), and every packed file and folder created in it kept that ACL
+    when renamed into the destination -- an IIS application-pool or other service account was denied
+    every protected file and the runtime manifest, and granting read on the site folder afterwards
+    did not reach them (audit 2026-11-17). The package is encrypted; its files are meant to be read
+    by the web server. On POSIX the mode is set explicitly at the end of the pack, as before."""
+    for _ in range(100):
+        candidate = parent / f".envelock-pack-{secrets.token_hex(8)}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise ValueError(f"Could not create a staging folder in {parent}")
+
+
 def pack_tree(
     source: Path,
     destination: Path,
@@ -3939,6 +4291,7 @@ def pack_tree(
     virtualize_loader: str | Path | None = None,
     unsafe_vm_laboratory: bool = False,
     obfuscate_flatten: bool = False,   # O6: control-flow flattening of function bodies (keyword)
+    target_os: str = "portable",       # C-21: "linux" relaxes the Windows-only portability rules
 ) -> dict:
     """php: CLI used by strip_comments/obfuscate. include_protection: protected files only run as
     the entry point or when called from protected code of the same project. no_prepend: refuse
@@ -4032,7 +4385,7 @@ def pack_tree(
     table = build_table(recipient_pubs, content_key, project_id, release_id)
     extensions = DEFAULT_EXTENSIONS if extensions is None else extensions
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".envelock-pack-", dir=destination.parent))
+    staging = _make_staging(destination.parent)
     protected, copied = 0, 0
     published = False
     portable_names = set()
@@ -4062,7 +4415,7 @@ def pack_tree(
             is_asset = _pattern_matches(name, assets)
             if not is_php and not is_asset:
                 continue
-            if _claim_portable_name(validate_portable_path(rel), portable_names, portable_dirs):
+            if _claim_portable_name(validate_portable_path(rel, target_os), portable_names, portable_dirs):
                 raise ValueError(f"Path collision on Windows/macOS: {name}")
             target = staging / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -4078,6 +4431,15 @@ def pack_tree(
                         assets_used.add(pattern)
         if not sources:
             raise ValueError("No PHP files found to protect")
+        # C-17: when NO source-rewriting pass will run, nothing parses the PHP, so a syntax error would
+        # ship silently. Lint the files with the real tokenizer and surface a warning (never fatal: the
+        # transforming passes below already stop the pack on a parse error, and this must not block a
+        # pack whose files use newer syntax than the operator's CLI php).
+        will_parse = any((virtualize, obfuscate_names, vault_strings, strip_comments, obfuscate,
+                          compact, encode_strings, obfuscate_methods, obfuscate_properties,
+                          obfuscate_flow, obfuscate_flatten, bytecode))
+        syntax_warnings = ([] if will_parse else
+                           [f"{n}: {msg}" for n, msg in sorted(_lint_sources(sources, php).items())])
         # An --asset that copied nothing used to vanish in silence (copied_assets 0, exit 0): an
         # operator who asked for `.netrc` or `.env` shipped a package without it and no word why
         # (audit 2026-11-12, H-08). Report every such pattern with the reason, for the CLI to warn.
@@ -4170,10 +4532,15 @@ def pack_tree(
         # --bytecode on, the same files are compiled to bytecode (no source shipped), so no warning.
         if not_token_transformed and not bytecode:
             listed = ", ".join(sorted(not_token_transformed))
-            print(f"WARNING: {len(not_token_transformed)} file(s) contain __halt_compiler() and could "
-                  f"not be obfuscated/vaulted (their trailing data cannot be rebuilt from tokens); they "
-                  f"ship as readable source: {listed}. Use --bytecode for these files, or --exclude "
-                  f"them. See envelock-package.json -> files_not_token_transformed.", file=sys.stderr)
+            print(f"WARNING: {len(not_token_transformed)} file(s) contain __halt_compiler() and were "
+                  f"encrypted WITHOUT the token-level hardening (obfuscation/vault): their trailing data "
+                  f"cannot be rebuilt from tokens, so those layers were skipped for them: {listed}. Two "
+                  f"consequences: (1) the original source is recoverable from the decrypted container "
+                  f"(no obfuscation) — use --bytecode or --exclude for these files; (2) if a file READS "
+                  f"its own __halt_compiler() data by re-opening __FILE__ and seeking to "
+                  f"__COMPILER_HALT_OFFSET__, that read now hits the ENCRYPTED container on disk and "
+                  f"fails — keep such a file cleartext (--exclude) or move the data to a separate asset. "
+                  f"See envelock-package.json -> files_not_token_transformed.", file=sys.stderr)
         for name, data in sources.items():
             # With the vault flag the plaintext is the table section then the source; the loader
             # registers the table and compiles only the source. count==0 files still carry the
@@ -4267,6 +4634,8 @@ def pack_tree(
         # For the caller only, never inside the package's envelock-package.json: the names of files
         # the operator asked for and did not get (".netrc", ".env.production") are not for the server.
         info["assets_not_copied"] = assets_not_copied
+        # Likewise caller-only (C-17): PHP files that did not parse under the operator's CLI php.
+        info["syntax_warnings"] = syntax_warnings
         return info
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -4598,6 +4967,77 @@ def host_ips_hash() -> bytes:
     return _fingerprint(b"envelock-ip-1", [a.encode("ascii") for a in sorted(addresses)])
 
 
+def resolve_licence_fields(days: int | None = None, expires: str | None = None,
+                           machine: str | None = None, domain: str | None = None,
+                           ip: str | None = None) -> tuple[int, bytes, bytes, bytes, list[str]]:
+    """Turn the user-facing licence inputs into the four signed fields, with EXACTLY the checks the
+    `licence issue` CLI performs, so a GUI (or any caller) issues the same licences as the command
+    line. Returns (expires_ts, machine, domain, ip, warnings); each binding is 32 bytes, ZERO32 when
+    unbound. `warnings` are plain messages (no 'WARNING:' prefix) the caller should show to the user.
+
+    `days`/`expires` are the two ways to set an expiry (mutually exclusive); `machine`/`domain`/`ip`
+    each take 'this' (fingerprint THIS host) or a 64-hex value. The released CLI keeps its own inline
+    copy of these checks; test_licence_resolver_matches_cli pins the two together on the deterministic
+    inputs so they cannot drift, and the all-zero rejections are the audited ENC-18/C-27 guards: a
+    binding slot of all zeros means 'any', so silently dropping the binding the user asked for is
+    refused rather than issued."""
+    if days is not None and expires:
+        raise ValueError("--days and --expires are alternatives")
+    expires_ts = 0
+    if days is not None:
+        if not 0 < days <= 36500:
+            raise ValueError("--days must be between 1 and 36500")
+        expires_ts = int(time.time()) + days * 86400
+    elif expires:
+        # End-of-day UTC via calendar.timegm, exactly like the CLI (ENV-2026-18: no DST double
+        # correction). strptime validates the format before anything is derived.
+        expires_ts = calendar.timegm(time.strptime(expires + " 23:59:59", "%Y-%m-%d %H:%M:%S"))
+        if expires_ts <= time.time():
+            raise ValueError(f"--expires {expires} is in the past; the licence would be expired on issue")
+    warnings: list[str] = []
+    domain_b = ZERO32
+    if domain:
+        if domain == "this":
+            domain_b = domain_hash(host_domain())
+            warnings.append("--domain this binds THIS machine's own name (" + host_domain()
+                            + "); on a web server the loader compares SERVER_NAME (the configured "
+                            "server name), which is usually different. Bind the site's name instead "
+                            "unless the package only runs from the CLI.")
+        else:
+            domain_b = domain_hash(domain)
+    ip_b = ZERO32
+    if ip:
+        if ip == "this":
+            ip_b = host_ips_hash()
+        else:
+            ip_b = bytes.fromhex(ip)
+            if len(ip_b) != 32:
+                raise ValueError("--ip takes 'this' or 64 hex characters")
+            if ip_b == ZERO32:
+                raise ValueError("--ip is all zeros, which a licence reads as 'any IP' (no binding): "
+                                 "the binding you asked for would be silently dropped. Pass a real IP "
+                                 "hash (envelock licence host-id on the target), or omit --ip for an "
+                                 "unbound licence.")
+    machine_b = ZERO32
+    if machine:
+        if machine == "this":
+            machine_b = machine_fingerprint()
+        else:
+            machine_b = bytes.fromhex(machine)
+            if len(machine_b) != 32:
+                raise ValueError("--machine takes 'this' or 64 hex characters")
+            if machine_b == ZERO32:
+                raise ValueError("--machine is all zeros, which a licence reads as 'any machine' (no "
+                                 "binding): the binding you asked for would be silently dropped. Pass "
+                                 "a real fingerprint (envelock licence machine-id on the target), or "
+                                 "omit --machine for an unbound licence.")
+    if machine_b != ZERO32 or domain_b != ZERO32 or ip_b != ZERO32:
+        warnings.append("this licence is bound to a machine, domain or IP address. Loaders on Windows "
+                        "servers cannot check those bindings and REFUSE it: it will not run on a "
+                        "Windows server. Issue an unbound (expiry-only) licence for Windows hosts.")
+    return expires_ts, machine_b, domain_b, ip_b, warnings
+
+
 # ---------------------------------------------------------------- compatibility preflight
 # Encryption replaces each .php with an encrypted stub, so any mechanism that re-opens a file to read
 # its TEXT at run time (rather than executing it) stops working: source tokenizers that build class
@@ -4607,7 +5047,7 @@ def host_ips_hash() -> bytes:
 # — it only reports, so the decision (and the protection) stays entirely with the developer. It adds
 # nothing to the package or to the runtime loader and therefore cannot weaken the protection.
 COMPAT_PATTERNS = [
-    ("source-tokenizer", re.compile(r"\btoken_get_all\s*\(", re.IGNORECASE),
+    ("source-tokenizer", re.compile(r"\btoken_get_all\s*\(|\bPhpToken\s*::\s*tokenize\s*\(", re.IGNORECASE),
      "tokenizes PHP source at run time (e.g. to build a class map). Ship the map/cache generated "
      "from a cleartext build, or exclude this file from encryption."),
     ("file-header-reader", re.compile(r"\bget_file_data\s*\(", re.IGNORECASE),
@@ -4615,8 +5055,11 @@ COMPAT_PATTERNS = [
      "carries the header unencrypted (--exclude it)."),
     ("reads-own-source", re.compile(
         r"\b(?:php_strip_whitespace|highlight_file|show_source)\s*\(|"
-        r"\bfile(?:_get_contents)?\s*\(\s*__FILE__", re.IGNORECASE),
-     "reads its own source text at run time. Exclude the file if that path is actually used."),
+        r"\b(?:file|file_get_contents|fopen|readfile)\s*\(\s*__FILE__|"
+        r"\bnew\s+SplFileObject\s*\(\s*__FILE__|"
+        r"__COMPILER_HALT_OFFSET__", re.IGNORECASE),
+     "reads its own source text at run time (its own file, or the data after __halt_compiler()). "
+     "Exclude the file if that path is actually used."),
     ("doctrine-annotation", re.compile(
         r"^\s*(?:/\*\*|\*)\s*@(?:ORM|Route|Assert|Serializer|ApiResource|Groups|Embedded)\b"),
      "mapping declared as a docblock ANNOTATION: the reader tokenizes the file's use-statements from "
@@ -4638,11 +5081,92 @@ COMPAT_PATTERNS = [
      "data stops rendering, HTTP 200 with the section simply absent). Do not use --strip-comments / "
      "--compact on a tree that contains this, or --exclude the affected files. "
      "Validated in docs/DEPLOYING-APPS.md."),
+    ("line-number-logic", re.compile(r"__LINE__|\bgetLine\s*\(|\bgetTrace(?:AsString)?\s*\("),
+     "uses source LINE NUMBERS at run time (__LINE__, an exception's getLine()/getTrace()). "
+     "--compact collapses each file onto fewer lines, so a program that uses the line number as DATA "
+     "(a cache key like 'build-'.__LINE__, an error map keyed by getLine()) silently changes value. "
+     "Plain encryption and --strip-comments keep line numbers; only --compact changes them. Leave "
+     "--compact off for such a tree, or --exclude the affected files."),
 ]
 
 # Categories whose findings are destroyed specifically by --strip-comments / --compact (they remove
 # the docblocks/comments those patterns rely on). Used for the active pack-time warning.
 _COMMENT_SENSITIVE_CATEGORIES = frozenset({"doctrine-annotation", "wp-file-header", "reads-own-docblock"})
+# Categories broken by --compact ALONE (it renumbers lines; --strip-comments keeps them). Line-number
+# logic is safe under plain encryption and --strip-comments but not under --compact (audit C-28).
+_COMPACT_SENSITIVE_CATEGORIES = frozenset({"line-number-logic"})
+
+# Categories whose evidence lives in a COMMENT, not in code: a plugin/theme header and a Doctrine
+# docblock annotation. When a token-based scan is available (below) these are matched only against the
+# file's comment text, so a PHP 8 NAMED ARGUMENT like f(slug: $x) is no longer mistaken for a
+# WordPress 'Slug:' header (audit 2026-11, C-01). Every other category is matched against code text,
+# so eval()/FFI/token_get_all/getDocComment written inside a comment or a string no longer misfire.
+_COMMENT_TEXT_CATEGORIES = frozenset({"doctrine-annotation", "wp-file-header"})
+
+# A PHP program that classifies each byte of every file as code, comment or string using the real
+# tokenizer, and returns two masked copies per file: `code` (comment and string text blanked to
+# spaces, newlines kept) and `comments` (everything but comment text blanked). The regex detectors
+# then run on the right copy, which removes the false positives and the named-argument header
+# confusion the audit reported (C-01). token_get_all is used WITHOUT TOKEN_PARSE so it lexes
+# best-effort and never throws on a file that does not fully parse. Advisory only: the result never
+# changes what is encrypted or how the loader runs.
+_NO_TOKENIZER_NOTE = ("Note: no php CLI was found (--php), so this scan used text patterns instead of the "
+                      "tokenizer; it can misflag eval/FFI/token_get_all/annotations/headers written inside "
+                      "a comment or a string. Install PHP 8, or pass --php /path/to/php, for an exact scan.")
+
+_PHP_COMPAT_SCAN = r"""
+if (!function_exists("token_get_all")) { fwrite(STDERR, "needs the tokenizer"); exit(2); }
+$in = json_decode(stream_get_contents(STDIN), true, 512, JSON_THROW_ON_ERROR);
+$COMMENT = array_flip([T_COMMENT, T_DOC_COMMENT]);
+$STR = array_flip([T_CONSTANT_ENCAPSED_STRING, T_ENCAPSED_AND_WHITESPACE, T_INLINE_HTML,
+                   T_START_HEREDOC, T_END_HEREDOC]);
+$out = [];
+foreach ($in["files"] as $name => $b64) {
+    $src = base64_decode($b64, true);
+    if ($src === false) { continue; }
+    $code = ""; $cmt = "";
+    foreach (@token_get_all($src) as $t) {
+        if (is_array($t)) { $id = $t[0]; $txt = $t[1]; } else { $id = -1; $txt = $t; }
+        $blank = preg_replace('/[^\n]/', ' ', $txt);           // keep line breaks, blank the rest
+        if ($id !== -1 && isset($COMMENT[$id])) { $cmt .= $txt;   $code .= $blank; }
+        elseif ($id !== -1 && isset($STR[$id]))  { $cmt .= $blank; $code .= $blank; }
+        else                                     { $cmt .= $blank; $code .= $txt;  }
+    }
+    $out[$name] = ["code" => base64_encode($code), "comments" => base64_encode($cmt)];
+}
+echo json_encode(["files" => $out], JSON_UNESCAPED_SLASHES);
+"""
+
+
+def _php_code_comment_masks(php: str, source: Path, extensions: set,
+                            skip_top: frozenset = frozenset()) -> dict | None:
+    """Best-effort token-based masks of each scanned file: {rel: {"code", "comments"}} with comment
+    and string text blanked out of `code`, and only comments left in `comments`. Returns None when no
+    usable php CLI is found, so the caller falls back to the raw-text regex scan (identical to the
+    historical behaviour). Never raises: an advisory scan must not block recommend/preflight."""
+    files: dict[str, str] = {}
+    for path in _scanned_files(source, extensions, skip_top):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        files[path.relative_to(source).as_posix()] = base64.b64encode(data).decode("ascii")
+    if not files:
+        return {}
+    masks: dict[str, dict] = {}
+    items = list(files.items())
+    try:
+        for i in range(0, len(items), 400):        # bound peak memory, like the other PHP passes
+            res = _run_php(php, _PHP_COMPAT_SCAN, {"files": dict(items[i:i + 400])},
+                           "the compatibility scan")
+            for name, blobs in res.get("files", {}).items():
+                masks[name] = {
+                    "code": base64.b64decode(blobs["code"]).decode("utf-8", "replace"),
+                    "comments": base64.b64decode(blobs["comments"]).decode("utf-8", "replace"),
+                }
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError, base64.binascii.Error):
+        return None
+    return masks
 
 
 def _scanned_files(source: Path, extensions: set, skip_top: frozenset = frozenset()) -> list[Path]:
@@ -4654,21 +5178,33 @@ def _scanned_files(source: Path, extensions: set, skip_top: frozenset = frozense
             if p.suffix.lower() in extensions and p.is_file() and not p.is_symlink()]
 
 
-def compatibility_findings(source: Path, extensions: set, skip_top: frozenset = frozenset()) -> dict:
+def compatibility_findings(source: Path, extensions: set, skip_top: frozenset = frozenset(),
+                           masks: dict | None = None) -> dict:
     """Static read-only scan: category -> {'hint', 'hits':[(relpath, line)]}. Never executes code.
     Fails closed on a bad --source: a non-existent path or a single file would otherwise rglob to
-    nothing and look like a clean project, so preflight/recommend would silently approve it (ENV-2026-11)."""
+    nothing and look like a clean project, so preflight/recommend would silently approve it (ENV-2026-11).
+    When `masks` (from _php_code_comment_masks) is given, each category matches against the token-aware
+    copy that fits it — comment categories against comment text, the rest against code text — so a
+    pattern inside a comment or a string no longer misfires (C-01). Without masks the behaviour is the
+    historical raw-text scan: both copies are the file text, so every line is matched as before."""
     if not source.is_dir():
         raise ValueError(f"--source must be a project directory (got: {source})")
     findings: dict = {}
     for path in _scanned_files(source, extensions, skip_top):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
         rel = path.relative_to(source).as_posix()
-        for lineno, line in enumerate(text.splitlines(), 1):
-            for category, pattern, hint in COMPAT_PATTERNS:
+        mask = masks.get(rel) if masks else None
+        if mask is not None:
+            code_lines = mask["code"].splitlines()
+            comment_lines = mask["comments"].splitlines()
+        else:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            code_lines = comment_lines = text.splitlines()
+        for category, pattern, hint in COMPAT_PATTERNS:
+            lines = comment_lines if category in _COMMENT_TEXT_CATEGORIES else code_lines
+            for lineno, line in enumerate(lines, 1):
                 if pattern.search(line):
                     findings.setdefault(category, {"hint": hint, "hits": []})["hits"].append((rel, lineno))
     return findings
@@ -4702,14 +5238,18 @@ _ENCRYPTION_BREAKING_CATEGORIES = frozenset({
 # would break it. assert('string') compiles its argument; create_function() is an eval() wrapper.
 # Case-insensitive (PHP keywords/functions are), and DOTALL so `eval\n(...)` split across lines is
 # still caught (ENV-2026-13): the whitespace class spans newlines.
-_EVAL_RE = re.compile(r"\beval\s*\(|\bcreate_function\s*\(|\bassert\s*\(\s*['\"]",
+# The leading (?<![\w$>:]) keeps a METHOD or property named the same from misfiring: $redis->eval(…),
+# Cache::eval(…), $myeval(…) or a function named my_eval are not the language construct (audit C-01).
+_EVAL_RE = re.compile(r"(?<![\w$>:])eval\s*\(|(?<![\w$>:])create_function\s*\(|"
+                      r"(?<![\w$>:])assert\s*\(\s*['\"]",
                       re.IGNORECASE | re.DOTALL)
 
 
-def _tree_uses_runtime_compile(source: Path, extensions: set, skip_top: frozenset = frozenset()) -> list:
+def _tree_uses_runtime_compile(source: Path, extensions: set, skip_top: frozenset = frozenset(),
+                               masks: dict | None = None) -> list:
     """Files that eval()/create_function()/assert('...') — what --sealed refuses at run time. Returns a
     few 'relpath:line' examples (bounded), used to gate the --sealed recommendation."""
-    return _tree_matches(source, extensions, _EVAL_RE, skip_top)
+    return _tree_matches(source, extensions, _EVAL_RE, skip_top, masks=masks)
 
 
 # FFI or dl() used by the project itself: --no-ffi refuses to load while either is reachable, so a
@@ -4723,24 +5263,30 @@ _TEMPLATE_SUFFIXES = (".blade.php",)
 _RUNTIME_CACHE_DIRS = ("bootstrap/cache", "storage/framework", "var/cache")
 
 
-def _tree_matches(source: Path, extensions: set, pattern, skip_top: frozenset = frozenset()) -> list:
+def _tree_matches(source: Path, extensions: set, pattern, skip_top: frozenset = frozenset(),
+                  masks: dict | None = None, use_comments: bool = False) -> list:
     hits: list[str] = []
     for path in _scanned_files(source, extensions, skip_top):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        rel = path.relative_to(source).as_posix()
+        mask = masks.get(rel) if masks else None
+        if mask is not None:
+            text = mask["comments"] if use_comments else mask["code"]
+        else:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
         # Scan the whole file text (not line by line) so `eval` and its `(` on different lines match;
         # report the line of the match start.
         for m in pattern.finditer(text):
             line = text.count("\n", 0, m.start()) + 1
-            hits.append(f"{path.relative_to(source).as_posix()}:{line}")
+            hits.append(f"{rel}:{line}")
             if len(hits) >= 8:
                 return hits
     return hits
 
 
-def recommend_options(source: Path, extensions: set) -> dict:
+def recommend_options(source: Path, extensions: set, masks: dict | None = None) -> dict:
     """Analyse the tree and recommend the STRONGEST protection that measurement shows is SAFE for it,
     turning OFF only what would break THIS project. Grounded in the four-CMS matrix and the preflight
     detectors (docs/DEPLOYING-APPS.md): it never recommends an option known to break the project.
@@ -4773,19 +5319,29 @@ def recommend_options(source: Path, extensions: set) -> dict:
                                                            if p != "vendor/*") +
                      ") are regenerated on the server and are not packed; they must still exist and be "
                      "writable there.")
-    findings = compatibility_findings(source, extensions, skip_top)
+    findings = compatibility_findings(source, extensions, skip_top, masks=masks)
     for cache in _RUNTIME_CACHE_DIRS:
         for data in findings.values():
             data["hits"] = [h for h in data["hits"] if not h[0].startswith(cache + "/")]
     findings = {c: d for c, d in findings.items() if d["hits"]}
     comment_sensitive = {c: d for c, d in findings.items() if c in _COMMENT_SENSITIVE_CATEGORIES}
+    compact_sensitive = {c: d for c, d in findings.items() if c in _COMPACT_SENSITIVE_CATEGORIES}
     encryption_breaking = {c: d for c, d in findings.items() if c in _ENCRYPTION_BREAKING_CATEGORIES}
-    eval_hits = _tree_uses_runtime_compile(source, extensions, skip_top)
-    ffi_hits = _tree_matches(source, extensions, _FFI_RE, skip_top)
+    eval_hits = _tree_uses_runtime_compile(source, extensions, skip_top, masks=masks)
+    ffi_hits = _tree_matches(source, extensions, _FFI_RE, skip_top, masks=masks)
     scanned = [p.relative_to(source).as_posix() for p in _scanned_files(source, extensions, skip_top)]
     scanned = [p for p in scanned if not any(p.startswith(c + "/") for c in _RUNTIME_CACHE_DIRS)]
     templates = sorted(p for p in scanned if p.lower().endswith(_TEMPLATE_SUFFIXES))
     entry_scripts = _cleartext_php_entry_points(source, skip_top)
+    other_php = _php_in_other_extensions(source, extensions, skip_top)
+    if other_php:
+        shown = ", ".join(other_php[:4]) + (", ..." if len(other_php) > 4 else "")
+        exts = sorted({Path(p).suffix for p in other_php})
+        notes.append("These files start with <?php but their extension is not in the PHP set, so pack "
+                     "would neither encrypt nor copy them and they would be MISSING on the server (" +
+                     shown + "). Add their extensions with --php-ext (e.g. " +
+                     " ".join("--php-ext " + e for e in exts) + ") to encrypt them, or --asset them to "
+                     "ship them cleartext.")
 
     on: list[str] = []
     off: dict[str, str] = {}
@@ -4811,30 +5367,38 @@ def recommend_options(source: Path, extensions: set) -> dict:
         "[$this, 'on' . $event] or a string handed to a callback) would break. Check: test the parts of "
         "the app that dispatch by name; if one breaks, drop this option")
     # include protection: a protected file refuses to load unless a protected file of the same project
-    # is already on the call stack or it is the entry script. An extensionless PHP entry point
-    # (artisan, bin/console) is never encrypted by pack, so the console would refuse the protected code
-    # it loads: measured on Laravel, `php artisan route:list` -> "include protection: it can only be
-    # loaded by its own application" while the web routes ran.
+    # is already on the call stack, or it is the entry script. Recommend turning it OFF whenever
+    # anything in THIS recommendation would run project code with no protected frame on the stack. Only
+    # cross-checking the extensionless entry point and vendor/ (not every cleartext .php, a Composer app
+    # whose vendor/ is absent, or a WordPress plugin) was audit 2026-11 C-04; H-03 is the vendor/ case.
+    cleartext_php_now = sorted({h[0] for d in encryption_breaking.values() for h in d["hits"]
+                                if h[0].lower().endswith(".php")})
+    ip_off = []
     if entry_scripts:
+        ip_off.append("a PHP entry point pack leaves in the clear (" + ", ".join(entry_scripts[:3]) +
+                      ": no .php extension), whose console commands (migrations, queues, the scheduler) "
+                      "would then refuse the protected code they load")
+    if "vendor/*" in exclude_patterns:
+        ip_off.append("vendor/ (Composer) is left out of the package, so library code PHP calls back "
+                      "with no protected file on the stack — an exception or error handler, a shutdown "
+                      "function, a session or output handler — refuses your protected classes and the "
+                      "request dies, often on its error page (external audit 2026-11-12, H-03)")
+    elif (source / "composer.json").is_file():
+        ip_off.append("composer.json is present but vendor/ is not installed here, so a Composer "
+                      "autoloader — which runs with no protected file on the stack — would be what loads "
+                      "your protected classes")
+    if cleartext_php_now:
+        ip_off.append("some .php must stay cleartext (e.g. " + cleartext_php_now[0] + ", which reads its "
+                      "own source), and such a file cannot share the include-protection call stack with "
+                      "the protected ones")
+    if "wp-file-header" in findings:
+        ip_off.append("this looks like a WordPress plugin/theme, which an unprotected WordPress core "
+                      "loads directly")
+    if ip_off:
         off["--include-protection"] = (
-            "this project has a PHP entry point that pack leaves in the clear (" + ", ".join(entry_scripts[:3]) +
-            ": no .php extension); with include protection the protected code it loads refuses to run, "
-            "so its console commands (migrations, queues, the scheduler) would fail. Use it only if every "
-            "entry point is protected")
-    elif "vendor/*" in exclude_patterns:
-        # This recommendation itself leaves vendor/ out (above), and the two do not mix: PHP calls some
-        # library code back with no protected file on the call stack — an exception or error handler,
-        # a shutdown function, a session or output handler registered from vendor/ — and when that
-        # code autoloads one of the project's protected classes (through vendor/'s autoloader),
-        # include protection refuses it and the request dies, usually on its error path. Measured by
-        # the external audit of 2026-11-12 (H-03): an exception handler in vendor/ loading a protected
-        # formatter -> "include protection: it can only be loaded by its own application".
-        off["--include-protection"] = (
-            "vendor/ (Composer) is left out of the package, and library code that PHP calls back with no "
-            "protected file on the call stack — an exception or error handler, a shutdown function, a "
-            "session or output handler registered from vendor/ — refuses to load your protected classes "
-            "under include protection, so the request dies, often on its error page. Use it only if "
-            "vendor/ is packed with the application too, and then test the error pages")
+            "; ".join(ip_off) + ". Under include protection the request dies with "
+            "\"it can only be loaded by its own application\"; use it only when the WHOLE application is "
+            "packed as protected, then test every page, console command and cron job")
     else:
         on.append("--include-protection")
         verify["--include-protection"] = (
@@ -4860,31 +5424,50 @@ def recommend_options(source: Path, extensions: set) -> dict:
         "depends on the server: auto_prepend_file and auto_append_file must be empty there, and some "
         "hosting security or monitoring agents set one (Wordfence's firewall, for instance); otherwise the "
         "package refuses to load. Check: run scripts/envelock-preflight.php on the server")
-    # strip-comments / compact: only when nothing reads its own docblocks/comments at run time
-    # (PrestaShop's AbstractLazyArray did, so these broke it — four-CMS matrix).
+    # strip-comments: only when nothing reads its own docblocks/comments at run time (PrestaShop's
+    # AbstractLazyArray did, so this broke it — four-CMS matrix). --strip-comments KEEPS line numbers.
+    docblock_why = ("no code here reads its own docblocks in a way the analysis knows (annotations, "
+                    "getDocComment(), file headers), but a library can read the application's "
+                    "@var/@param docblocks for type information at run time")
+    if docblock_readers:
+        docblock_why += (" — and this project has one (" + ", ".join("vendor/" + n for n in docblock_readers) +
+                         ", used e.g. by Symfony's serializer and forms): with the comments gone it can "
+                         "silently change how data is (de)serialised")
     if comment_sensitive:
         files = sorted({h[0] for d in comment_sensitive.values() for h in d["hits"]})
-        reason = ("the tree reads its own docblocks/comments at run time (" +
-                  ", ".join(sorted(comment_sensitive)) + f"; e.g. {files[0]}); removing them would "
-                  "silently break it")
-        off["--strip-comments"] = reason
-        off["--compact"] = reason
+        off["--strip-comments"] = ("the tree reads its own docblocks/comments at run time (" +
+                                   ", ".join(sorted(comment_sensitive)) + f"; e.g. {files[0]}); removing "
+                                   "them would silently break it")
     else:
-        on += ["--strip-comments", "--compact"]
-        why = ("no code here reads its own docblocks in a way the analysis knows (annotations, "
-               "getDocComment(), file headers), but a library can read the application's @var/@param "
-               "docblocks for type information at run time")
-        if docblock_readers:
-            why += (" — and this project has one (" + ", ".join("vendor/" + n for n in docblock_readers) +
-                    ", used e.g. by Symfony's serializer and forms): with the comments gone it can "
-                    "silently change how data is (de)serialised")
-        why += (". Check: test the paths that serialise, deserialise or validate objects; if anything "
-                "changes, drop both options")
-        verify["--strip-comments"] = why
-        verify["--compact"] = why
+        on.append("--strip-comments")
+        verify["--strip-comments"] = docblock_why + (". Check: test the paths that serialise, "
+                                                     "deserialise or validate objects; if anything "
+                                                     "changes, drop it")
+    # compact: off when docblocks/comments are read at run time (it removes them) OR line numbers are
+    # used as DATA (it renumbers them — audit C-28). --compact is the only option that changes line
+    # numbers, so its gate is wider than --strip-comments'.
+    if comment_sensitive or compact_sensitive:
+        bits = []
+        if comment_sensitive:
+            cf = sorted({h[0] for d in comment_sensitive.values() for h in d["hits"]})[0]
+            bits.append("reads its own docblocks/comments at run time (" +
+                        ", ".join(sorted(comment_sensitive)) + f"; e.g. {cf})")
+        if compact_sensitive:
+            lf = sorted({h[0] for d in compact_sensitive.values() for h in d["hits"]})[0]
+            bits.append(f"uses source line numbers as data (__LINE__/getLine()/getTrace(); e.g. {lf}), "
+                        "which --compact changes")
+        off["--compact"] = "the tree " + " and ".join(bits) + "; --compact would silently break it"
+    else:
+        on.append("--compact")
+        verify["--compact"] = docblock_why + (". --compact also collapses lines, so anything that uses "
+                                              "__LINE__ or an exception's getLine()/getTrace() as DATA "
+                                              "(a cache key, an error map) would change. Check: test "
+                                              "those paths; if anything changes, drop it")
         notes.append("--compact collapses each file's lines: error messages, stack traces and listings "
                      "that show source positions (e.g. `artisan route:list`) report the collapsed line "
-                     "numbers. Leave it off if you need production line numbers.")
+                     "numbers, and any code that uses the line number as DATA (a 'build-'.__LINE__ cache "
+                     "key, an error map keyed by getLine()) changes value. Leave it off if you need "
+                     "production line numbers or use them as logic.")
     # sealed: only when the tree does not compile strings at run time (eval/create_function/assert) AND
     # there are no .php files we have to keep cleartext (sealed would refuse those unless allowlisted —
     # recommending --sealed together with --exclude of .php was ENV-2026-12).
@@ -4990,8 +5573,32 @@ def _cleartext_php_entry_points(source: Path, skip_top: frozenset = frozenset())
                 head = handle.read(256)
         except OSError:
             continue
+        head = head.lstrip(b"\xef\xbb\xbf")             # tolerate a UTF-8 BOM before the tag (C-03)
         first = head.split(b"\n", 1)[0]
-        if head.startswith(b"<?php") or (first.startswith(b"#!") and b"php" in first):
+        # lstrip() also drops a blank line or indentation before <?php (some generators emit one).
+        if head.lstrip().startswith(b"<?php") or (first.startswith(b"#!") and b"php" in first):
+            found.append(path.relative_to(source).as_posix())
+    return sorted(found)
+
+
+def _php_in_other_extensions(source: Path, extensions: set, skip_top: frozenset = frozenset()) -> list[str]:
+    """Files whose EXTENSION is not in the PHP set but whose content starts with `<?php` (Drupal's
+    .module/.install, a .dist template, etc.). pack neither encrypts them (wrong extension) nor copies
+    them (not an --asset), so they go missing on the server unless added with --php-ext (C-03)."""
+    found: list[str] = []
+    php_ext = {e.lower() for e in extensions}
+
+    def skip(rel: Path) -> bool:
+        return any(part in DENIED_PARTS for part in rel.parts) or (len(rel.parts) and rel.parts[0] in skip_top)
+    for path in _source_entries(source, skip):
+        if not path.suffix or path.suffix.lower() in php_ext or not path.is_file() or path.is_symlink():
+            continue
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(256)
+        except OSError:
+            continue
+        if head.lstrip(b"\xef\xbb\xbf").lstrip().startswith(b"<?php"):
             found.append(path.relative_to(source).as_posix())
     return sorted(found)
 
@@ -5051,10 +5658,44 @@ def format_recommendation(rec: dict) -> str:
     return "\n".join(out)
 
 
+def _one_developer_source(args) -> Path:
+    """The single developer identity to build a trust store from: --developer (a public descriptor,
+    recommended) or --owner (a full signing identity). Exactly one is required (C-12)."""
+    if args.developer and args.owner:
+        raise ValueError("pass --developer OR --owner, not both")
+    source = args.developer or args.owner
+    if source is None:
+        raise ValueError("this command needs --developer (public descriptor from export-developer) "
+                         "or --owner")
+    return source
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    """A SIGTERM/SIGHUP handler that raises, so the pack's finally/except cleanup runs."""
+    raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+
+def _install_termination_handlers() -> None:
+    """Make SIGTERM/SIGHUP raise KeyboardInterrupt instead of killing the process outright, so an
+    interrupted --bytecode pack (a CI cancel, a closed terminal) runs the cleanup that removes the
+    plaintext sources at the deploy path and the temporary pack folder, instead of leaving them behind
+    (audit 2026-11, C-18). SIGINT already behaves this way. Only the main thread can set signal
+    handlers (the GUI packs in a worker thread), and some platforms lack SIGHUP, so this is guarded and
+    is a no-op where it cannot apply."""
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _raise_keyboard_interrupt)
+        except (ValueError, OSError):   # not the main thread, or unsupported on this platform
+            pass
+
+
 def main() -> int:
     # Private key material and its parent directories must not inherit a lax umask.
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="Envelock: offline encoder (prototype)")
+    parser = argparse.ArgumentParser(description="Envelock: offline PHP source encoder")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init-owner", help="Create a private signing identity; DO NOT distribute")
     p.add_argument("--out", type=Path, required=True)
@@ -5071,13 +5712,22 @@ def main() -> int:
     p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("export-identity", help="Create the SECRET server identity file")
     p.add_argument("--recipient", type=Path, required=True)
-    p.add_argument("--owner", type=Path, required=True)
+    p.add_argument("--owner", type=Path, help="Signing identity (its PUBLIC keys are used)")
+    p.add_argument("--developer", type=Path,
+                   help="Public developer descriptor from export-developer, instead of --owner, so the "
+                        "private signing key never leaves the packaging machine (recommended)")
     p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("server-install",
                        help="Install the SECRET identity file as root:root mode 0400 (O5)")
-    p.add_argument("--recipient", type=Path, action="append", required=True,
+    p.add_argument("--recipient", type=Path, action="append",
                    help="Recipient private descriptor; repeat for a host serving several projects")
-    p.add_argument("--owner", type=Path, required=True)
+    p.add_argument("--owner", type=Path, help="Signing identity (its PUBLIC keys are used)")
+    p.add_argument("--developer", type=Path,
+                   help="Public developer descriptor from export-developer, instead of --owner, so the "
+                        "private signing key never leaves the packaging machine (recommended)")
+    p.add_argument("--identity", type=Path,
+                   help="Install an identity file already built with export-identity, instead of "
+                        "--recipient/--developer: nothing secret is typed on the server")
     p.add_argument("--out", type=Path, required=True,
                    help="Where to install it, e.g. /etc/envelock/identity.bin")
     p.add_argument("--owner-user",
@@ -5096,7 +5746,10 @@ def main() -> int:
     pa = rsub.add_parser("add", help="Add a recipient and its developer to the identity file")
     pa.add_argument("--identity", type=Path, required=True, help="Identity file to create or extend")
     pa.add_argument("--recipient", type=Path, required=True, help="Recipient private descriptor")
-    pa.add_argument("--owner", type=Path, required=True, help="Signing identity (trusted developer)")
+    pa.add_argument("--owner", type=Path, help="Signing identity (its PUBLIC keys are used)")
+    pa.add_argument("--developer", type=Path,
+                    help="Public developer descriptor from export-developer, instead of --owner, so the "
+                         "private signing key never leaves the packaging machine (recommended)")
     pr = rsub.add_parser("remove", help="Remove a recipient from the identity file")
     pr.add_argument("--identity", type=Path, required=True)
     pr.add_argument("--recipient", type=Path, required=True,
@@ -5176,8 +5829,15 @@ def main() -> int:
     p = sub.add_parser("verify", help="Check a packed folder against its signed manifest (pack --manifest)")
     p.add_argument("--package", type=Path, required=True)
     vg = p.add_mutually_exclusive_group(required=True)
-    vg.add_argument("--developer", type=Path, help="Trusted developer public descriptor")
-    vg.add_argument("--owner", type=Path, help="Owner descriptor (uses its signing public key)")
+    vg.add_argument("--developer", type=Path, help="Trusted developer public descriptor (use this "
+                                                    "on a server: it holds no private key)")
+    vg.add_argument("--owner", type=Path, help="Owner key (its private file is decrypted to read the "
+                                                "public key: for the packaging machine, not a server)")
+    p.add_argument("--project", help="Fail unless the package is of this project UUID (a whole package "
+                                     "swapped for another project of the same developer passes "
+                                     "without it)")
+    p.add_argument("--min-serial", type=int, help="Fail unless the package's serial is at least this "
+                                                  "(catches an older release swapped in)")
     p = sub.add_parser("new-project", help="Generate project UUID; keep it across releases")
     p = sub.add_parser("preflight",
                        help="Scan a source tree for code that reads its OWN source at run time "
@@ -5185,6 +5845,9 @@ def main() -> int:
                             "encryption. Read-only; changes nothing")
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--php-ext", action="append", default=[], help="Additional PHP extension, e.g. .module")
+    p.add_argument("--php", default="php",
+                   help="php CLI used to tokenize files for an exact scan (ignores eval/FFI/headers "
+                        "written inside comments or strings). Falls back to text patterns if absent")
     p.add_argument("--json", action="store_true", help="Machine-readable output")
     p.add_argument("--strict", action="store_true", help="Exit non-zero if any issue is found")
 
@@ -5194,6 +5857,9 @@ def main() -> int:
                             "and turns off only what would break THIS project. Read-only")
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--php-ext", action="append", default=[], help="Additional PHP extension, e.g. .module")
+    p.add_argument("--php", default="php",
+                   help="php CLI used to tokenize files for an exact scan (ignores eval/FFI/headers "
+                        "written inside comments or strings). Falls back to text patterns if absent")
     p.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p = sub.add_parser("pack", help="Encrypt PHP per recipient and copy ONLY explicit assets")
@@ -5291,10 +5957,16 @@ def main() -> int:
                    help="Protected files run only as the entry point or when called from "
                         "protected code of the same project (not from other scripts)")
     p.add_argument("--no-prepend", action="store_true",
-                   help="Refuse to run when auto_prepend_file/auto_append_file are set")
+                   help="Refuse to run when auto_prepend_file/auto_append_file are set. NOTE: PHP runs a "
+                        "site-configured prepend BEFORE this package is reached, so this detects and "
+                        "refuses a misconfigured server; it does not stop a prepend that already ran. "
+                        "Disable prepends at the pool/php.ini level for real protection.")
     p.add_argument("--no-ffi", action="store_true",
-                   help="Refuse to run while FFI or dl() is reachable (they can read the "
-                        "decrypted code from process memory); enable only if the app needs neither")
+                   help="Refuse to run while FFI or dl() is reachable (they can read the decrypted code "
+                        "AND the server's identity key from process memory). NOTE: the identity key is in "
+                        "worker memory from startup and a prepend/FFI runs before this check, so this "
+                        "refuses a misconfigured server but cannot undo an in-process read — set "
+                        "ffi.enable=0 and enable_dl=0 at the server. Enable only if the app needs neither.")
     p.add_argument("--sealed", action="store_true",
                    help="Sealed tree: the loader refuses any plain (unencrypted) PHP under the "
                         "package folder and refuses eval() while the package is active; enable only "
@@ -5319,7 +5991,12 @@ def main() -> int:
     p.add_argument("--allow-secret-assets", action="store_true",
                    help="Permit config assets (.json/.env/.ini/...) whose content looks like "
                         "credentials. Assets are NOT encrypted; only use this after reviewing them")
+    p.add_argument("--target", choices=["portable", "linux"], default="portable",
+                   help="File-name portability to enforce. 'portable' (default) refuses names a "
+                        "Windows OR POSIX server would reject; 'linux' allows names a Linux server "
+                        "accepts but Windows reserves (aux.php, con.php, nul.php, trailing dots)")
     args = parser.parse_args()
+    _install_termination_handlers()
     try:
         if args.command == "init-owner":
             save_json(args.out, make_owner(with_recovery=args.with_recovery), new_password(args))
@@ -5328,9 +6005,10 @@ def main() -> int:
         elif args.command == "export-public":
             save_json(args.out, recipient_public(read_config(args.recipient, "envelock-recipient")))
         elif args.command == "export-identity":
+            dev_path = _one_developer_source(args)
             identity = make_identity(
                 read_config(args.recipient, "envelock-recipient"),
-                read_config(args.owner, "envelock-owner"),
+                read_developer_like(dev_path),
             )
             secret_write(args.out, identity_bytes(identity))
             print(RESTART_NOTE)
@@ -5348,9 +6026,27 @@ def main() -> int:
                 except KeyError:
                     raise ValueError(f"unknown user for --owner-user: {args.owner_user}")
                 owner_uid, owner_gid, owner_name = pw.pw_uid, pw.pw_gid, pw.pw_name
-            server_install(
-                server_install_identities(args.recipient, args.owner), args.out,
-                owner_uid=owner_uid, owner_gid=owner_gid)
+            if args.identity is not None:
+                # Install an identity file already built (with export-identity) on the packaging
+                # machine: nothing secret is typed on the server (C-12).
+                if args.recipient or args.owner or args.developer:
+                    raise ValueError("--identity installs a prebuilt file; do not also pass "
+                                     "--recipient/--owner/--developer")
+                bundle = bounded_read(args.identity, IDENTITY_MAX_FILE)
+                # Only an identity file: a wrong argument (the owner key, say) used to be installed as
+                # is, putting the private SIGNING key on the server -- what --identity exists to avoid
+                # (C-12) -- and the loader then just failed to start (audit 2026-11-17).
+                try:
+                    parse_identity_store(bundle)
+                except ValueError as error:
+                    raise ValueError(f"{args.identity} is not an Envelock server identity file "
+                                     f"({error}); nothing was installed") from error
+            else:
+                if not args.recipient:
+                    raise ValueError("server-install needs --recipient (and --owner or --developer), "
+                                     "or --identity to install a prebuilt file")
+                bundle = server_install_identities(args.recipient, _one_developer_source(args))
+            server_install(bundle, args.out, owner_uid=owner_uid, owner_gid=owner_gid)
             if os.name == "nt":
                 print(f"Installed {args.out}, read-only, readable only by SYSTEM, Administrators "
                       "and you (protected access list).")
@@ -5364,6 +6060,9 @@ def main() -> int:
             print(RESTART_NOTE)
         elif args.command == "keygen":
             if args.kind == "owner":
+                if args.label:
+                    raise ValueError("keygen owner does not take --label (a label names a RECIPIENT); "
+                                     "nothing was written")
                 save_json(args.out, make_owner(with_recovery=args.with_recovery), new_password(args))
             else:
                 if not args.label:
@@ -5377,7 +6076,7 @@ def main() -> int:
                 data = add_recipient_to_store(
                     existing,
                     read_config(args.recipient, "envelock-recipient"),
-                    read_config(args.owner, "envelock-owner"),
+                    read_developer_like(_one_developer_source(args)),
                 )
             else:
                 if existing is None:
@@ -5455,7 +6154,13 @@ def main() -> int:
                 developer_pub = ZERO32   # admin-set: unbound (applies to any developer)
             data = set_minimum(existing, project, serial, developer_pub, args.allow_downgrade)
             write_store(args.identity, data)
-            print(f"Project {uuid.UUID(project)}: releases with a serial below {serial} are refused")
+            eff = effective_minimum(data, project, developer_pub)
+            if eff == serial:
+                print(f"Project {uuid.UUID(project)}: releases with a serial below {serial} are refused")
+            else:
+                # C-32: a higher applicable minimum (bound or unbound) still governs this project.
+                print(f"Project {uuid.UUID(project)}: this entry records {serial}, but a higher "
+                      f"applicable minimum ({eff}) means releases below {eff} are refused")
             print(RESTART_NOTE)
         elif args.command == "licence":
             if args.subcommand == "machine-id":
@@ -5503,6 +6208,14 @@ def main() -> int:
                         # An already-expired licence is refused by every loader (ENC-23).
                         raise ValueError(f"--expires {args.expires} is in the past; the licence "
                                          "would be expired on issue")
+                # An EMPTY --machine/--domain/--ip (a script whose fingerprint capture failed: --machine
+                # "$FP" with FP empty) used to issue an UNBOUND licence with exit 0 -- more than was
+                # asked. Omitting the option is how to ask for no binding (audit 2026-11-17).
+                for name in ("machine", "domain", "ip"):
+                    value = getattr(args, name)
+                    if value is not None and not value.strip():
+                        raise ValueError(f"--{name} is empty; pass a value (or 'this'), or omit "
+                                         f"--{name} for a licence not bound to it")
                 domain = ip = ZERO32
                 if args.domain:
                     domain = (domain_hash(host_domain()) if args.domain == "this"
@@ -5514,6 +6227,11 @@ def main() -> int:
                         ip = bytes.fromhex(args.ip)
                         if len(ip) != 32:
                             raise ValueError("--ip takes 'this' or 64 hex characters")
+                        if ip == ZERO32:
+                            raise ValueError("--ip is all zeros, which a licence reads as 'any IP' (no "
+                                             "binding): the binding you asked for would be silently "
+                                             "dropped. Pass a real IP hash (envelock licence host-id on "
+                                             "the target), or omit --ip for an unbound licence.")
                 machine = ZERO32
                 if args.machine:
                     if args.machine == "this":
@@ -5522,6 +6240,12 @@ def main() -> int:
                         machine = bytes.fromhex(args.machine)
                         if len(machine) != 32:
                             raise ValueError("--machine takes 'this' or 64 hex characters")
+                        if machine == ZERO32:
+                            raise ValueError("--machine is all zeros, which a licence reads as 'any "
+                                             "machine' (no binding): the binding you asked for would be "
+                                             "silently dropped. Pass a real fingerprint (envelock "
+                                             "licence machine-id on the target), or omit --machine for "
+                                             "an unbound licence.")
                 if args.out.exists() and not args.force:
                     raise ValueError(f"refusing to overwrite {args.out} (use --force)")
                 if args.domain == "this":
@@ -5559,14 +6283,23 @@ def main() -> int:
         elif args.command == "verify":
             kind = "envelock-developer-public" if args.developer else "envelock-owner"
             pub = read_config(args.developer or args.owner, kind)["signing_public"]
-            report = verify_package(args.package, pub)
+            if args.project is not None:
+                try:
+                    uuid.UUID(args.project)
+                except ValueError as error:
+                    raise ValueError("--project takes a project UUID") from error
+            report = verify_package(args.package, pub, project=args.project,
+                                    min_serial=args.min_serial)
             print(json.dumps(report, indent=2))
             return 0 if report["ok"] else 1
         elif args.command == "new-project":
             print(uuid.uuid4())
         elif args.command == "preflight":
             extensions = DEFAULT_EXTENSIONS | {"." + x.lower().lstrip(".") for x in args.php_ext}
-            findings = compatibility_findings(args.source, extensions)
+            masks = _php_code_comment_masks(args.php, args.source, extensions) if args.source.is_dir() else None
+            if masks is None and args.source.is_dir():
+                print(_NO_TOKENIZER_NOTE, file=sys.stderr)
+            findings = compatibility_findings(args.source, extensions, masks=masks)
             if args.json:
                 print(json.dumps({c: {"hint": d["hint"], "hits": d["hits"]}
                                   for c, d in findings.items()}, indent=2))
@@ -5575,7 +6308,10 @@ def main() -> int:
             return 1 if (args.strict and findings) else 0
         elif args.command == "recommend":
             extensions = DEFAULT_EXTENSIONS | {"." + x.lower().lstrip(".") for x in args.php_ext}
-            rec = recommend_options(args.source, extensions)
+            masks = _php_code_comment_masks(args.php, args.source, extensions) if args.source.is_dir() else None
+            if masks is None and args.source.is_dir():
+                print(_NO_TOKENIZER_NOTE, file=sys.stderr)
+            rec = recommend_options(args.source, extensions, masks=masks)
             if args.json:
                 print(json.dumps(rec, indent=2))
             else:
@@ -5628,6 +6364,7 @@ def main() -> int:
                 bytecode_php=args.bytecode_php,
                 bytecode_loader=args.bytecode_loader,
                 deploy_root=args.deploy_root,
+                target_os=args.target,
             )
             # ENV-AUD-15: the base protection (per-file AES-256-GCM encryption + Ed25519 signing) is
             # always on, and the runtime manifest is on by default, but the confidentiality hardening
@@ -5641,10 +6378,40 @@ def main() -> int:
                 print("Note: base protection only (encryption + signing). For stronger protection "
                       "add --include-protection, --no-ffi, --vault-strings and --sealed "
                       "(see docs/SEGURIDAD.md).", file=sys.stderr)
+            # C-30: include protection stops a protected library file from being reached by a direct
+            # request, but NOT from being loaded as the entry point by an auto_prepend_file /
+            # auto_append_file the server configures: that prelude runs first and can call the
+            # library's functions. Only --no-prepend refuses to run under a configured prelude. Warn
+            # so the operator adds it, or disables the prelude in the pool, instead of believing
+            # include protection alone closes this path.
+            if args.include_protection and not args.no_prepend:
+                print("WARNING: --include-protection without --no-prepend is bypassable by an "
+                      "auto_prepend_file/auto_append_file configured on the server (it can load a "
+                      "protected library file as the entry point and call its functions). Add "
+                      "--no-prepend, or make sure the PHP pool sets auto_prepend_file= and "
+                      "auto_append_file= empty (docs/SEGURIDAD.md).", file=sys.stderr)
             # H-08 (audit 2026-11-12): an --asset that copied nothing is no longer silent.
             for missing in info.get("assets_not_copied", []):
                 print(f"WARNING: --asset {missing['asset']} was not copied: {missing['reason']}.",
                       file=sys.stderr)
+            # C-17: a plain pack does not parse the PHP, so flag any file that does not compile.
+            for warn in info.get("syntax_warnings", []):
+                print(f"WARNING: PHP syntax error, packed anyway: {warn}", file=sys.stderr)
+            # C-24: --obfuscate-names declines the WHOLE package on any risky construct. Say so, with
+            # the reason, instead of silently renaming nothing while the operator believes it worked.
+            if args.obfuscate_names and not info.get("names_obfuscated"):
+                reason = info.get("names_skipped") or ""
+                explain = {
+                    "namespaced": "the package uses `namespace` declarations; add --obfuscate-names-ast "
+                                  "to rename across namespaces",
+                    "dynamic": "the package reaches names at run time (reflection, variable class or "
+                               "function calls, string callables) or uses try/catch/throw, whose "
+                               "exception types may be matched by code outside the package; the safe "
+                               "token pass then declines the WHOLE package",
+                    "lint": "a rename produced PHP that no longer parsed, so the whole rename was "
+                            "rolled back",
+                }.get(reason, "no eligible global names were found to rename")
+                print(f"WARNING: --obfuscate-names renamed nothing ({explain}).", file=sys.stderr)
             # H-02 (audit 2026-11-12): what --sealed does NOT cover, said where the choice is made.
             if args.sealed:
                 print("Note: --sealed refuses plain PHP under the package folder only once a protected "
@@ -5659,9 +6426,10 @@ def main() -> int:
             # @ORM, WP file headers) then silently misbehaves with no pack-time error. This is the one
             # flag combination that can corrupt a tree invisibly, so actively scan and warn for it.
             if args.strip_comments or args.compact:
-                sensitive = {c: d for c, d in
-                             compatibility_findings(args.source, extensions).items()
-                             if c in _COMMENT_SENSITIVE_CATEGORIES}
+                warn_masks = (_php_code_comment_masks(args.php, args.source, extensions)
+                              if args.source.is_dir() else None)
+                found = compatibility_findings(args.source, extensions, masks=warn_masks)
+                sensitive = {c: d for c, d in found.items() if c in _COMMENT_SENSITIVE_CATEGORIES}
                 if sensitive:
                     files = len({h[0] for d in sensitive.values() for h in d["hits"]})
                     print("WARNING: --strip-comments/--compact removes docblocks, and " +
@@ -5669,6 +6437,16 @@ def main() -> int:
                           "(annotations). They will silently misbehave after this pack. Run 'envelock "
                           "preflight --source " + str(args.source) + "' for the list, then --exclude "
                           "those files or drop --strip-comments/--compact.", file=sys.stderr)
+                # C-28: --compact (but not --strip-comments) renumbers lines, breaking code that uses
+                # __LINE__/getLine()/getTrace() as data.
+                line_logic = {c: d for c, d in found.items() if c in _COMPACT_SENSITIVE_CATEGORIES}
+                if args.compact and line_logic:
+                    files = len({h[0] for d in line_logic.values() for h in d["hits"]})
+                    print("WARNING: --compact renumbers lines, and " + str(files) + " file(s) in this "
+                          "tree use source line numbers as data (__LINE__/getLine()/getTrace()). Values "
+                          "derived from them (cache keys, error maps) will silently change. Run "
+                          "'envelock preflight --source " + str(args.source) + "' for the list, then "
+                          "--exclude those files or drop --compact.", file=sys.stderr)
             print("Tip: for third-party or framework code, run 'envelock preflight --source " +
                   str(args.source) + "' first to flag code that reads its own source "
                   "(annotations, class maps) and would break after encryption.", file=sys.stderr)

@@ -28,12 +28,21 @@ FILE *envelock_plain_open(const char *path);
  * reading a public package file (the runtime manifest) opened with envelock_identity_open. */
 int envelock_file_is_regular(FILE *file);
 
+/* Size in bytes of the open FILE, or -1 when it cannot be read. */
+long long envelock_file_size(FILE *file);
+
 #ifdef _WIN32
 #include <wchar.h>
 /* Windows: converts a path setting to UTF-16 for the wide file APIs. A php.ini value is UTF-8, a
  * php.exe -d value is in the ANSI code page: valid UTF-8 is taken as UTF-8, anything else as ANSI.
  * Returns a malloc'd string (free() it) or NULL. */
 wchar_t *envelock_path_wide(const char *path);
+
+/* Windows, envelock.harden_memory: replace the access list of this process / of the calling thread
+ * with one that denies memory reads, debugging, code injection and handle duplication to every
+ * account but SYSTEM (and SeDebugPrivilege). Best effort; 1 when the list was set. */
+int envelock_restrict_process_access(void);
+int envelock_restrict_thread_access(void);
 #endif
 
 #endif

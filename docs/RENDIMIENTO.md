@@ -98,6 +98,47 @@ exchange; otherwise A is stronger. Configuration is the same as A regarding OPca
 and preload (all still refused/blacklisted for the protected tree); worker mode changes only how
 often compilation happens, not what is allowed to persist.
 
+## Memory, and large projects
+
+The loader decrypts and compiles **one file at a time, on demand** — never the whole project at once.
+Envelock installs itself as PHP's `zend_compile_file` hook, which the engine calls once for each file
+an `include`/`require` reaches, exactly as for unprotected PHP. When a file is compiled the loader
+decrypts just that one file's source into a transient buffer, hands it to the compiler, and then wipes
+(`OPENSSL_cleanse`) and frees the buffer before moving on. No step reads the package tree as a whole,
+and nothing decrypted is kept (only the per-worker *verification result* and the symmetric *key* are
+cached, not source or opcodes).
+
+Two consequences for sizing a server:
+
+- **The project's total size does not have to "fit" in memory.** A request's peak memory is what that
+  request's own code and data would use as plain PHP, plus the transient source buffer of the single
+  file being compiled at that instant (freed immediately after). A 5 000-file, 500 MB package uses the
+  same per-request memory as the same application unprotected would *without OPcache*: it is loaded in
+  parts, following the normal include graph, not all at once. Only a single pathologically large file
+  would add its own size to the peak, and only while that one file compiles.
+- **`memory_limit` is a per-request limit and is independent of package size.** Set it for what one
+  request actually uses, measured with `memory_get_peak_usage(true)` on a protected run. The one
+  Envelock-specific pressure on it is **re-compilation without OPcache SHM** (above): in a non-resident
+  SAPI protected files are recompiled every request, so their compiled op_arrays live in that
+  request's memory instead of in shared OPcache — in a large protected codebase that can be tens of MB
+  more per request than the same code would cost with OPcache on. Mitigate it by encrypting only your
+  own code (leave the framework and `vendor/` to OPcache), by bundling (below), and by a resident
+  worker (option B), which compiles each file once per worker. See
+  [VERIFICACION.md](VERIFICACION.md#measured-memory) and MANUAL.md §14.
+
+**Packaging, not the running server, is where whole-tree memory can bite.** `pack`'s optional
+transform passes (`--obfuscate`, `--strip-comments`, `--compact`, `--bytecode`, `--virtualize`) hand
+batches of files to a PHP process on the **packaging machine**. The encoder runs every such pass with
+`memory_limit=-1`, so the host's default `php.ini` limit (128 MB on a php.ini-less Windows ZIP) does
+not cap them; the only bound on a very large tree is the packaging machine's physical RAM, and the
+batch size keeps peak memory well under it. This is a one-time, build-machine cost, not a property of
+the running server.
+
+**Where this is exercised.** Protected applications run under **PHP-FPM** (a web-server SAPI) and as
+real **Laravel** and **Symfony** apps in CI on every push (see [TEST-STATUS.md](../TEST-STATUS.md)), in
+addition to CLI runs. The per-file, per-request memory behaviour above follows directly from the
+compile-hook design and is what those runs exercise.
+
 ## Manifest-anchored verification (`envelock.manifest_fastpath`, default on under `--enforce-manifest`)
 
 **On by default** for `--enforce-manifest` packages, and **only when the server's identity file trusts
@@ -117,7 +158,8 @@ manifest's single signature.
 
 **What it does.** The signed binary manifest already carries a trusted SHA-256 of every packaged
 file (one Ed25519 signature over the whole list). With `envelock.manifest_fastpath=1`, once that
-manifest has verified (its signature is still checked every request, bound to this release), each
+manifest has verified (its bytes are read and hashed every request, bound to this release; the
+Ed25519 verification itself runs once per worker for the same bytes, see below), each
 listed digest is seeded into the per-worker verified cache. A later protected file whose own SHA-256
 is in that set is then vouched for by the (single) trusted developer who signed the manifest, so
 `envelock_signature_ok()` returns without the per-file Ed25519. The per-file signatures **stay in the
@@ -143,8 +185,31 @@ the flag off, nothing is seeded and the path is byte-for-byte the previous behav
   it does today — never fall back to "no verification".
 - The per-file hash must be compared against the manifest **before** decrypt/execute, every request
   (this is cheap and already computed for the verified-cache lookup).
-- The manifest signature itself is still verified per worker, and bound to the package release (it
-  already is: project and release offsets are checked).
+- The manifest signature itself is verified per worker, and bound to the package release (project and
+  release offsets are checked every request). Until 2026-11-17 the code verified it on **every
+  request**, once per package — an Ed25519 verification (~120–155 µs) on each request of a default
+  pack, for bytes the worker had already verified. It is now verified the first time a worker sees
+  those exact bytes and found afterwards by their SHA-256 in the verified cache (a key that cannot
+  match a container's); changed bytes are verified again, and fail. The per-file presence check and
+  the release binding still run on every request.
+
+## Licences bound to the machine or the IP
+
+A machine-bound licence makes the loader compute this host's fingerprint (`/etc/machine-id` and every
+network card under `/sys/class/net`), an IP-bound one its IPv4 fingerprint (a `getifaddrs()` netlink
+dump). Until 2026-11-17 both ran for **every protected file** — about twenty system calls each. The
+machine fingerprint is now computed once per process (it is first computed at start-up, in the FPM
+master, so it also works in a pool with `chroot`, where `/sys` is missing), and the IP fingerprint
+once per request (addresses can change during a worker's life). The expiry and the domain are still
+checked for every file.
+
+**Measured (2026-11-17, WSL1, PHP 8.4.27 NTS, `php-cgi` serving a 300-file default pack, warm
+requests, old loader against new):** with a machine+IP-bound licence a request fell from 84 ms to
+44 ms, and the system calls of four requests from 39 682 to 9 381. Without a licence the wall time did
+not change measurably (41.6 against 41.9 ms, within WSL1's noise): the Ed25519 verification of the
+manifest that no longer runs on every request is about 1 % of such a request there — valgrind counts
+one verification per request before and none after the first, and 0.8 % fewer instructions. WSL1 makes
+system calls expensive, so on a native Linux server the licence gain is smaller in absolute terms.
 
 **Review findings (resolved):** per-file verification stays available simply by leaving the flag off
 (default). The `signer` identity a seeded file records becomes the manifest's signer; the review
@@ -157,6 +222,21 @@ the review were addressed: seeding leaves headroom below the verified-cache cap 
 digests cannot evict warm entries, and a signed-but-malformed manifest that seeds a few entries
 before being refused is harmless (every seeded digest is developer-authentic; the request still
 fails closed).
+
+## Smaller per-file and per-call costs (2026-11-17)
+
+- **Package digest:** every protected file hashed the whole recipient table of its container again (up
+  to 127 KB with 1 024 recipients) to find its cached key; it is now remembered per worker, by the
+  container's SHA-256 that the signature check computes anyway.
+- **Debugger extensions:** the twelve module-registry lookups ran for every file; they run once per
+  request, again whenever a module is added (`dl()`).
+- **Plain files:** the sealed-package check did its work for every plain include even when nothing in
+  the request was sealed; it now returns at once then.
+- **Mini-VM (`--virtualize`, laboratory only):** every call of a virtualized function decoded the
+  program's base64, validated the whole program and zeroed a 64 KiB stack. A program is prepared once
+  per request (still refused on every call if malformed), and the stack starts at 16 slots. Measured
+  (WSL1, PHP 8.4.27 NTS, five interleaved runs, loader before against after): a one-line function
+  1.65 → 0.15 µs per call; a 50-iteration loop 11.8 → 10.2 µs per call.
 
 ## Fewer, larger protected files (bundles)
 

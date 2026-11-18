@@ -342,10 +342,17 @@ static void envelock_file_cache_serialize_ast(zend_ast                 *ast,
 			}
 		}
 	} else if (ast->kind == ZEND_AST_OP_ARRAY) {
-		zval z;
-		ZVAL_PTR(&z, zend_ast_get_op_array(ast)->op_array);
-		envelock_file_cache_serialize_func(&z, script, info, buf);
-		zend_ast_get_op_array(ast)->op_array = Z_PTR(z);
+		/* A constant expression is SHARED when a same-file subclass inherits a property whose default
+		 * is a closure (allowed since 8.5): persist deduplicates the tree, and this walk then reaches
+		 * it once per default-properties table. Upstream serialized the closure's op_array again the
+		 * second time, from an offset, and packing failed ("pointer out of range") for valid code
+		 * (audit 2026-11-17). Like the list and child walks above: only what is not serialized yet. */
+		if (!IS_SERIALIZED(zend_ast_get_op_array(ast)->op_array)) {
+			zval z;
+			ZVAL_PTR(&z, zend_ast_get_op_array(ast)->op_array);
+			envelock_file_cache_serialize_func(&z, script, info, buf);
+			zend_ast_get_op_array(ast)->op_array = Z_PTR(z);
+		}
 	} else if (ast->kind == ZEND_AST_CALLABLE_CONVERT) {
 		zend_ast_fcc *fcc = (zend_ast_fcc*)ast;
 		ZEND_MAP_PTR_INIT(fcc->fptr, NULL);
@@ -1084,11 +1091,15 @@ static void envelock_file_cache_unserialize_ast(zend_ast                *ast,
 			}
 		}
 	} else if (ast->kind == ZEND_AST_OP_ARRAY) {
-		zval z;
 		ENVELOCK_FC_EXTENT(ast, sizeof(zend_ast_op_array));
-		ZVAL_PTR(&z, zend_ast_get_op_array(ast)->op_array);
-		envelock_file_cache_unserialize_func(&z, script, buf);
-		zend_ast_get_op_array(ast)->op_array = Z_PTR(z);
+		/* The shared tree of an inherited closure default (see the serializer) is walked once per
+		 * table; its op_array is relocated the first time only, as the list and child walks do. */
+		if (!IS_UNSERIALIZED(zend_ast_get_op_array(ast)->op_array)) {
+			zval z;
+			ZVAL_PTR(&z, zend_ast_get_op_array(ast)->op_array);
+			envelock_file_cache_unserialize_func(&z, script, buf);
+			zend_ast_get_op_array(ast)->op_array = Z_PTR(z);
+		}
 	} else if (ast->kind == ZEND_AST_CALLABLE_CONVERT) {
 		zend_ast_fcc *fcc = (zend_ast_fcc*)ast;
 		ENVELOCK_FC_EXTENT(ast, sizeof(zend_ast_fcc));

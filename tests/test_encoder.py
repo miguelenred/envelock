@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import uuid
@@ -17,6 +18,12 @@ spec.loader.exec_module(a)
 
 
 TABLE = len(a.STUB) + a.HEADER.size + len("app.php")  # recipient table offset in sample()
+
+try:
+    a.resolve_program("php")
+    HAVE_PHP = True
+except Exception:
+    HAVE_PHP = False
 
 
 def symlink_or_skip(link: Path, target, is_dir: bool = False) -> None:
@@ -200,10 +207,12 @@ def test_truncated(material, cut):
 
 
 def test_identity_bundle_bytes_layout(material):
+    import hashlib
     data = a.identity_bytes(material[2])
-    assert data[:8] == a.IDENTITY_MAGIC                 # ENVLKID3
+    assert data[:8] == a.IDENTITY_MAGIC_V4             # C-29: 1.1 writes the checksummed ENVLKID4 format
     assert data[8:12] == b"\x00\x01\x00\x01"            # 1 recipient, 1 developer
-    assert len(data) == 12 + a.IDENTITY_RECIPIENT + a.IDENTITY_DEVELOPER
+    assert len(data) == 12 + a.IDENTITY_RECIPIENT + a.IDENTITY_DEVELOPER + a.IDENTITY_CHECKSUM
+    assert hashlib.sha256(data[:-32]).digest() == data[-32:]   # trailing SHA-256 over the body
 
 
 def test_developer_id_is_sha256_of_signing_public(material):
@@ -300,6 +309,163 @@ def test_assets_and_exclude(tmp_path, material):
     assert (dest / "style.css").read_text() == "body{}"
     assert not (dest / "debug.php").exists()
     assert not (dest / ".env.production").exists()
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
+def test_pack_lints_php_syntax_adversarial(tmp_path, material):
+    """C-17, ATTACK: the advisory lint must catch real syntax errors (several, in one pack), must not
+    false-flag valid-but-unusual files (heredoc, PHP 8 attributes, an empty <?php), and must NEVER make
+    the pack fail — it is advisory only. A broken file is still encrypted."""
+    source, dest = tmp_path / "src", tmp_path / "out"
+    source.mkdir()
+    (source / "broken1.php").write_text("<?php function f( { return 1; }\n")        # missing )
+    (source / "broken2.php").write_text("<?php class C { public function \n")        # truncated
+    (source / "ok_heredoc.php").write_text("<?php $x = <<<EOT\nhi $y\nEOT;\n")
+    (source / "ok_attr.php").write_text("<?php #[Attribute]\nclass A {}\n")
+    (source / "ok_empty.php").write_text("<?php\n")
+    info = a.pack_tree(source, dest, [a.recipient_public(material[1])], material[0], str(uuid.uuid4()))
+    assert info["protected_files"] == 5                               # ALL encrypted, pack did not fail
+    warned = {w.split(":", 1)[0] for w in info["syntax_warnings"]}
+    assert warned == {"broken1.php", "broken2.php"}, warned             # exactly the broken ones
+    # The broken files are genuinely encrypted (recoverable), the lint never blocked them:
+    assert a.open_protected((dest / "broken1.php").read_bytes(), material[2]).startswith(b"<?php")
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
+def test_pack_lints_php_syntax_without_transform(tmp_path, material):
+    """C-17: a plain pack (no source-rewriting option) now syntax-checks the PHP and reports the files
+    that do not parse, instead of shipping a broken file with exit 0. The pack still succeeds."""
+    source, dest = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    (source / "ok.php").write_text("<?php function g(){ return 1; }\n")
+    (source / "broken.php").write_text("<?php function x( { return 1; }\n")   # missing )
+    info = a.pack_tree(source, dest, [a.recipient_public(material[1])], material[0], str(uuid.uuid4()))
+    assert info["protected_files"] == 2                      # both still encrypted
+    warned = {w.split(":", 1)[0] for w in info["syntax_warnings"]}
+    assert warned == {"broken.php"}
+    # A transforming pass already stops the pack on a parse error, so the lint is skipped then:
+    clean, dest2 = tmp_path / "clean", tmp_path / "out2"
+    clean.mkdir()
+    (clean / "ok.php").write_text("<?php $x = 1;\n")
+    good = a.pack_tree(clean, dest2, [a.recipient_public(material[1])], material[0], str(uuid.uuid4()),
+                       strip_comments=True)
+    assert good["syntax_warnings"] == []
+
+
+def test_validate_asset_binary_vs_readable_php(tmp_path):
+    """C-06: a binary asset must not be rejected as 'readable PHP' just because '<?' (or even the bytes
+    '<?php') appear by chance; real readable PHP text must still be refused."""
+    p = tmp_path / "x"
+    # Binaries that contain "<?"/"<?php"/"<?=" by chance but are NOT decodable text: accepted.
+    png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 20 + b"<?php stray ?> <? <?= end"
+    jpeg = b"\xff\xd8\xff\xe0" + b"<?php echo" + bytes(range(256)) * 10 + b"\xff\xd9"
+    woff2 = b"wOF2\x00\x01\x00\x00" + bytes(range(256)) * 8 + b"<? \x00\x00<?="
+    for blob in (png, jpeg, woff2):
+        a.validate_asset(p, blob)   # must NOT raise
+    # Real readable PHP (UTF-8 and a UTF-16 template): refused.
+    for bad in (b'<?php echo "x";', b"<?= $x", b"<?\n echo 1;", b"<? echo 1;",
+                "<?php echo 1;".encode("utf-16")):
+        with pytest.raises(ValueError, match="readable PHP"):
+            a.validate_asset(p, bad)
+    # Text with a stray "<?" that is NOT a PHP open tag (XML decl, a CSV cell): accepted.
+    for ok in (b"id,note\n1,<?xml-ish\n2,price<?x end\n", b"body{content:'<'}\n",
+               b'{"x":"<?xml version=\\"1.0\\"?>"}'):
+        a.validate_asset(p, ok)     # must NOT raise
+
+
+def test_validate_asset_credentials_adversarial(tmp_path):
+    """C-15, ATTACK: (1) a real secret must NOT sneak past the detector in a tricky-but-valid form
+    (under-flagging ships it in clear — the dangerous direction); (2) benign JS/expression forms must
+    not misfire; (3) hostile/malformed input must not crash the classifier (it returns a bool)."""
+    p = tmp_path / "a.js"
+    # (1) Real secrets in awkward-but-real shapes: ALL must still be refused.
+    must_refuse = [
+        b'{"password":"s3cr3t"}',                       # no spaces, quoted
+        b"password\t=\thunter2logn",                    # tabs around =
+        b"password  =>  's3cretValue'",                 # PHP arrow + spaces + quotes
+        b"api_key: ABCD1234EFGH5678",                   # YAML bareword
+        b"DB_PASSWORD=verylongsecretvalue000",          # env bareword
+        b"password:\n  s3cretOnNextLine",               # value on the next line
+        b"password:/*c*/s3cretAfterComment",            # a comment between : and the value
+        b"aws_secret_access_key = AKIAIOSFODNN7EXAMPLE",
+        b"machine host login u password p3wra",         # netrc format (SECRET_FORMATS_RE)
+        b"https://user:tok3n@example.com/x",             # URL with user:password
+        b"TOKEN=" + b"x" * 5000,                         # very long value must still flag, not hang
+    ]
+    for data in must_refuse:
+        with pytest.raises(ValueError, match="credential"):
+            a.validate_asset(p, data)
+    # (2) Benign expressions / non-credentials: must NOT be refused.
+    must_accept = [
+        b"const o = { user: u, password: p };\n",
+        b"headers['X-Api-Key'] = apiKey;\n",
+        b"$cfg = ['password' => $env['DB_PASS']];\n",
+        b"password: () => computeSecret()\n",
+        b"const passwordField = selector;\n",           # 'password' not on a word boundary before =
+        b"tokens = tokenizer.run();\n",                 # 'token' not a boundary match
+        b"body { content: 'secret'; }\n",               # css, 'secret' is not key:value here
+    ]
+    for data in must_accept:
+        a.validate_asset(p, data)                       # must NOT raise
+    # (3) Hostile/malformed input: the classifier must return a bool, never raise.
+    for weird in ("", " ", ">", "password:", "password: ", "password:\x00\x00",
+                  "password:" + "(" * 2000, "password: café", 'password:"unterminated',
+                  "secret=" + "\\" * 500, "=" * 1000, "password:==>>"):
+        assert isinstance(a._asset_has_credentials(weird), bool)
+        assert isinstance(a._asset_value_is_literal_secret(weird), bool)
+
+
+def test_validate_asset_credentials_need_a_literal_value(tmp_path):
+    """C-15: a credential KEY only counts when a real literal value follows it. Ordinary JavaScript —
+    `token: getCsrf()`, `{user:u,password:p}`, `password: $pass` — is an expression, not a secret, and
+    must no longer force a blanket --allow-secret-assets. Genuine credential values stay refused."""
+    p = tmp_path / "app.js"
+    # Expressions, NOT literals: accepted (no raise).
+    for ok in (b"const o = { user: u, password: p };\n",
+               b"const h = { token: getCsrf() };\n",
+               b"$config = ['password' => $pass];\n",
+               b"headers['X-Api-Key'] = apiKey;\n",
+               b"const secret = computeSecret();\n"):
+        a.validate_asset(p, ok)                       # must NOT raise
+    # Real literal credentials: still refused.
+    for bad in (b'{"password": "s3cret"}',            # quoted
+                b"DB_PASSWORD=hunter2\n",             # bareword
+                b"aws_secret_access_key = AKIA\n",    # 4-char value at line end
+                b"api_key: 0123456789abcdef\n",       # digit-leading bareword
+                b"password = 'supersecret'\n"):
+        with pytest.raises(ValueError, match="credential"):
+            a.validate_asset(p, bad)
+    # The helper itself, directly:
+    assert a._asset_value_is_literal_secret(' "x"') is True
+    assert a._asset_value_is_literal_secret(" getCsrf()") is False
+    assert a._asset_value_is_literal_secret(" p}") is False
+    assert a._asset_value_is_literal_secret(" $pass") is False
+    assert a._asset_value_is_literal_secret(" hunter2") is True
+
+
+def test_run_php_lifts_memory_limit(monkeypatch):
+    """C-13: every build-time PHP pass must run with memory_limit=-1 so a large tree does not hit the
+    host's default 128M. Checked by capturing the argv _run_php builds."""
+    captured = {}
+
+    class _Done:
+        returncode = 0
+        stdout = b'{"ok": true}'
+        stderr = b""
+
+    def _fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _Done()
+
+    monkeypatch.setattr(a, "resolve_program", lambda name: "/usr/bin/php")
+    monkeypatch.setattr(a.subprocess, "run", _fake_run)
+    assert a._run_php("php", "echo 1;", {"x": 1}, "test") == {"ok": True}
+    argv = captured["argv"]
+    assert "memory_limit=-1" in argv and argv[argv.index("memory_limit=-1") - 1] == "-d"
+    # The program still travels via -r, and STDOUT stays the JSON channel (display_errors=stderr).
+    assert "-r" in argv and "display_errors=stderr" in argv
+    # C-33/N-14: a site-configured prepend/append must not run and write to STDOUT here.
+    assert "auto_prepend_file=" in argv and "auto_append_file=" in argv
 
 
 def test_no_overwrite(tmp_path):
@@ -584,6 +750,218 @@ def test_cli_minimum_set_from_package(tmp_path):
     assert run("minimum", "set", "--identity", ident, "--project", project).returncode != 0   # needs --serial
 
 
+def test_identity_from_public_developer_descriptor(tmp_path):
+    """C-12: an identity/trust store builds from the PUBLIC developer descriptor, so the private signing
+    key never has to reach the server. make_identity/add_recipient_to_store accept it and produce the
+    SAME bytes as the full owner; export-identity --developer and recipient add --developer work."""
+    owner = a.make_owner(with_recovery=True)
+    recipient = a.make_recipient("r")
+    dev_pub = a.developer_public(owner)
+    # Either source yields the identical identity / trust store:
+    assert a.make_identity(recipient, dev_pub) == a.make_identity(recipient, owner)
+    assert (a.add_recipient_to_store(None, recipient, dev_pub)
+            == a.add_recipient_to_store(None, recipient, owner))
+    # read_developer_like reads both kinds:
+    opath, dpath = tmp_path / "owner.json", tmp_path / "dev.json"
+    a.save_json(opath, owner, None)
+    dpath.write_text(json.dumps(dev_pub), encoding="utf-8")
+    assert a.read_developer_like(dpath)["signing_public"] == owner["signing_public"]
+    assert a.read_developer_like(opath)["signing_public"] == owner["signing_public"]
+    # CLI: export-identity --developer (no private signing key in play):
+    enc = str(ROOT / "encoder/envelock.py")
+
+    def run(*argv):
+        return subprocess.run([sys.executable, enc, *map(str, argv)], capture_output=True, text=True)
+
+    rpath = tmp_path / "rcpt.json"
+    assert run("keygen", "recipient", "--out", rpath, "--label", "c1", "--no-encrypt").returncode == 0
+    idout = tmp_path / "identity.bin"
+    r = run("export-identity", "--recipient", rpath, "--developer", dpath, "--out", idout)
+    assert r.returncode == 0, r.stderr
+    assert idout.exists()
+    # recipient add --developer extends a trust store with only the public descriptor:
+    store = tmp_path / "store.bin"
+    assert run("recipient", "add", "--identity", store, "--recipient", rpath,
+               "--developer", dpath).returncode == 0
+    assert store.exists()
+    # Passing both --developer and --owner is refused:
+    bad = run("export-identity", "--recipient", rpath, "--developer", dpath, "--owner", opath,
+              "--out", tmp_path / "x.bin")
+    assert bad.returncode != 0 and "not both" in bad.stderr
+
+
+def test_licence_issue_rejects_all_zero_binding_and_inspect_recognises_it(tmp_path):
+    """C-27: an explicit all-zero --machine/--ip fingerprint is refused (it would silently mean 'any',
+    dropping the binding the operator asked for). C-33: the general 'inspect' recognises a licence file
+    and shows its constraints instead of a cryptic error."""
+    enc = str(ROOT / "encoder/envelock.py")
+
+    def run(*argv):
+        return subprocess.run([sys.executable, enc, *map(str, argv)], capture_output=True, text=True)
+
+    owner = tmp_path / "owner.json"
+    assert run("keygen", "owner", "--out", owner, "--no-encrypt").returncode == 0
+    lic = tmp_path / "licence.bin"
+    zeros = "0" * 64
+    bad = run("licence", "issue", "--owner", owner, "--machine", zeros, "--out", lic)
+    assert bad.returncode != 0 and "all zeros" in bad.stderr
+    badip = run("licence", "issue", "--owner", owner, "--ip", zeros, "--out", lic)
+    assert badip.returncode != 0 and "all zeros" in badip.stderr
+    assert not lic.exists()                                   # nothing was written
+    # A valid unbound (expiry-only) licence issues, and the general inspect recognises it:
+    assert run("licence", "issue", "--owner", owner, "--out", lic).returncode == 0
+    info = json.loads(run("inspect", lic).stdout)
+    assert info["kind"] == "envelock-licence"
+    assert info["machine"] == "any" and info["domain"] == "any" and info["ip"] == "any"
+
+
+def test_developer_like_rejects_hostile_input(tmp_path):
+    """C-12, ATTACK: accepting a PUBLIC developer descriptor must not weaken validation. A recipient,
+    garbage, wrong types and malformed descriptors are all refused, and an injected private field in a
+    developer descriptor is IGNORED (the identity's private key is always the recipient's)."""
+    owner = a.make_owner(with_recovery=True)
+    recipient = a.make_recipient("r")
+    dev_pub = a.developer_public(owner)
+    # A recipient is not a developer; wrong types and malformed descriptors are refused:
+    hostile = [recipient, None, [], "x", 123, {}, {"kind": "envelock-developer-public"},
+               {"kind": "envelock-developer-public", "format": a.FORMAT_VERSION, "signing_public": "00"},
+               {"kind": "envelock-developer-public", "format": a.FORMAT_VERSION, "signing_public": "zz" * 32},
+               {"kind": "envelock-owner", "format": a.FORMAT_VERSION, "signing_public": "aa" * 32}]
+    for bad in hostile:
+        with pytest.raises((ValueError, TypeError)):
+            a._validate_developer_like(bad)
+        with pytest.raises((ValueError, TypeError)):
+            a.make_identity(recipient, bad)
+    # read_developer_like on hostile FILES: never crashes with a raw traceback, always a ValueError.
+    for content in (b"not json at all", b"[]", b"12345",
+                    b'{"kind":"envelock-recipient","format":2,"x25519_public":"' + b"aa" * 32 +
+                    b'","x25519_private":"' + b"bb" * 32 + b'"}',
+                    b'{"kind":"envelock-developer-public"}'):
+        pth = tmp_path / "d.json"
+        pth.write_bytes(content)
+        with pytest.raises(ValueError):
+            a.read_developer_like(pth)
+    # An injected x25519_private in a developer-public is IGNORED: the identity's private key is the
+    # recipient's, and the signer is the real developer's public key — attacker data never leaks in.
+    tampered = dict(dev_pub)
+    tampered["x25519_private"] = "ff" * 32
+    ident = a.make_identity(recipient, tampered)
+    assert ident["x25519_private"] == recipient["x25519_private"]
+    assert ident["signing_public"] == owner["signing_public"]
+    # Same descriptor fed to both sources yields the same trust store (no attacker-controlled drift):
+    assert a.add_recipient_to_store(None, recipient, tampered) == a.add_recipient_to_store(None, recipient, owner)
+
+
+def test_licence_issue_all_zero_binding_adversarial(tmp_path):
+    """C-27, ATTACK: an all-zero fingerprint silently means 'any' (no binding). Try to slip one through
+    in several forms; a GENUINE near-zero binding and malformed input must behave correctly."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    base = ["licence", "issue", "--owner", tmp_path / "o.json", "--out", tmp_path / "l.bin"]
+    zeros = "0" * 64
+    # Every all-zero spelling is refused (hex is case-insensitive, so upper/lower both reduce to zero):
+    for flag, val in [("--machine", zeros), ("--machine", "0" * 63 + "0"), ("--ip", zeros),
+                      ("--machine", "0" * 64)]:
+        r = run(*base, flag, val)
+        assert r.returncode != 0 and "all zeros" in r.stderr, (flag, val, r.stderr)
+        assert not (tmp_path / "l.bin").exists()
+    # A GENUINE near-zero binding (63 zeros + one non-zero) is a real fingerprint -> allowed:
+    ok = run(*base, "--machine", "0" * 63 + "f")
+    assert ok.returncode == 0, ok.stderr
+    info = json.loads(run("inspect", tmp_path / "l.bin").stdout)
+    assert info["machine"].rstrip("0").endswith("f") and info["machine"] != "any"
+    # Malformed fingerprints are a clean error, not a traceback:
+    (tmp_path / "l.bin").unlink()
+    for val in ["00", "zz" * 32, "xyz", "0" * 63]:
+        r = run(*base, "--machine", val)
+        assert r.returncode != 0 and "Traceback" not in r.stderr
+
+
+def test_resolve_licence_fields_adversarial(monkeypatch):
+    """ATTACK the shared licence resolver that the GUI uses: every way to smuggle a no-op binding past
+    it, malformed and boundary inputs, and the 'this' / expiry paths. It must resist each one with a
+    clean ValueError or the correct resolved value — never a silent wrong binding and never a crash."""
+    Z = a.ZERO32
+    rlf = a.resolve_licence_fields
+    # Unbound (nothing asked): all-zero slots, no expiry, no warnings.
+    assert rlf() == (0, Z, Z, Z, [])
+    # --- all-zero bindings are refused in EVERY spelling (hex folds case; 63+1 still reduces to zero):
+    for flag in ("machine", "ip"):
+        for val in ("0" * 64, "0" * 63 + "0", "00000000000000000000000000000000" * 2):
+            with pytest.raises(ValueError, match="all zeros"):
+                rlf(**{flag: val})
+    # --- malformed / wrong-length fingerprints: clean ValueError, never a raw crash:
+    for flag in ("machine", "ip"):
+        for val in ("00", "0" * 63, "aa" * 31, "aa" * 33, "zz" * 32, "xyz", " " * 64):
+            with pytest.raises(ValueError):
+                rlf(**{flag: val})
+    # An empty string is falsy, so (exactly as the CLI's `if args.machine:` / `elif args.expires:`) it
+    # means 'not asked for' -> unbound / no expiry, NOT an error. Never mistaken for a binding.
+    assert rlf(machine="", ip="", domain="", expires="") == (0, Z, Z, Z, [])
+    # --- a GENUINE near-zero fingerprint (63 zeros + one set bit) is a real binding, so it is kept,
+    # and a bound licence carries the Windows "cannot check bindings" warning:
+    exp, m, d, ip, warns = rlf(machine="0" * 63 + "f")
+    assert m != Z and m.hex() == "0" * 63 + "f" and d == Z and ip == Z
+    assert exp == 0 and any("Windows" in w for w in warns)
+    exp, m, d, ip, warns = rlf(ip="0" * 63 + "1")
+    assert ip != Z and m == Z and any("Windows" in w for w in warns)
+    # --- expiry: days and expires are alternatives; days is bounded 1..36500; a past date is refused;
+    # a malformed date is a clean error; a valid future date is deterministic (end-of-day UTC).
+    with pytest.raises(ValueError, match="alternatives"):
+        rlf(days=1, expires="2999-12-31")
+    for bad_days in (0, -1, -36500, 36501, 10 ** 9):
+        with pytest.raises(ValueError, match="between 1 and 36500"):
+            rlf(days=bad_days)
+    for bad_date in ("2020-01-01", "1970-01-01"):
+        with pytest.raises(ValueError, match="in the past"):
+            rlf(expires=bad_date)
+    for junk in ("notadate", "2026-13-01", "2026-02-30", "2026/01/01", "2026-01-01x", "99999-01-01"):
+        with pytest.raises(ValueError):
+            rlf(expires=junk)
+    import calendar as _cal
+    import time
+    before = int(time.time())
+    exp, *_ = rlf(days=30)
+    after = int(time.time())
+    assert before + 30 * 86400 <= exp <= after + 30 * 86400          # ~now + 30 days, no monkeypatch
+    assert rlf(expires="2999-12-31")[0] == _cal.timegm(time.strptime("2999-12-31 23:59:59",
+                                                                      "%Y-%m-%d %H:%M:%S"))
+    # --- domain binding by name: hashed exactly like the loader; bound -> Windows warning, no 'this' note:
+    exp, m, d, ip, warns = rlf(domain="App.Example.COM")
+    assert d == a.domain_hash("App.Example.COM") and m == Z and ip == Z
+    assert any("Windows" in w for w in warns) and not any("own name" in w for w in warns)
+    # --- 'this' resolves THIS host (patched to be deterministic) and adds the right warnings:
+    monkeypatch.setattr(a, "machine_fingerprint", lambda: b"\x11" * 32)
+    monkeypatch.setattr(a, "host_domain", lambda: "box.local")
+    monkeypatch.setattr(a, "host_ips_hash", lambda: b"\x22" * 32)
+    exp, m, d, ip, warns = rlf(machine="this", domain="this", ip="this")
+    assert m == b"\x11" * 32 and d == a.domain_hash("box.local") and ip == b"\x22" * 32
+    # exactly one Windows binding warning even with three bindings, plus the 'domain this' note:
+    assert sum("Windows" in w for w in warns) == 1
+    assert any("own name" in w and "box.local" in w for w in warns)
+
+
+def test_licence_resolver_matches_cli(tmp_path):
+    """Pin the GUI resolver to the shipped CLI so the two can never drift: on deterministic inputs
+    (fixed expiry date and fixed hex bindings), the licence the resolver+issue_licence produce must be
+    byte-for-byte the licence the `licence issue` CLI writes (Ed25519 signing is deterministic)."""
+    run = _cli(tmp_path)
+    owner_path = tmp_path / "o.json"
+    assert run("keygen", "owner", "--out", owner_path, "--no-encrypt").returncode == 0
+    owner = a.read_config(owner_path, "envelock-owner")
+    lic = tmp_path / "cli.bin"
+    r = run("licence", "issue", "--owner", owner_path, "--out", lic,
+            "--expires", "2999-12-31", "--machine", "aa" * 32, "--domain", "example.com", "--ip", "bb" * 32)
+    assert r.returncode == 0, r.stderr
+    cli_bytes = lic.read_bytes()
+    exp, m, d, ip, _ = a.resolve_licence_fields(expires="2999-12-31", machine="aa" * 32,
+                                                domain="example.com", ip="bb" * 32)
+    mine = a.issue_licence(owner, expires=exp, machine=m, domain=d, ip=ip)
+    assert mine == cli_bytes                                  # same body AND same signature
+    # And it verifies under the owner's own signing key (sanity that the bytes are a real licence):
+    assert a.verify_licence(mine, [owner["signing_public"]])["machine"] == m
+
+
 def test_cli_pack_advises_when_no_hardening_flags(tmp_path):
     """ENV-AUD-15: a bare pack (base protection only) prints an advisory to stderr; enabling any
     hardening layer silences it. Defaults are unchanged (no breakage of existing workflows)."""
@@ -605,6 +983,115 @@ def test_cli_pack_advises_when_no_hardening_flags(tmp_path):
     assert bare.returncode == 0 and "base protection only" in bare.stderr
     hardened = run(*common, "--output", tmp_path / "hard", "--include-protection")
     assert hardened.returncode == 0 and "base protection only" not in hardened.stderr
+
+
+def _cli(tmp_path):
+    enc = str(ROOT / "encoder/envelock.py")
+
+    def run(*argv):
+        return subprocess.run([sys.executable, enc, *map(str, argv)], capture_output=True, text=True)
+    return run
+
+
+def test_cli_keygen_label_rules(tmp_path):
+    """C-33: `keygen owner --label` used to ignore --label silently; it is now refused. Recipient still
+    requires --label, and both succeed when used correctly (four distinct cases)."""
+    run = _cli(tmp_path)
+    # owner + --label -> refused, nothing written
+    bad = run("keygen", "owner", "--out", tmp_path / "o1.json", "--label", "x", "--no-encrypt")
+    assert bad.returncode != 0 and "does not take --label" in bad.stderr
+    assert not (tmp_path / "o1.json").exists()
+    # owner without --label -> ok
+    assert run("keygen", "owner", "--out", tmp_path / "o2.json", "--no-encrypt").returncode == 0
+    # recipient without --label -> refused
+    norl = run("keygen", "recipient", "--out", tmp_path / "r1.json", "--no-encrypt")
+    assert norl.returncode != 0 and "requires --label" in norl.stderr
+    # recipient with --label -> ok
+    assert run("keygen", "recipient", "--out", tmp_path / "r2.json",
+               "--label", "srv", "--no-encrypt").returncode == 0
+
+
+def test_cli_pack_warns_include_protection_without_no_prepend(tmp_path):
+    """C-30: --include-protection stops a direct request to a protected library file, but an
+    auto_prepend_file/auto_append_file configured on the server can still load it as the entry point
+    and call its functions; only --no-prepend refuses to run under a configured prelude. Three cases:
+    include-protection alone warns EXACTLY ONCE (pack used to print two different warnings for this,
+    and a duplicated copy of this test hid the first assertion), with --no-prepend it is quiet, and
+    without include protection there is nothing to warn about."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", tmp_path / "r.json", "--label", "s",
+               "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", tmp_path / "r.json",
+               "--out", tmp_path / "p.json").returncode == 0
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "i.php").write_text("<?php echo 1;")
+    base = ["pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+            "--project", str(uuid.uuid4()), "--source", src]
+    warn = run(*base, "--output", tmp_path / "a", "--include-protection")
+    assert warn.returncode == 0, warn.stderr
+    assert warn.stderr.count("--include-protection without --no-prepend") == 1, warn.stderr
+    assert "bypassable by an auto_prepend_file/auto_append_file" in warn.stderr
+    both = run(*base, "--output", tmp_path / "b", "--include-protection", "--no-prepend")
+    assert both.returncode == 0 and "--include-protection without --no-prepend" not in both.stderr
+    neither = run(*base, "--output", tmp_path / "c")
+    assert neither.returncode == 0 and "--include-protection without --no-prepend" not in neither.stderr
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="--obfuscate-names needs a php CLI")
+def test_cli_pack_warns_when_obfuscate_names_renames_nothing(tmp_path):
+    """C-24: --obfuscate-names declines the WHOLE package on a risky construct (try/catch/throw,
+    reflection, variable calls). Two distinct cases: a tree with try/catch warns 'renamed nothing', a
+    closed tree without any renameable global name is also reported, both instead of silent success."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", tmp_path / "r.json", "--label", "s",
+               "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", tmp_path / "r.json",
+               "--out", tmp_path / "p.json").returncode == 0
+    src = tmp_path / "src"
+    src.mkdir()
+    # A try/catch makes the token pass decline the whole package (exception types cross boundaries).
+    (src / "a.php").write_text("<?php function helper_fn(){ try { return 1; } catch (\\Exception $e) "
+                               "{ return 0; } }\n")
+    res = run("pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+              "--project", str(uuid.uuid4()), "--source", src, "--output", tmp_path / "out",
+              "--obfuscate-names")
+    assert res.returncode == 0
+    assert "renamed nothing" in res.stderr and "try/catch" in res.stderr
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="--strip-comments needs a php CLI")
+def test_cli_pack_warns_about_halt_compiler_data(tmp_path):
+    """C-19: a file with data after __halt_compiler() is encrypted but cannot be read back via
+    __FILE__/__COMPILER_HALT_OFFSET__. Two cases: a tree WITH such a file warns and lists it; a tree
+    without one does not."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", tmp_path / "r.json", "--label", "s",
+               "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", tmp_path / "r.json",
+               "--out", tmp_path / "p.json").returncode == 0
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "ok.php").write_text("<?php class Ok { function x(){ return 1; } }\n")
+    (src / "data.php").write_text("<?php class Dat {}\n__halt_compiler();\nRAW TRAILING DATA BYTES\n")
+    res = run("pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+              "--project", str(uuid.uuid4()), "--source", src, "--output", tmp_path / "out",
+              "--strip-comments")
+    assert res.returncode == 0, res.stderr
+    info = json.loads(res.stdout)
+    assert "data.php" in info["files_not_token_transformed"]
+    assert "__COMPILER_HALT_OFFSET__" in res.stderr and "data.php" in res.stderr
+    # A tree with no __halt_compiler() file: no such warning.
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    (src2 / "ok.php").write_text("<?php class Ok2 { function x(){ return 1; } }\n")
+    res2 = run("pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+               "--project", str(uuid.uuid4()), "--source", src2, "--output", tmp_path / "out2",
+               "--strip-comments")
+    assert res2.returncode == 0 and "__COMPILER_HALT_OFFSET__" not in res2.stderr
 
 
 def test_cli_pack_writes_runtime_manifest_by_default(tmp_path):
@@ -730,6 +1217,34 @@ def test_bytecode_temp_sources_are_owner_only(tmp_path, monkeypatch):
         assert all(dacl == owner_only for dacl in seen.values()), seen
     else:
         assert all(mode == 0o600 for mode in seen.values()), {k: oct(v) for k, v in seen.items()}
+
+
+def test_bytecode_pass_cleans_plaintext_when_interrupted(tmp_path, monkeypatch):
+    """C-18: if the compile step is interrupted (a SIGTERM that now raises KeyboardInterrupt), the
+    bytecode pass's finally must still remove the plaintext sources it wrote at the deploy path, so a
+    cancelled CI job leaves nothing in the clear."""
+    deploy = tmp_path / "deploy"
+
+    def interrupted(*args, **kw):
+        raise KeyboardInterrupt("terminated by signal 15")
+
+    monkeypatch.setattr(a, "_run_php", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        a._bytecode_pass({"sub/a.php": b"<?php echo 1;", "b.php": b"<?php echo 2;"}, deploy, "php", None)
+    assert not list(deploy.rglob("*.php")), "plaintext source left at the deploy path after interrupt"
+
+
+def test_termination_handler_raises_and_installs(monkeypatch):
+    """C-18: the SIGTERM/SIGHUP handler raises KeyboardInterrupt (so cleanup runs), and installing it on
+    the main thread registers it for SIGTERM. The install is a guarded no-op off the main thread."""
+    with pytest.raises(KeyboardInterrupt):
+        a._raise_keyboard_interrupt(signal.SIGTERM, None)
+    prev = signal.getsignal(signal.SIGTERM)
+    try:
+        a._install_termination_handlers()
+        assert signal.getsignal(signal.SIGTERM) is a._raise_keyboard_interrupt
+    finally:
+        signal.signal(signal.SIGTERM, prev)
 
 
 def test_bytecode_pass_keeps_preexisting_deploy_root(tmp_path, monkeypatch):
@@ -908,6 +1423,81 @@ def test_recommend_turns_include_protection_off_when_it_leaves_vendor_out(tmp_pa
     assert "--include-protection" in rec["on"] and "--include-protection" in rec["verify"]
 
 
+def test_recommend_include_protection_off_on_cross_checked_cases(tmp_path):
+    """C-04: --include-protection is also turned off when the recommendation leaves any .php cleartext
+    (it reads its own source), when composer.json is present but vendor/ is not installed, or for a
+    WordPress plugin/theme an unprotected core loads; a clean app with none of these stays ON."""
+    ext = {".php"}
+    # (a) a .php that reads its own source stays cleartext -> off, and the file is named.
+    a1 = tmp_path / "a1"
+    a1.mkdir()
+    (a1 / "ok.php").write_text("<?php class A { function f(){ return 1; } }")
+    (a1 / "tok.php").write_text("<?php $t = token_get_all(file_get_contents(__FILE__));")
+    r1 = a.recommend_options(a1, ext)
+    assert "--include-protection" not in r1["on"]
+    assert "cleartext" in r1["off"]["--include-protection"] and "tok.php" in r1["off"]["--include-protection"]
+    # (b) composer.json present but vendor/ not installed -> off (autoloader runs with no protected frame).
+    a2 = tmp_path / "a2"
+    a2.mkdir()
+    (a2 / "composer.json").write_text('{"name":"x/y"}')
+    (a2 / "src.php").write_text("<?php class S { function f(){ return 1; } }")
+    r2 = a.recommend_options(a2, ext)
+    assert "--include-protection" not in r2["on"] and "composer.json" in r2["off"]["--include-protection"]
+    # (c) a WordPress plugin header file -> off (loaded by an unprotected core).
+    a3 = tmp_path / "a3"
+    a3.mkdir()
+    (a3 / "plugin.php").write_text("<?php\n/**\n * Plugin Name: Demo\n */\nfunction demo(){}")
+    r3 = a.recommend_options(a3, ext)
+    assert "--include-protection" not in r3["on"] and "WordPress" in r3["off"]["--include-protection"]
+    # (d) a clean app with none of these -> still ON (no false turn-off).
+    a4 = tmp_path / "a4"
+    a4.mkdir()
+    (a4 / "lib.php").write_text("<?php class L { function f(){ return 1; } }")
+    assert "--include-protection" in a.recommend_options(a4, ext)["on"]
+
+
+def test_preflight_detects_more_self_source_reads(tmp_path):
+    """C-02: catch more ways a file reads its OWN source (fopen/readfile/SplFileObject(__FILE__),
+    __COMPILER_HALT_OFFSET__, PhpToken::tokenize), without flagging a plain data-file read."""
+    ext = {".php"}
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "fopen.php").write_text("<?php $h = fopen(__FILE__, 'r');")
+    (src / "readfile.php").write_text("<?php readfile(__FILE__);")
+    (src / "spl.php").write_text("<?php $o = new SplFileObject(__FILE__);")
+    (src / "halt.php").write_text("<?php $o = __COMPILER_HALT_OFFSET__; __halt_compiler(); data")
+    (src / "phptoken.php").write_text("<?php $t = PhpToken::tokenize('<?php 1;');")
+    (src / "datafile.php").write_text("<?php $c = file_get_contents(__DIR__ . '/data.json');")
+    (src / "clean.php").write_text("<?php class A { function f(){ return 1; } }")
+    findings = a.compatibility_findings(src, ext)
+    read = {h[0] for h in findings.get("reads-own-source", {}).get("hits", [])}
+    assert {"fopen.php", "readfile.php", "spl.php", "halt.php"} <= read
+    tok = {h[0] for h in findings.get("source-tokenizer", {}).get("hits", [])}
+    assert "phptoken.php" in tok
+    # A plain data-file read (__DIR__ + a .json) must NOT be flagged as reading its own source.
+    assert "datafile.php" not in read
+    assert "clean.php" not in read and "clean.php" not in tok
+
+
+def test_preflight_entry_points_and_nonstandard_extensions(tmp_path):
+    """C-03: an extensionless entry point is detected even with a BOM or a blank line before <?php, and
+    a PHP file with a non-standard extension (.module) is reported with a --php-ext suggestion."""
+    ext = {".php"}
+    app = tmp_path / "app"
+    (app / "bin").mkdir(parents=True)
+    (app / "src.php").write_text("<?php function f(){ return 1; }")
+    (app / "bin" / "console").write_bytes(b"\xef\xbb\xbf\n   <?php require __DIR__.'/../src.php';\n")
+    assert "bin/console" in a._cleartext_php_entry_points(app, frozenset())
+    (app / "mymod.module").write_text("<?php function mymod_hook(){}")
+    rec = a.recommend_options(app, ext)
+    note = " ".join(rec["notes"])
+    assert "mymod.module" in note and "--php-ext .module" in note
+    assert "--include-protection" not in rec["on"]        # bin/console is a cleartext entry point
+    # a plain data file with the same odd extension but no <?php is NOT reported.
+    (app / "notes.module").write_text("just text, not php")
+    assert "notes.module" not in " ".join(a.recommend_options(app, ext)["notes"])
+
+
 def test_pack_reports_each_asset_it_did_not_copy(tmp_path, material):
     """External audit 2026-11-12, H-08: `--asset .netrc` (a path pack never copies) ended with
     copied_assets 0, exit 0 and not a word. Every --asset that copied nothing is now reported with the
@@ -1060,6 +1650,211 @@ def test_recommend_robust_against_evasion_and_shell_metachars(tmp_path):
     assert "'[[]id].php'" in cmd                                          # glob-escaped + shell-quoted
 
 
+def test_compat_token_masks_route_detectors_and_kill_false_positives(tmp_path):
+    """C-01: with token-aware masks, comment categories (wp header, Doctrine annotation) match only the
+    COMMENT text and code categories (eval, FFI, token_get_all, getDocComment) match only the CODE text.
+    So a PHP 8 named argument `slug:` on its own line is no longer a WordPress header, and a genuine
+    header in a comment still is. The masks are supplied directly (as _php_code_comment_masks would
+    build them) so the test needs no php."""
+    ext = {".php"}
+    src = tmp_path / "proj"
+    src.mkdir()
+    # x.php: a named argument `slug:` on its own line — the exact raw-text false positive from the
+    # audit — plus a $r->eval( method call. Here the file text has no comments/strings, so the raw
+    # scan sees this text verbatim.
+    fp_code = ("<?php\n"
+               "$x = foo(\n"
+               "    slug: $s,\n"          # named arg on its own line: a WP-header false positive in raw
+               ");\n"
+               "$r->eval($y);\n")        # method call, not the eval() construct
+    (src / "x.php").write_text(fp_code)
+    # plug.php: a genuine WordPress header, which lives in a COMMENT.
+    (src / "plug.php").write_text("<?php\n")
+
+    # Raw scan (no php): the named argument MISFIRES as a header, which is what the token path fixes.
+    raw = a.compatibility_findings(src, ext)
+    assert "x.php" in {h[0] for h in raw.get("wp-file-header", {"hits": []})["hits"]}
+    # The eval lookbehind already rejects the ->eval( method call even in raw mode (no mask needed):
+    assert a._tree_uses_runtime_compile(src, ext) == []
+
+    # Token masks: slug: is CODE (the comment blob is empty), so the header false positive is gone;
+    # the real header in plug.php's comment blob is still found, on its own line.
+    masks = {
+        "x.php": {"code": fp_code, "comments": "\n\n\n\n\n"},
+        "plug.php": {"code": "     \n     \n                 \n    \n",
+                     "comments": "\n/**\n * Plugin Name: Z\n */\n"},
+    }
+    findings = a.compatibility_findings(src, ext, masks=masks)
+    cats = {c: sorted({h[0] for h in d["hits"]}) for c, d in findings.items()}
+    assert cats.get("wp-file-header") == ["plug.php"]       # only the real header, not the named arg
+    assert sorted(ln for f, ln in findings["wp-file-header"]["hits"] if f == "plug.php") == [3]
+    assert "source-tokenizer" not in cats
+    assert a._tree_uses_runtime_compile(src, ext, masks=masks) == []
+    assert a._tree_matches(src, ext, a._FFI_RE, masks=masks) == []
+
+
+def test_compat_token_masks_keep_real_positives(tmp_path):
+    """C-01: masks must not SUPPRESS genuine findings — a real eval(), FFI::, token_get_all() and
+    getDocComment() in code are still reported when they live in the code mask."""
+    ext = {".php"}
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "y.php").write_text("<?php\n")
+    masks = {"y.php": {
+        "code": ("<?php\n"
+                 "eval($code);\n"
+                 "$f = FFI::cdef('int x();', 'l.so');\n"
+                 "token_get_all($s);\n"
+                 "(new ReflectionMethod($o,'m'))->getDocComment();\n"),
+        "comments": "\n\n\n\n\n"}}
+    cats = {c: sorted({h[0] for h in d["hits"]})
+            for c, d in a.compatibility_findings(src, ext, masks=masks).items()}
+    assert cats.get("source-tokenizer") == ["y.php"]
+    assert cats.get("reads-own-docblock") == ["y.php"]
+    assert a._tree_uses_runtime_compile(src, ext, masks=masks) == ["y.php:2"]
+    assert a._tree_matches(src, ext, a._FFI_RE, masks=masks) == ["y.php:3"]
+
+
+def test_recommend_compact_off_for_line_number_logic(tmp_path):
+    """C-28: __LINE__/getLine()/getTrace() used as data breaks under --compact (it renumbers lines) but
+    is fine under --strip-comments. The recommender turns OFF only --compact; preflight flags it; and a
+    token scan ignores a __LINE__ that is only in a comment."""
+    ext = {".php"}
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "cache.php").write_text("<?php $key = 'build-' . __LINE__;\n")
+    rec = a.recommend_options(app, ext)
+    assert "--strip-comments" in rec["on"]       # strip keeps line numbers -> still recommended
+    assert "--compact" in rec["off"]             # compact renumbers -> turned off
+    assert "line number" in rec["off"]["--compact"].lower()
+    assert "line-number-logic" in a.compatibility_findings(app, ext)
+    (app / "err.php").write_text("<?php function h($e){ return $e->getLine(); }\n")
+    assert "line-number-logic" in a.compatibility_findings(app, ext)
+    # A __LINE__ that lives only in a comment must NOT be flagged when token masks are available.
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / "x.php").write_text("<?php $x = 1;\n")
+    masks = {"x.php": {"code": "<?php $x = 1;\n", "comments": "// __LINE__ mentioned here\n"}}
+    assert "line-number-logic" not in a.compatibility_findings(c, ext, masks=masks)
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
+def test_compat_line_number_logic_adversarial(tmp_path):
+    """C-28, ATTACK: __LINE__/getLine()/getTrace() hidden in a comment or a string must NOT trigger the
+    --compact gate, a similarly-named method (getLineNumber) must not be a false positive, and the real
+    uses must still be caught."""
+    ext = {".php"}
+    src = tmp_path / "p"
+    src.mkdir()
+    (src / "hidden.php").write_text(
+        "<?php\n"
+        "// uses __LINE__ in a comment and $e->getLine() too\n"
+        '$s = "build-" . "plain string __LINE__ and getLine( here";\n'
+        "$n = $e->getLineNumber();\n"           # different method, not getLine(
+        "echo $s;\n", encoding="utf-8")
+    (src / "uses.php").write_text(
+        "<?php\n$k = 'build-' . __LINE__;\nfunction h($e){ return $e->getLine(); }\n", encoding="utf-8")
+    masks = a._php_code_comment_masks("php", src, ext)
+    assert masks is not None
+    cats = {c: sorted({h[0] for h in d["hits"]})
+            for c, d in a.compatibility_findings(src, ext, masks=masks).items()}
+    assert cats.get("line-number-logic") == ["uses.php"], cats.get("line-number-logic")
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
+def test_compat_token_masks_adversarial(tmp_path):
+    """C-01, ATTACK with the real tokenizer: eval()/FFI/token_get_all hidden in comments, strings,
+    heredoc/nowdoc, inline HTML, escaped quotes or a string carrying `*/` must NOT be flagged, while the
+    genuine ones right next to them MUST be — and a header-looking line in code or a string is not a
+    WordPress header. A detector that can be fooled either way is the whole point of C-01."""
+    ext = {".php"}
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "noise.php").write_text(
+        "<?php\n"
+        "// eval( here is a line comment\n"
+        "# eval( here too\n"
+        "/* a block comment with eval( FFI:: token_get_all( getDocComment( inside */\n"
+        '$a = "a double-quoted string with eval( and FFI:: inside";\n'
+        "$b = 'single-quoted eval( and token_get_all(';\n"
+        "$c = <<<EOT\n eval( inside a heredoc FFI:: \nEOT;\n"
+        "$d = <<<'NOW'\n token_get_all( inside a nowdoc \nNOW;\n"
+        '$e = "escaped \\" quote then eval( still in the string";\n'
+        "$redis->eval($x);\n"              # method call, not the construct
+        "Cache::eval($x);\n"               # static method, not the construct
+        "function eval_helper() { return 1; }\n"   # a function named eval_* is not eval
+        "?>\n"
+        "inline HTML with eval( and FFI:: that is not PHP at all\n"
+        "<?php echo 1;\n", encoding="utf-8")
+    (src / "real.php").write_text(
+        "<?php\n"
+        '$s = "ordinary";\n'
+        "eval($code);\n"                               # real eval
+        '$f = FFI::cdef("int x();", "lib.so");\n'      # real FFI
+        "token_get_all($s);\n"                         # real tokenizer
+        'echo "a */ tricky string"; eval($again);\n',  # a string holding */ then a real eval
+        encoding="utf-8")
+    (src / "plug.php").write_text(
+        "<?php\n/**\n * Plugin Name: Real One\n */\n$x = 1;\n", encoding="utf-8")
+    (src / "fakehdr.php").write_text(
+        "<?php\n"
+        '$t = "Plugin Name: inside a string, not a header";\n'
+        "register_block_pattern(slug: $s, title: $t);\n"   # named args, not a header
+        "// Plugin Name: after a // prefix, not a header\n", encoding="utf-8")
+
+    masks = a._php_code_comment_masks("php", src, ext)
+    assert masks is not None, "the token scan failed"
+    cats = {c: sorted({h[0] for h in d["hits"]})
+            for c, d in a.compatibility_findings(src, ext, masks=masks).items()}
+    # Code detectors fire ONLY on real.php, never on the hidden copies in noise.php:
+    assert cats.get("source-tokenizer") == ["real.php"], cats.get("source-tokenizer")
+    assert {h.split(":")[0] for h in a._tree_uses_runtime_compile(src, ext, masks=masks)} == {"real.php"}
+    assert {h.split(":")[0] for h in a._tree_matches(src, ext, a._FFI_RE, masks=masks)} == {"real.php"}
+    # The header is found only in the REAL docblock, not in the string or the //-prefixed line:
+    assert cats.get("wp-file-header") == ["plug.php"], cats.get("wp-file-header")
+    # getDocComment hidden in a comment is not a reads-own-docblock finding:
+    assert "noise.php" not in cats.get("reads-own-docblock", [])
+
+
+def test_php_code_comment_masks_absent_php_returns_none(tmp_path, monkeypatch):
+    """C-01: _php_code_comment_masks never raises; with no php CLI it returns None so recommend/preflight
+    fall back to the raw-text regex scan (identical to the historical behaviour)."""
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "a.php").write_text("<?php eval($x);\n")
+    monkeypatch.setattr(a, "resolve_program",
+                        lambda name: (_ for _ in ()).throw(ValueError("no php")))
+    assert a._php_code_comment_masks("php", src, {".php"}) is None
+    # masks=None path still produces the finding via raw text:
+    assert a._tree_uses_runtime_compile(src, {".php"}, masks=None) == ["a.php:1"]
+
+
+@pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
+def test_php_code_comment_masks_integration(tmp_path):
+    """C-01 end to end with the real tokenizer: eval()/FFI/token_get_all written inside a comment or a
+    string, and a `slug:` named argument, are NOT flagged; the genuine ones are."""
+    ext = {".php"}
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "noise.php").write_text(
+        "<?php\n// once called eval( ) here\n"
+        "/* token_get_all( ) and FFI:: in a comment */\n"
+        "$q = 'SELECT eval( FROM t';\n$r->eval($s);\n", encoding="utf-8")
+    (src / "named.php").write_text(
+        "<?php\nregister_block_pattern(\n    slug: $this->slug,\n);\n", encoding="utf-8")
+    (src / "real.php").write_text(
+        "<?php\n/**\n * Plugin Name: Real\n */\neval($c);\n$f = FFI::cdef('int x();','l.so');\n",
+        encoding="utf-8")
+    masks = a._php_code_comment_masks("php", src, ext)
+    assert masks is not None
+    cats = {c: sorted({h[0] for h in d["hits"]})
+            for c, d in a.compatibility_findings(src, ext, masks=masks).items()}
+    assert cats.get("wp-file-header") == ["real.php"]
+    assert "source-tokenizer" not in cats
+    assert a._tree_uses_runtime_compile(src, ext, masks=masks) == ["real.php:5"]
+    assert [h for h in a._tree_matches(src, ext, a._FFI_RE, masks=masks)] == ["real.php:6"]
+
+
 def test_secret_write_does_not_clamp_preexisting_parent_dir(tmp_path):
     """ENV-2026-17: writing a secret into a PRE-EXISTING shared dir must not silently chmod it to 0700
     (that broke e.g. /etc/envelock holding a world-readable licence). The secret file is still 0600."""
@@ -1150,6 +1945,37 @@ def test_server_install_allows_rootless_for_current_user(tmp_path):
     with pytest.raises(ValueError, match="run as root"):
         a.server_install(b"SECRET", out2, owner_uid=0, owner_gid=0)
     assert not out2.exists()
+
+
+def test_server_install_creates_missing_dirs(tmp_path):
+    """C-20: the identity file's missing parent folders are created; the helper reports which ones."""
+    out = tmp_path / "etc" / "envelock" / "identity.bin"
+    created = a._create_install_dirs(out, owner_uid=0)
+    assert out.parent.is_dir()
+    assert (tmp_path / "etc") in created and (tmp_path / "etc" / "envelock") in created
+
+
+def test_server_install_dirs_traversable_for_owner_user(tmp_path):
+    """C-20: for a non-root owner (--owner-user), the folders THIS call creates must be traversable
+    (0711) so that user can reach the 0400 identity inside; a self-owned install keeps the umask and is
+    not forced open. Root keeps ownership of the created folders (the pool user cannot write them)."""
+    import stat as _stat
+    if os.name == "nt":
+        pytest.skip("POSIX ownership/mode semantics")
+    out = tmp_path / "etc" / "envelock" / "identity.bin"
+    created = a._create_install_dirs(out, owner_uid=os.geteuid() + 1)   # a different owner
+    assert created
+    for directory in created:
+        assert _stat.S_IMODE(os.stat(directory).st_mode) == 0o711, directory
+    # A self-owned install keeps the umask (here 0700), i.e. it is NOT forced traversable to others:
+    out2 = tmp_path / "self" / "a" / "identity.bin"
+    old = os.umask(0o077)
+    try:
+        created2 = a._create_install_dirs(out2, owner_uid=os.geteuid())
+    finally:
+        os.umask(old)
+    for directory in created2:
+        assert not (os.stat(directory).st_mode & 0o077), directory
 
 
 def test_verify_package_flags_added_symlink(tmp_path):

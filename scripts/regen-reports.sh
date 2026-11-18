@@ -12,7 +12,12 @@ mkdir -p "$out"
 cd "$root"
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 php_ver="$(php -r 'echo PHP_VERSION;')"
-ossl="$(php -r 'echo OPENSSL_VERSION_TEXT;' 2>/dev/null || openssl version)"
+# Two OpenSSLs, each recorded as what it is: the libcrypto the loader, the clang run and the ASan
+# exerciser are BUILT against (config.m4 requires >= 3.0; found through pkg-config like the build),
+# and the one PHP itself links. Only the second used to be recorded, under a name that read as the
+# first (1.1.1k, which the loader cannot even build against; audit 2026-11-17).
+ossl="OpenSSL $(pkg-config --modversion libcrypto)"
+php_ossl="$(php -r 'echo OPENSSL_VERSION_TEXT;' 2>/dev/null || echo 'none (PHP without ext/openssl)')"
 
 echo "[1/7] ruff";      ruff check --output-format json encoder gui tests scripts/demo_material.py scripts/check_release.py scripts/bench.py scripts/fpm_smoke.py > "$out/ruff.json" 2>/dev/null || true
 echo "[2/7] bandit";    bandit -q -f json -r encoder gui scripts/demo_material.py scripts/check_release.py scripts/bench.py scripts/fpm_smoke.py > "$out/bandit.json" 2>/dev/null || true
@@ -74,8 +79,9 @@ gcc -fsanitize=address,undefined -fno-sanitize-recover=all -O1 -g -I"$work" -I"$
 {
   echo "Envelock crypto core — gcc AddressSanitizer + UndefinedBehaviorSanitizer exerciser"
   echo "date: $now"
-  echo "inputs: 1 valid small blob (all single-byte mutations + all truncations + 1 append),"
-  echo "        1 valid 100 KiB blob, and 200000 pseudo-random inputs (seed 1234)."
+  echo "built against: $ossl"
+  echo "inputs: 1 valid small blob (every byte with its top bit flipped, one mutation per byte, and"
+  echo "        every truncation), 1 valid 100 KiB blob, and 200000 pseudo-random inputs (seed 1234)."
   echo "paths: envelock_decrypt (signature first), envelock_verify, envelock_decrypt_verified,"
   echo "       envelock_decrypt_with_key, envelock_package_digest, and the loader path"
   echo "       envelock_unwrap_key + envelock_decrypt_with_key_into (into a caller buffer and in place)"
@@ -87,42 +93,53 @@ gcc -fsanitize=address,undefined -fno-sanitize-recover=all -O1 -g -I"$work" -I"$
   echo "result: no AddressSanitizer/UndefinedBehaviorSanitizer errors."
 } > "$out/fuzz-asan-ubsan.txt" 2>&1
 
-echo "[6/7] JUnit on PHP $php_ver"
-rm -f "$out"/php-8.*.xml "$out"/junit-php-*.xml "$out"/php-source-*.json
-(cd "$root" && ENVELOCK_REQUIRE_NATIVE=1 python3 -m pytest -q tests \
-  --junitxml="$out/junit-php-${php_ver}.xml" >/dev/null 2>&1) || true
-
-echo "[7/7] targets.json (SHA256 of shipped sources + environment)"
-python3 - "$root" "$out" "$now" "$php_ver" "$ossl" <<'PY'
-import hashlib, json, platform, sys
+# The sources are pinned BEFORE the test run: the suite runs the release gate on this very tree, and
+# against the pins of the previous run it would record its own "stale evidence" failure.
+echo "[6/7] targets.json (SHA256 of shipped sources + environment)"
+python3 - "$root" "$out" "$now" "$php_ver" "$ossl" "$php_ossl" <<'PY'
+import importlib.util, json, platform, sys
 from pathlib import Path
-root, out, now, php_ver, ossl = sys.argv[1:6]
+root, out, now, php_ver, ossl, php_ossl = sys.argv[1:7]
 root = Path(root)
-files = ["extension/envelock.c","extension/envelock_crypto.c","extension/envelock_crypto.h",
-         "extension/envelock_file.c","extension/envelock_file.h",
-         "extension/config.m4","extension/config.w32","encoder/envelock.py",
-         "scripts/build-unix.sh","scripts/build-windows.ps1","CMakeLists.txt"]
-targets = {}
-for f in files:
-    p = root/f
-    if p.exists():
-        targets[f] = "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+# The SAME digest and the SAME list of sources the release gate verifies with
+# (check_release.py --require-complete refuses a release whose pinned sources changed since, or that
+# holds a source the evidence does not pin: audit 2026-11-17, H-1).
+sys.path.insert(0, str(root / "scripts"))
+from check_release import evidence_digest, evidence_sources
+# Format and identity magic read from the encoder itself: a hard-coded "ENVLKID2" outlived two
+# identity-format changes.
+spec = importlib.util.spec_from_file_location("envelock_encoder", root / "encoder" / "envelock.py")
+enc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(enc)
+targets = {f: evidence_digest((root / f).read_bytes()) for f in evidence_sources(root)}
 doc = {
-    "generated": now, "format": "ENVLK02", "identity": "ENVLKID2",
+    "generated": now,
+    "format": enc.MAGIC.rstrip(b"\0").decode(),
+    "identity": enc.IDENTITY_MAGIC_V4.decode(),
     "environment": {"python": platform.python_version(), "php": php_ver,
-                    "openssl": ossl, "uname": platform.platform()},
-    "note": "Hashes of the exact sources audited/compiled on this machine. "
+                    "openssl": ossl, "php_openssl": php_ossl, "uname": platform.platform()},
+    "note": "SHA-256 (line endings normalised to LF) of every first-party source this evidence "
+            "covers: compiled into the loader the JUnit run tests, run by the test suite, or scanned "
+            "by ruff/bandit (scripts/check_release.py EVIDENCE_PATTERNS; tests/fixtures/ not "
+            "pinned). openssl is the libcrypto the loader and the exerciser were built against; "
+            "php_openssl the one PHP links. scripts/check_release.py --require-complete refuses a "
+            "release whose pinned sources changed since or that holds an unpinned one. "
             "Multi-version matrix, libFuzzer and Windows/macOS come from CI.",
     "targets": targets,
 }
 Path(out, "targets.json").write_text(json.dumps(doc, indent=2) + "\n")
 PY
 
+echo "[7/7] JUnit on PHP $php_ver"
+rm -f "$out"/php-8.*.xml "$out"/junit-php-*.xml "$out"/php-source-*.json
+(cd "$root" && ENVELOCK_REQUIRE_NATIVE=1 python3 -m pytest -q tests \
+  --junitxml="$out/junit-php-${php_ver}.xml" >/dev/null 2>&1) || true
+
 cat > "$out/README.md" <<EOF
 # docs/reports — measured evidence (regenerated, do not hand-edit)
 
 Regenerated by \`scripts/regen-reports.sh\` on $now.
-Environment: PHP $php_ver, $ossl, $(uname -srm).
+Environment: PHP $php_ver (linking $php_ossl), loader built against $ossl, $(uname -srm).
 
 Produced on this machine:
 - \`ruff.json\`, \`bandit.json\` — static analysis of the encoder/scripts (Python).
@@ -137,19 +154,27 @@ libFuzzer campaign, and Windows/macOS builds. See \`.github/workflows/checks.yml
 and \`docs/PLATAFORMAS.md\`.
 EOF
 # Published evidence must not carry this machine's paths (skip messages and tool output print
-# absolute paths): make them relative to the repository, and fail if any remains.
+# absolute paths): make them relative to the repository, and fail if any remains. Nor its name: pytest
+# writes the host name into every JUnit file (hostname="..."), and a machine is often named after its
+# owner -- no structural pattern catches that, so the attribute is emptied (audit 2026-11-17).
 python3 - "$root" "$out" <<'PY'
-import sys
+import re, sys
 from pathlib import Path
 root, out = sys.argv[1], Path(sys.argv[2])
 for report in out.iterdir():
     if report.is_file():
         text = report.read_text(encoding="utf-8", errors="surrogateescape")
-        if root in text:
-            report.write_text(text.replace(root + "/", "").replace(root, "."),
-                              encoding="utf-8", errors="surrogateescape")
+        new = text.replace(root + "/", "").replace(root, ".") if root in text else text
+        if report.suffix == ".xml":
+            new = re.sub(r'\bhostname="[^"]*"', 'hostname=""', new)
+        if new != text:
+            report.write_text(new, encoding="utf-8", errors="surrogateescape")
 PY
-python3 "$root/scripts/check_release.py" "$out" >/dev/null || {
+# With the maintainer's terms file when there is one: the reports folder has none of its own, so the
+# check ran with the term search disabled (audit 2026-11-17).
+terms=()
+[ -f "$root/scripts/forbidden-terms.txt" ] && terms=(--terms "$root/scripts/forbidden-terms.txt")
+python3 "$root/scripts/check_release.py" ${terms[@]+"${terms[@]}"} "$out" >/dev/null || {
   echo "A regenerated report still holds private or personal data: run scripts/check_release.py $out" >&2
   exit 1
 }

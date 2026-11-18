@@ -14,6 +14,14 @@ def guard(path, *extra):
     return subprocess.run([sys.executable, GUARD, *extra, str(path)], capture_output=True, text=True)
 
 
+def terms(tree, text):
+    """A forbidden-terms file kept OUTSIDE the scanned tree, as --terms arguments: inside a tree that
+    is not a live git checkout the file is itself a finding (it would publish every term)."""
+    path = tree.parent / (tree.name + "-forbidden-terms.txt")
+    path.write_text(text)
+    return ("--terms", str(path))
+
+
 def test_require_complete_flags_an_incomplete_release(tmp_path):
     """ENV-2026-01: --require-complete fails when a required entry point (here the vendored PHP-Parser)
     is missing from the assembled tree, so an incomplete release ZIP is caught; without the flag the
@@ -74,12 +82,11 @@ def test_project_url_allowed_but_other_personal_refs_flagged(tmp_path):
     # Split the term so this test file itself does not carry the literal personal reference the guard
     # (which scans tests/ too) would flag; it is only assembled at run time, into the staged files.
     mig = "miguel" + "enred"
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "forbidden-terms.txt").write_text(mig + "\n")
+    t = terms(tmp_path, mig + "\n")
     (tmp_path / "ok.md").write_text(f"Powered by Envelock -- https://{mig}.es/envelock\n")
-    assert guard(tmp_path).returncode == 0
+    assert guard(tmp_path, *t).returncode == 0
     (tmp_path / "bad.md").write_text(f"see also https://{mig}.es/otherproject\n")
-    r = guard(tmp_path)
+    r = guard(tmp_path, *t)
     assert r.returncode == 1 and "bad.md" in r.stdout and "forbidden term" in r.stdout
 
 
@@ -134,6 +141,70 @@ def test_nested_private_folder_of_a_staged_app_is_scanned(tmp_path):
     (staged / "private" / "x.json").write_text(json.dumps(leak))
     result = guard(staged)
     assert result.returncode == 1 and "private-key value" in result.stdout
+
+
+def test_require_complete_refuses_stale_audit_evidence(tmp_path):
+    """H-1 (audit 2026-11-17): docs/reports/targets.json pins the sources the published evidence was
+    produced from, and 1.1.0 was assembled with every pin stale. --require-complete must refuse a tree
+    whose pinned sources changed or vanished, and evidence that is missing, unreadable, empty or that
+    names a path outside the tree; a CRLF checkout of the same sources is NOT stale, and the default
+    privacy scan does not look at evidence at all."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from check_release import evidence_digest
+
+    _fake_repository(tmp_path, [])
+    (tmp_path / "encoder").mkdir()
+    a_py, b_py = tmp_path / "encoder" / "a.py", tmp_path / "encoder" / "b.py"
+    a_py.write_bytes(b"x = 1\n")
+    b_py.write_bytes(b"y = 2\n")
+    reports = tmp_path / "docs" / "reports"
+    reports.mkdir(parents=True)
+
+    def pin(entries):
+        (reports / "targets.json").write_text(json.dumps({"targets": entries}), encoding="utf-8")
+
+    def evidence_lines():
+        out = guard(tmp_path, "--require-complete").stdout
+        return [line for line in out.splitlines() if "targets.json" in line]
+
+    marker = (tmp_path / "extension" / "envelock.c").read_bytes()
+    fresh = {"encoder/a.py": evidence_digest(b"x = 1\n"), "encoder/b.py": evidence_digest(b"y = 2\n"),
+             "extension/envelock.c": evidence_digest(marker)}
+    pin(fresh)
+    assert evidence_lines() == []                                   # fresh evidence
+    a_py.write_bytes(b"x = 1\r\n")                                  # the same source, CRLF checkout
+    assert evidence_lines() == []
+    # A source ADDED after the evidence -- a new module, a new bytecode-layer file, a test or a
+    # scanned script -- is not pinned, so the evidence does not cover it (it used to pass).
+    added = ("encoder/new_module.py", "extension/envelock_new.c", "extension/opcache/php86/x.c",
+             "tests/test_new.py", "scripts/fpm_smoke.py")
+    for rel in added:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("# added\n")
+    lines = evidence_lines()
+    for rel in added:
+        assert any(f"{rel} is not pinned" in ln for ln in lines), (rel, lines)
+    for rel in added:
+        (tmp_path / rel).unlink()
+    assert evidence_lines() == []
+    a_py.write_bytes(b"x = 666\n")                                  # a pinned source changed...
+    b_py.unlink()                                                   # ...and another one vanished
+    lines = evidence_lines()
+    assert any("encoder/a.py changed after the evidence was generated" in ln for ln in lines), lines
+    assert any("encoder/b.py is pinned but missing" in ln for ln in lines), lines
+    assert "targets.json" not in guard(tmp_path).stdout             # not a privacy-scan concern
+    # Hostile or broken evidence: never opened outside the tree, never silently accepted.
+    for entry in ({"../outside.py": "sha256:00"}, {"/etc/passwd": "sha256:00"},
+                  {"C:/Windows/win.ini": "sha256:00"}, {"..\\up.py": "sha256:00"},
+                  {"encoder/a.py": 5}):
+        pin(entry)
+        assert any("invalid entry" in ln for ln in evidence_lines()), entry
+    pin({})
+    assert any("pins no source" in ln for ln in evidence_lines())
+    (reports / "targets.json").write_text("{not json", encoding="utf-8")
+    assert any("unreadable" in ln for ln in evidence_lines())
+    (reports / "targets.json").unlink()
+    assert any("missing, so the release carries no audit evidence" in ln for ln in evidence_lines())
 
 
 def _fake_repository(root, ignored):
@@ -256,13 +327,12 @@ def test_third_party_is_byte_for_byte_and_still_guarded(tmp_path):
     (lib / "test.key").write_text("-----BEGIN " + "PRIVATE KEY-----\n")
     (lib / "libffi.lib").write_bytes(b"\x00\x01binary")
     (lib / "ident.rs").write_bytes(b"unicode::FoobarXID::is_start(c)\n")   # term inside an identifier
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n")
+    t = terms(tmp_path, "Foobar\n")
     _manifest(tmp_path / "third_party")
-    assert guard(tmp_path).returncode == 0
+    assert guard(tmp_path, *t).returncode == 0
 
     (lib / "ident.rs").write_bytes(b"unicode::FoobarXID::is_start(c)\r\n")  # CRLF conversion
-    result = guard(tmp_path)
+    result = guard(tmp_path, *t)
     assert result.returncode == 1 and "ident.rs: differs from its hash" in result.stdout
     (lib / "ident.rs").write_bytes(b"unicode::FoobarXID::is_start(c)\n")
 
@@ -271,9 +341,9 @@ def test_third_party_is_byte_for_byte_and_still_guarded(tmp_path):
     (lib / "owner.json").write_text(json.dumps({"signing_private": a.make_owner()["signing_private"]}))
     (lib / "notes-utf16.txt").write_bytes("Written with Foobar.\n".encode("utf-16"))
     (lib / "notes-latin1.txt").write_bytes("Écrit avec Foobar.\n".encode("latin-1"))
-    assert "_backend.so: not listed in third_party/SHA256SUMS" in guard(tmp_path).stdout
+    assert "_backend.so: not listed in third_party/SHA256SUMS" in guard(tmp_path, *t).stdout
     _manifest(tmp_path / "third_party")                                  # even if listed
-    result = guard(tmp_path).stdout
+    result = guard(tmp_path, *t).stdout
     assert "owner.json: forbidden file" in result and "owner.json:1: embedded private-key value" in result
     assert "notes-utf16.txt:1: forbidden term" in result and "notes-latin1.txt:1: forbidden term" in result
     (lib / "owner.json").unlink()
@@ -288,10 +358,9 @@ def test_own_files_match_terms_anywhere_and_extra_venvs_are_skipped(tmp_path):
     """Outside third_party/ a term counts even inside an identifier; .venv-* folders (git-ignored
     build environments) are not scanned inside a live git checkout, but reported anywhere else
     (a copy or a release would publish them)."""
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n")
+    t = terms(tmp_path, "Foobar\n")
     (tmp_path / "client.py").write_text("client = FoobarClient()\n")
-    assert "client.py:1: forbidden term" in guard(tmp_path).stdout
+    assert "client.py:1: forbidden term" in guard(tmp_path, *t).stdout
     (tmp_path / "client.py").unlink()
     venv = tmp_path / ".venv-gui" / "lib"
     venv.mkdir(parents=True)
@@ -312,13 +381,12 @@ def test_upstream_rules_human_coauthors_binaries_links_and_allowed_phrases(tmp_p
     lib.mkdir(parents=True)
     (lib / "NEWS").write_text("Co-" + "authored-by: Jane Developer\nPatch by Foobar Smith.\n")
     (lib / "icon.icns").write_bytes(b"\x00\x01\x02 xFOOBARx \x00 FooBar \x00\xff" * 4)
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n!Foobar Smith\n")
+    t = terms(tmp_path, "Foobar\n!Foobar Smith\n")
     _manifest(tmp_path / "third_party")
-    assert guard(tmp_path).returncode == 0
+    assert guard(tmp_path, *t).returncode == 0
     (lib / "notes.txt").write_bytes("Made with Foobar.\n".encode("utf-16-le"))   # no BOM
     _manifest(tmp_path / "third_party")
-    assert "notes.txt:1: forbidden term" in guard(tmp_path).stdout
+    assert "notes.txt:1: forbidden term" in guard(tmp_path, *t).stdout
     (lib / "notes.txt").unlink()
     _symlink_or_skip("NEWS", lib / "NEWS.link")
     _manifest(tmp_path / "third_party")
@@ -333,18 +401,16 @@ def test_allowed_phrases_are_narrow_and_upstream_only(tmp_path):
     lib = tmp_path / "third_party" / "lib-1.0"
     lib.mkdir(parents=True)
     (lib / "CREDITS").write_text("Patch by Foobar Smith.\n")
-    (tmp_path / "scripts").mkdir()
-    terms = tmp_path / "scripts" / "forbidden-terms.txt"
-    terms.write_text("Foobar\nSmithson\n!Foobar Smith\n!\n")
+    t = terms(tmp_path, "Foobar\nSmithson\n!Foobar Smith\n!\n")
     _manifest(tmp_path / "third_party")
-    assert guard(tmp_path).returncode == 0
+    assert guard(tmp_path, *t).returncode == 0
     (lib / "CREDITS").write_text("Patch by Foobar Smithson.\n")       # overlaps a longer term
     _manifest(tmp_path / "third_party")
-    assert "CREDITS:1: forbidden term" in guard(tmp_path).stdout
+    assert "CREDITS:1: forbidden term" in guard(tmp_path, *t).stdout
     (lib / "CREDITS").write_text("Patch by Foobar Smith.\n")
     _manifest(tmp_path / "third_party")
     (tmp_path / "README.md").write_text("Thanks to Foobar Smith.\n")  # Envelock's own file
-    assert "README.md:1: forbidden term" in guard(tmp_path).stdout
+    assert "README.md:1: forbidden term" in guard(tmp_path, *t).stdout
 
 
 def test_text_with_a_stray_nul_or_in_utf32_is_still_searched(tmp_path):
@@ -354,10 +420,8 @@ def test_text_with_a_stray_nul_or_in_utf32_is_still_searched(tmp_path):
     (lib / "NEWS").write_bytes(b"Made with Foobar.\n\x00\n")
     (lib / "notes32.txt").write_bytes("Made with Foobar.\n".encode("utf-32"))
     (lib / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n Foobar \x00")      # data: not searched
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n")
     _manifest(tmp_path / "third_party")
-    result = guard(tmp_path).stdout
+    result = guard(tmp_path, *terms(tmp_path, "Foobar\n")).stdout
     assert "NEWS:1: forbidden term" in result and "notes32.txt:1: forbidden term" in result
     assert "logo.png" not in result
 
@@ -459,6 +523,76 @@ def test_archive_in_release_tree_is_flagged(tmp_path):
     (tmp_path / "data.tar.gz").write_bytes(b"\x1f\x8b\x08" + b"\x00" * 24)  # gzip magic
     r = guard(tmp_path)
     assert r.returncode == 1 and "archive" in r.stdout
+
+
+@pytest.mark.parametrize("name,data", [
+    ("cpython.tar.zst", b"\x28\xb5\x2f\xfd" + b"\x00" * 24),     # Zstandard
+    ("bundle.cab", b"MSCF" + b"\x00" * 24),                         # cabinet
+    ("old.tar.Z", b"\x1f\x9d" + b"\x00" * 24),                      # compress
+    ("renamed.bin", b"\x28\xb5\x2f\xfd" + b"\x00" * 24),            # by magic, whatever the name
+    ("a.lz4", b"\x04\x22\x4d\x18" + b"\x00" * 24),
+])
+def test_archive_formats_that_used_to_pass_as_blobs_are_flagged(tmp_path, name, data):
+    """Audit 2026-11-17: zstd, cabinet, .Z and LZ4 archives fell through as "binary blobs" (NUL bytes,
+    no text extension) and passed unscanned."""
+    (tmp_path / name).write_bytes(data)
+    r = guard(tmp_path)
+    assert r.returncode == 1 and f"{name}: archive in the release tree" in r.stdout, r.stdout
+
+
+def test_terms_file_inside_a_staged_tree_is_refused_and_taken_from_outside(tmp_path):
+    """Audit 2026-11-17: copying scripts/forbidden-terms.txt into a staged tree to term-check it made
+    the check pass and shipped the whole list. Its presence outside a live git checkout that ignores
+    it is a finding; --terms FILE checks the tree against a file kept outside it."""
+    (tmp_path / "README.md").write_text("Made by Foobar.\n")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n")
+    out = guard(tmp_path).stdout
+    assert "scripts/forbidden-terms.txt: internal file that must never be published" in out, out
+    assert "README.md:1: forbidden term" in out                    # still used for the scan itself
+    (tmp_path / "scripts" / "forbidden-terms.txt").unlink()
+    r = guard(tmp_path, *terms(tmp_path, "Foobar\n"))
+    assert r.returncode == 1 and "README.md:1: forbidden term" in r.stdout
+    assert "DISABLED" not in r.stderr
+    (tmp_path / "README.md").write_text("Nothing private.\n")
+    assert guard(tmp_path, *terms(tmp_path, "Foobar\n")).returncode == 0
+    # A live git checkout that ignores it keeps it, as before.
+    (tmp_path / "scripts" / "forbidden-terms.txt").write_text("Foobar\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("scripts/forbidden-terms.txt\n")
+    assert guard(tmp_path).returncode == 0
+    # A missing --terms file is a usage error, not a silent pass.
+    assert guard(tmp_path, "--terms", str(tmp_path / "nope.txt")).returncode == 2
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+def test_terms_file_with_a_byte_order_mark_keeps_its_first_term(tmp_path, encoding):
+    """Audit 2026-11-17: PowerShell 5.1 writes a BOM (Out-File/Set-Content -Encoding utf8, or UTF-16
+    with `>`); read as plain UTF-8 the BOM stayed glued to the first term and disabled it."""
+    (tmp_path / "README.md").write_text("acmeinternal and projectzeta\n")
+    path = tmp_path.parent / (tmp_path.name + "-bom-terms.txt")
+    path.write_bytes("acmeinternal\r\nprojectzeta\r\n".encode(encoding))
+    out = guard(tmp_path, "--terms", str(path)).stdout
+    assert out.count("README.md:1: forbidden term") == 1, out
+    path.write_bytes("acmeinternal\r\n".encode(encoding))
+    assert "README.md:1: forbidden term" in guard(tmp_path, "--terms", str(path)).stdout
+
+
+def test_symbolic_links_are_refused_anywhere(tmp_path):
+    """Audit 2026-11-17: outside prebuilt/ and third_party/ a link to a folder (whose files zip
+    follows and ships unscanned) and a dangling link (whose home-folder target git/tar store) were
+    skipped silently."""
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir()
+    (outside / "owner.json").write_text(json.dumps({"signing_private": a.make_owner()["signing_private"]}))
+    (tmp_path / "docs").mkdir()
+    _symlink_or_skip(outside, tmp_path / "docs" / "keys")
+    _symlink_or_skip(str(outside / "gone.txt"), tmp_path / "docs" / "dangling.txt")
+    (tmp_path / "README.md").write_text("ok\n")
+    _symlink_or_skip(str(tmp_path / "README.md"), tmp_path / "docs" / "readme-link.md")
+    out = guard(tmp_path).stdout
+    for rel in ("docs/keys", "docs/dangling.txt", "docs/readme-link.md"):
+        assert f"{rel}: symbolic link" in out, (rel, out)
 
 
 def test_terms_file_absent_warns_on_stderr(tmp_path):

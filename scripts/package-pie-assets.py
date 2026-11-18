@@ -31,6 +31,30 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = "envelock"
 PHP_MINORS = ("8.2", "8.3", "8.4", "8.5")
 OFFICIAL_COMPILER = {"8.2": "vs16", "8.3": "vs16", "8.4": "vs17", "8.5": "vs17"}
+# ZEND_MODULE_API_NO of each minor: every extension carries its build id ("API20240924,NTS" on
+# Linux, "API20240924,TS,VS17" on Windows), which is what PHP checks when it loads the module.
+MODULE_API = {"8.2": "20220829", "8.3": "20230831", "8.4": "20240924", "8.5": "20250925"}
+BUILD_ID_RE = re.compile(rb"API[0-9]{8},(?:NTS|TS)(?:,VS[0-9]{2})?")
+
+
+def expected_build_id(system, minor, ts, compiler=None):
+    """The build id a loader for this folder must carry."""
+    build_id = f"API{MODULE_API[minor]},{'TS' if ts in ('ts', 'zts') else 'NTS'}"
+    if system == "windows":
+        build_id += f",{compiler.upper()}"
+    return build_id.encode()
+
+
+def build_id_problem(data, expected):
+    """None when the module carries exactly the expected build id, else what is wrong. The folder a
+    binary sits in decided its PIE asset name, so an 8.2 DLL copied into php-8.3-nts/ (both vs16) or
+    an NTS .so into php-8.4-zts/ was published under the wrong name and failed to load for every
+    user who installed it (audit 2026-11-17)."""
+    found = sorted(set(BUILD_ID_RE.findall(data)))
+    if found == [expected]:
+        return None
+    shown = ", ".join(f.decode() for f in found) or "none"
+    return f"build id {shown}, but this folder needs {expected.decode()}"
 ZIP_DATE = (2026, 1, 1, 0, 0, 0)
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-?(?:alpha|beta|RC|rc)[0-9]*)?$")
 
@@ -123,11 +147,19 @@ def main(argv=None):
             if compiler != OFFICIAL_COMPILER[minor]:
                 errors.append(f"{rel}: built with {compiler}, but PHP {minor} for Windows uses {OFFICIAL_COMPILER[minor]}")
                 continue
+            problem = build_id_problem(data, expected_build_id(system, minor, ts, compiler))
+            if problem:
+                errors.append(f"{rel}: {problem}")
+                continue
             base = windows_asset(args.version, minor, ts, compiler)
             members = [(base + ".dll", data)] + extras
         else:
             if not is_elf_x86_64(data):
                 errors.append(f"{rel}: not an x86-64 ELF object")
+                continue
+            problem = build_id_problem(data, expected_build_id(system, minor, ts))
+            if problem:
+                errors.append(f"{rel}: {problem}")
                 continue
             base = linux_asset(args.version, minor, ts)
             members = [(f"{EXTENSION}.so", data)] + extras

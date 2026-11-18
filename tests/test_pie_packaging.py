@@ -86,6 +86,68 @@ def test_packages_every_prebuilt_loader(tmp_path):
     assert b"\r" not in (out / "SHA256SUMS").read_bytes()
 
 
+def _fake_elf(build_id):
+    import struct
+    head = bytearray(64)
+    head[0:4], head[4] = b"\x7fELF", 2
+    head[18:20] = struct.pack("<H", 62)                     # x86-64
+    return bytes(head) + b"\0module\0" + build_id + b"\0"
+
+
+def _fake_pe(build_id, linker_minor=29):
+    import struct
+    data = bytearray(0x200)
+    data[0:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<H", data, 0x84, 0x8664)
+    data[0x80 + 24 + 2], data[0x80 + 24 + 3] = 14, linker_minor
+    return bytes(data) + build_id + b"\0"
+
+
+@pytest.mark.parametrize("rel, data, problem", [
+    # an NTS module in the ZTS folder
+    ("loader/linux-x86_64/php-8.4-zts/envelock.so", _fake_elf(b"API20240924,NTS"),
+     "build id API20240924,NTS, but this folder needs API20240924,TS"),
+    # an 8.2 module in the 8.5 folder
+    ("loader/linux-x86_64/php-8.5-nts/envelock.so", _fake_elf(b"API20220829,NTS"),
+     "build id API20220829,NTS, but this folder needs API20250925,NTS"),
+    # an 8.2 DLL in the 8.3 folder: both vs16, so the linker check alone passed it
+    ("loader/windows-x64/php-8.3-nts/php_envelock.dll", _fake_pe(b"API20220829,NTS,VS16"),
+     "build id API20220829,NTS,VS16, but this folder needs API20230831,NTS,VS16"),
+    # a TS DLL in the NTS folder
+    ("loader/windows-x64/php-8.3-nts/php_envelock.dll", _fake_pe(b"API20230831,TS,VS16"),
+     "needs API20230831,NTS,VS16"),
+])
+def test_refuses_a_binary_copied_into_the_wrong_folder(tmp_path, rel, data, problem):
+    """Audit 2026-11-17: the folder decides the PIE asset name, and nothing checked that the binary
+    in it was built for that PHP: an 8.2 DLL in php-8.3-nts/ (same linker generation) or an NTS .so in
+    php-8.4-zts/ was published under the wrong name and failed to load for everyone. The build id PHP
+    itself checks at load time must match the folder."""
+    fake = tmp_path / "prebuilt"
+    (fake / rel).parent.mkdir(parents=True)
+    (fake / rel).write_bytes(data)
+    (fake / "SHA256SUMS").write_text(f"{hashlib.sha256(data).hexdigest()}  {rel}\n")
+    result = _run("--version", "1.0.0", "--prebuilt", fake, "--out", tmp_path / "out")
+    assert result.returncode != 0 and problem in result.stderr, result.stderr
+    assert not (tmp_path / "out").exists()
+
+
+def test_accepts_a_binary_built_for_its_folder(tmp_path):
+    fake = tmp_path / "prebuilt"
+    files = {"loader/linux-x86_64/php-8.4-zts/envelock.so": _fake_elf(b"API20240924,TS"),
+             "loader/windows-x64/php-8.5-ts/php_envelock.dll": _fake_pe(b"API20250925,TS,VS17", 44)}
+    lines = []
+    for rel, data in files.items():
+        (fake / rel).parent.mkdir(parents=True)
+        (fake / rel).write_bytes(data)
+        lines.append(f"{hashlib.sha256(data).hexdigest()}  {rel}")
+    (fake / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    result = _run("--version", "1.0.0", "--prebuilt", fake, "--out", tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert len(list((tmp_path / "out").glob("*.zip"))) == 2
+
+
 @pytest.mark.skipif(not (ROOT / "prebuilt" / "loader" / "windows-x64").is_dir(), reason="no prebuilt Windows loaders")
 def test_refuses_a_binary_that_is_not_the_listed_one(tmp_path):
     fake = tmp_path / "prebuilt"
