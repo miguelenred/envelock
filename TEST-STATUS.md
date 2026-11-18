@@ -14,6 +14,17 @@ per-call costs (package digest, debugger lookups, mini-VM), reproducible bytecod
 analyser notes on `envelock_vm.c`, `-Werror=sizeof-array-argument`, the start-up-only directives
 documented, and `build-windows.ps1`'s slow downloads. Then every binary in `prebuilt/` was rebuilt.
 
+**Final pre-release re-verification (2026-11-18, idle machine).** Before tagging 1.1.0, the CI's own
+commands were rehearsed locally on an otherwise idle machine and every NTS binary rebuilt once more
+from the committed source. The CI's unix command, `ENVELOCK_REQUIRE_NATIVE=1 python -m pytest -q
+tests` on PHP 8.3, gave **1768 passed, 50 skipped, 0 failed** — `test_release_guard` included, after
+regenerating `docs/reports/`. The five release Linux loaders rebuilt with `build-unix.sh` pass
+`test_native.py` with **0 failed** each (8.4 ZTS byte-identical to the already-tested loader). The four
+Windows NTS DLLs rebuilt with `build-windows.ps1` pass with **964 passed, 0 failed** each; the 8.5 NTS
+DLL's single load timeout on the first pass (a cold `php.exe` spawn hitting a 3 s limit as the fourth
+build in a row — a VM test whose `input=0` path is a plain `else` return, so no non-termination) did
+not recur when 8.5 was rebuilt alone. `scripts/check_release.py --require-complete` passes.
+
 | Where | Suite | Result |
 |---|---|---|
 | AlmaLinux 8 (WSL1), static OpenSSL 3.5.9, test build of the loader | `test_native.py` + `test_bytecode_guard.py` + `test_prebuilt.py`, PHP 8.2.35 NTS | 1038 passed, 28 skipped, 0 failed |

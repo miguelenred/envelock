@@ -3067,9 +3067,12 @@ def test_secret_memory_reports_what_the_kernel_actually_gave(native):
     kind = on.stdout.strip()
     # memfd_secret needs CONFIG_SECRETMEM *and* a small-page direct map; where the syscall is not
     # registered the arena degrades to the locked mapping, and must say so rather than pass. On
-    # Windows only VirtualLock applies, and it now says that instead of the Linux name.
+    # Windows only VirtualLock applies, and on macOS only mlock (it has no MADV_DONTDUMP): both now say
+    # that instead of the Linux name (audit 2026-11-17; the macOS case was caught by CI, 2026-11-18).
     if os.name == "nt":
         assert kind == "VirtualLock", kind
+    elif sys.platform == "darwin":
+        assert kind == "mlock", kind
     else:
         assert kind in ("memfd_secret", "mlock+MADV_DONTDUMP"), kind
 
