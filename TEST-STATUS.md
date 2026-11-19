@@ -9,14 +9,13 @@ Date: 2026-11-19 (1.1.1 source and its loaders, built and tested; the records be
 ## Real applications: CodeIgniter 4 and Magento 2.4 (2026-11-19, GitHub's runners)
 
 Two more real applications, protected vs unprotected, compared request by request (status, full body and
-headers). Nothing in the loader or the encoder changed; the checks are `scripts/framework-smoke.py`
-(CodeIgniter, now in the CI `frameworks` job) and `scripts/magento-smoke.py`
-(`.github/workflows/apps.yml`, run by hand: Magento needs MariaDB and OpenSearch).
+headers). Measured once to show compatibility, like the four CMSs, with a throwaway workflow; not part of the
+CI. Nothing in the loader or the encoder changed.
 
 | Where | Suite | Result |
 |---|---|---|
-| GitHub `ubuntu-22.04`, PHP 8.4, CodeIgniter 4.7.6 + fixture, bytecode + `--encode-strings --obfuscate --strip-comments --compact` | `framework-smoke.py --kind codeigniter` | first run: every request `Cannot redeclare class Config\Filters` — CodeIgniter's filter discovery tokenizes `app/Config/Filters.php`; with that file cleartext: 7/7 identical |
-| GitHub `ubuntu-24.04`, PHP 8.4, Magento Open Source 2.4.8 (git + Composer), MariaDB 11.4, OpenSearch 2.19, default mode, full-page cache off | `magento-smoke.py`, whole core packed (14,138 files, 42.7 MB) | 15/15 identical as encryption only, as bytecode and with recommend's options; per request without OPcache on both sides: bytecode as fast as unprotected, encryption about +20%, with obfuscation about +28% |
+| GitHub `ubuntu-22.04`, PHP 8.4, CodeIgniter 4.7.6 + fixture, bytecode + `--encode-strings --obfuscate --strip-comments --compact` | a test application, 7 routes | first run: every request `Cannot redeclare class Config\Filters` — CodeIgniter's filter discovery tokenizes `app/Config/Filters.php`; with that file cleartext: 7/7 identical |
+| GitHub `ubuntu-24.04`, PHP 8.4, Magento Open Source 2.4.8 (git + Composer), MariaDB 11.4, OpenSearch 2.19, default mode, full-page cache off | 15 probes, whole core packed (14,138 files, 42.7 MB) | 15/15 identical as encryption only, as bytecode and with recommend's options; per request without OPcache on both sides: bytecode as fast as unprotected, encryption about +20%, with obfuscation about +28% |
 
 ## 1.1.1: the memory guidance applied by the tools (2026-11-18/19)
 

@@ -155,7 +155,7 @@ source-tokenizing annotation problem; `include_protection` stays off so the runt
 
 ## Magento 2.4 (measured: the whole core, three profiles)
 
-Measured on 2026-11-19 on GitHub's runners (`.github/workflows/apps.yml`, `scripts/magento-smoke.py`):
+Measured once on 2026-11-19, like the four CMSs below, on GitHub's runners with a throwaway workflow:
 Magento Open Source 2.4.8 installed from its git release with Composer (no Adobe keys), PHP 8.4 on its
 built-in server with Magento's own `phpserver/router.php`, MariaDB 11.4 and OpenSearch 2.19, default
 mode, and the full-page cache off, so that every probe renders its page through the protected code.
@@ -198,12 +198,12 @@ mode, and the full-page cache off, so that every probe renders its page through 
 
 ## CodeIgniter 4 (measured)
 
-Measured on 2026-11-19 on GitHub's runners with `scripts/framework-smoke.py` (the Laravel/Symfony check,
-run in the CI `frameworks` job): CodeIgniter 4.7.6 (`codeigniter4/appstarter`) with a small fixture
-(`tests/fixtures/frameworks/codeigniter/`: a service from `Config\Services`, a Model on SQLite, validation
-answering 422, a PHP 8 attribute read back by reflection, and a 404), its own code packed as bytecode with
-`--encode-strings --obfuscate --strip-comments --compact`, served in production mode. `vendor/` and
-`writable/` stay cleartext.
+Measured once on 2026-11-19, like the four CMSs below, on GitHub's runners: CodeIgniter 4.7.6
+(`codeigniter4/appstarter`) with a small test application (a service from `Config\Services`, a Model
+on SQLite, validation answering 422, a PHP 8 attribute read back by reflection, and a 404), its own code
+packed as bytecode with `--encode-strings --obfuscate --strip-comments --compact`, served in production
+mode and compared request by request with the unprotected application. `vendor/` and `writable/` stay
+cleartext.
 
 - **Keep `app/Config/Filters.php` cleartext.** CodeIgniter finds the class in a `Config/Filters.php` by
   reading the file and tokenizing it (`FileLocator::getClassname`, called by filter discovery on every

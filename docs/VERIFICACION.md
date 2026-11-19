@@ -39,11 +39,10 @@ re-run in this environment. Honest status, with what could not be verified here 
   command run as printed (web routes and console). `scripts/framework-smoke.py`; `TEST-STATUS.md`.
 - **CodeIgniter 4 and Magento 2.4 (real applications).** *Run on 2026-11-19* on GitHub's runners.
   CodeIgniter 4.7.6 with a fixture (7 routes) packed as bytecode is identical to the cleartext app once
-  `app/Config/Filters.php` stays cleartext (CodeIgniter tokenizes it at run time); it now runs in the CI
-  `frameworks` job. Magento Open Source 2.4.8, its whole core packed (14,138 files), is identical on 15
+  `app/Config/Filters.php` stays cleartext (CodeIgniter tokenizes it at run time). Magento Open Source 2.4.8, its whole core packed (14,138 files), is identical on 15
   probes (12 HTTP pages, REST and GraphQL calls and 3 `bin/magento` commands) as encryption only, as
-  bytecode and with recommend's options, on MariaDB and OpenSearch (`.github/workflows/apps.yml`, run by
-  hand). `docs/DEPLOYING-APPS.md`.
+  bytecode and with recommend's options, on MariaDB and OpenSearch. Measured once to show compatibility,
+  like the four CMSs; not part of the CI. `docs/DEPLOYING-APPS.md`.
 - **Windows DLL runtime validation.** *Done on 2026-11-10* on native Windows 11 with the official PHP
   for Windows builds: the 8 DLLs are now built there (`scripts/build-windows.ps1`) and pass
   `tests/test_native.py` with 0 failures; see `TEST-STATUS.md` and `docs/AUDITORIA.md` (Pass 32).

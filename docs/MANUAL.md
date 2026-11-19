@@ -695,16 +695,12 @@ Honest limits:
 - An administrator who controls the machine's DNS and its trusted CAs can answer with a chosen time. That is a much higher bar than `date -s`, not an impossible one.
 - Not implemented on Windows: the loader reports no observation there and the deployment runs on the local clock and the watermark.
 
-### 14.3.1 Real applications: Laravel, Symfony and CodeIgniter (objective O11)
+### 14.3.1 Real applications: Laravel and Symfony (objective O11)
 
 An integration check for the v2 container format; repeat it as the final O11 closure check after all other
-objectives are complete. It uses dedicated **disposable** applications, not production apps. The builder
-also creates a CodeIgniter 4 fixture, checked with
-`python3 scripts/framework-smoke.py --app /tmp/envelock-framework-fixtures/codeigniter --kind codeigniter`
-(CodeIgniter reads `app/Config/Filters.php` as text, so the check keeps that file cleartext; see
-[DEPLOYING-APPS.md](DEPLOYING-APPS.md#codeigniter-4-measured)). A whole Magento 2.4 install is checked by
-`scripts/magento-smoke.py`, which needs MariaDB and OpenSearch and runs on GitHub's runners
-(`.github/workflows/apps.yml`, Actions > Run workflow).
+objectives are complete. It uses dedicated **disposable** applications, not production apps. The
+compatibility of other applications (WordPress, Drupal, Joomla, PrestaShop, CodeIgniter 4, Magento 2.4)
+was measured once and is recorded in [DEPLOYING-APPS.md](DEPLOYING-APPS.md).
 The builder requires Composer, PHP 8.4+ with the frameworks' extensions, network access and an
 empty destination; it refuses to overwrite an existing directory. The fixture source lives under
 `tests/fixtures/frameworks/`.

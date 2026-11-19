@@ -2,21 +2,15 @@
 
 ## Unreleased
 
-**Two more real applications checked, protected vs unprotected; nothing in the loader or the encoder
-changed.** `docs/DEPLOYING-APPS.md` has the measurements and the recipes.
-- **CodeIgniter 4** joins the Laravel and Symfony check (`scripts/framework-smoke.py`, CI `frameworks`
-  job): CodeIgniter 4.7.6 with a fixture, packed as bytecode, is identical to the cleartext app once
-  `app/Config/Filters.php` stays cleartext. CodeIgniter's filter discovery reads that file and tokenizes
-  it to find its class (`FileLocator::getClassname`), so on an encrypted file it took the app's own config
-  for a module's and included it again: every request died with `Cannot redeclare class Config\Filters`.
+**Compatibility measured on two more real applications, like the four CMSs; nothing in the loader or the
+encoder changed.** `docs/DEPLOYING-APPS.md` has the measurements and the recipes.
+- **CodeIgniter 4.7.6**, its own code packed as bytecode, is identical to the cleartext application once
+  `app/Config/Filters.php` stays cleartext. CodeIgniter's filter discovery reads that file and tokenizes it
+  to find its class (`FileLocator::getClassname`), so on an encrypted file it took the app's own config for
+  a module's and included it again: every request died with `Cannot redeclare class Config\Filters`.
   Migrations and `spark routes` use the same reader.
-- **Magento 2.4**: `scripts/magento-smoke.py`, run by hand on GitHub's runners
-  (`.github/workflows/apps.yml`: MariaDB and OpenSearch as services). Magento Open Source 2.4.8 with its
-  whole core packed (14,138 files) is identical on 15 probes (pages, REST, GraphQL, `bin/magento`) as
-  encryption only, as bytecode and with recommend's options.
-- `framework-smoke.py` packs only the `.php` files inside an own-code folder; an extensionless entry
-  script (`artisan`, `bin/console`, `spark`) is named on its own, so a folder's `.htaccess` or `.gitignore`
-  is no longer packed as PHP.
+- **Magento Open Source 2.4.8**, its whole core packed (14,138 files), is identical on 15 probes (pages,
+  REST, GraphQL, `bin/magento`) as encryption only, as bytecode and with recommend's options.
 
 ## 1.1.1 — 2026-11-19 (memory guidance applied by the tools)
 
