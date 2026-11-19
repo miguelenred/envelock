@@ -140,6 +140,19 @@ The extra protections (path binding, release consistency, minimum serial, includ
 
 Without OPcache's help, the compiled code of protected files lives in each request's own memory: it counts towards `memory_limit` and each FPM worker keeps that memory. See the recommendations in `MANUAL.md` (sections 14 and 19).
 
+**On a real application (2026-11-18).** Laravel 13.43 (33 PHP files of its own; 8,207 in `vendor/`, 64 MB), PHP 8.4.27 NTS under PHP-FPM with OPcache on and the protected files blacklisted, the 1.1.0 release loader, one worker, 15 requests per route. Every response was identical to the unprotected app's. PHP memory per request (`memory_get_peak_usage()`, steady state):
+
+| Variant | Protected files loaded per request | `/widgets` (Eloquent query) | `/ping` | Worker RSS |
+|---|---:|---:|---:|---:|
+| Unprotected | 0 | 0.99 MB | 0.85 MB | 30 MB |
+| Only the application's code (what `recommend` packs: `vendor/`, run-time caches and Blade templates left out) | 18 (46 KB of source) | 1.05 MB | 0.87 MB | 31 MB |
+| The same with `--strip-comments` | 18 | 1.05 MB | 0.87 MB | 31 MB |
+| Everything, `vendor/` included | 549 (6.3 MB of source) | 22.2 MB | 20.7 MB | 39 MB |
+
+Protecting only the application's code costs nothing measurable. Encrypting `vendor/` multiplies the memory of every request by about 22, because the framework is then compiled into each request instead of being served from OPcache. That compiled code took about 3.4 times the size of its source (21 MB for 6.3 MB), against 9.3 times on the dense generated project above; `recommend` uses that 3–9 range for its estimate. `--strip-comments` made no measurable difference here, where the application's own code is small. Times are not reported: under WSL1 they were too noisy to compare.
+
+`envelock recommend` and the assistant's Recommend tab already pack this way — they leave Composer's `vendor/`, the run-time caches and Blade templates out of the encryption — and state the size of what they encrypt with the worst-case extra memory per request; `pack` states the same ceiling for what it has just encrypted and warns when Composer's `vendor/` goes into a package encrypted.
+
 ## Not verified here / pending CI
 
 | Scope | Status |

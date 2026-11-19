@@ -200,6 +200,42 @@ STRINGS = {
                             "se puede saltar con un auto_prepend_file/auto_append_file configurado "
                             "en el servidor. Marca también esa opción, o asegúrate de que el pool "
                             "de PHP los deja vacíos."),
+    "pack_vendor": ("\n\nWARNING: vendor/ (Composer dependencies) is in the package encrypted: {n} PHP "
+                    "file(s), {mb} MB of source. OPcache cannot cache protected files, so every request "
+                    "recompiles the ones it uses, in every PHP worker: more memory and time per request. "
+                    "Unless you need it, put vendor/* in 'Exclude' and deploy vendor/ next to the package; "
+                    "the Recommend tab does this for you.",
+                    "\n\nAVISO: vendor/ (dependencias de Composer) va cifrado en el paquete: {n} fichero(s) "
+                    "PHP, {mb} MB de código. OPcache no puede guardar los ficheros protegidos, así que cada "
+                    "petición vuelve a compilar los que usa, en cada proceso de PHP: más memoria y tiempo por "
+                    "petición. Salvo que lo necesites, pon vendor/* en 'Excluir' y despliega vendor/ junto al "
+                    "paquete; la pestaña Recomendar lo hace por ti."),
+    "pack_vendor_ip": ("\n\nNote: vendor/ (Composer dependencies) is in the package encrypted ({n} PHP "
+                       "file(s), {mb} MB of source), as 'Include protection' needs. OPcache cannot cache "
+                       "protected files, so every request recompiles the ones it uses, in every PHP worker: "
+                       "size memory_limit and the number of PHP workers for it.",
+                       "\n\nNota: vendor/ (dependencias de Composer) va cifrado en el paquete ({n} fichero(s) "
+                       "PHP, {mb} MB de código), como necesita 'Protección de includes'. OPcache no puede "
+                       "guardar los ficheros protegidos, así que cada petición vuelve a compilar los que usa, "
+                       "en cada proceso de PHP: dimensiona memory_limit y el número de procesos de PHP para "
+                       "ello."),
+    "pack_memory": ("\n\nMemory: this package encrypts {n} PHP file(s), {size} of source. OPcache cannot "
+                    "cache protected files, so each request compiles the ones it uses into its own memory, in "
+                    "every PHP worker: a request that loaded all of them would need {extra} more than with "
+                    "OPcache (3-9x the source, measured).{limit} This is a ceiling, not a forecast: measure a "
+                    "real request with memory_get_peak_usage(true).",
+                    "\n\nMemoria: este paquete cifra {n} fichero(s) PHP, {size} de código. OPcache no puede "
+                    "guardar los ficheros protegidos, así que cada petición compila los que usa en su propia "
+                    "memoria, en cada proceso de PHP: una petición que los cargara todos necesitaría {extra} "
+                    "más que con OPcache (de 3 a 9 veces el código, medido).{limit} Es un máximo, no una "
+                    "previsión: mide una petición real con memory_get_peak_usage(true)."),
+    "pack_memory_limit": (" That is above PHP's default memory_limit ({mb} MB), though a real request loads "
+                          "only the files it uses.",
+                          " Eso supera el memory_limit por defecto de PHP ({mb} MB), aunque una petición real "
+                          "solo carga los ficheros que usa."),
+    "mem_lt": ("less than 0.1 MB", "menos de 0.1 MB"),
+    "mem_upto": ("up to about {high} MB", "hasta unos {high} MB"),
+    "mem_range": ("roughly {low}-{high} MB", "unos {low}-{high} MB"),
     "saved_at": ("Saved to:\n{path}", "Guardado en:\n{path}"),
     # keys tab
     "keys_help": ("Create your keys once. The owner signs; each server has its own recipient key. "
@@ -888,7 +924,23 @@ class Assistant(tk.Tk):
             extra.append(self.t("pack_not_transformed", n=len(halted), files=", ".join(halted)))
         if warn_prepend:
             extra.append(self.t("pack_inc_no_prepend"))
-        return text + "".join(extra), bool(extra)
+        vendor = info.get("vendor_encrypted")
+        if vendor:
+            extra.append(self.t("pack_vendor_ip" if info.get("include_protection") else "pack_vendor",
+                                n=vendor["files"], mb=f"{vendor['bytes'] / 1048576:.1f}"))
+        # The memory ceiling is information, not a warning: it is always shown and never marks the result.
+        mem = info.get("memory_estimate")
+        note = ""
+        if mem and mem.get("protected_files"):
+            low, high = mem["worst_case_extra_mb"]
+            amount = (self.t("mem_lt") if high < 0.05 else
+                      self.t("mem_upto", high=f"{high:.1f}") if low < 0.05 else
+                      self.t("mem_range", low=f"{low:.1f}", high=f"{high:.1f}"))
+            limit_mb = actions.a.PHP_DEFAULT_MEMORY_LIMIT_MB
+            note = self.t("pack_memory", n=mem["protected_files"],
+                          size=actions.a._size(mem["protected_source_bytes"]), extra=amount,
+                          limit=self.t("pack_memory_limit", mb=limit_mb) if high > limit_mb else "")
+        return text + "".join(extra) + note, bool(extra)
 
     def _tab_keys(self, f):
         ttk.Label(f, text=self.t("keys_help"), wraplength=660, foreground="#555").pack(anchor="w", pady=(0, 4))

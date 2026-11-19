@@ -1,5 +1,5 @@
 {
-  "generated": "2026-11-18T11:28:22Z",
+  "generated": "2026-11-19T07:39:42Z",
   "format": "ENVLK02",
   "identity": "ENVLKID4",
   "environment": {
@@ -12,7 +12,7 @@
   "note": "SHA-256 (line endings normalised to LF) of every first-party source this evidence covers: compiled into the loader the JUnit run tests, run by the test suite, or scanned by ruff/bandit (scripts/check_release.py EVIDENCE_PATTERNS; tests/fixtures/ not pinned). openssl is the libcrypto the loader and the exerciser were built against; php_openssl the one PHP links. scripts/check_release.py --require-complete refuses a release whose pinned sources changed since or that holds an unpinned one. Multi-version matrix, libFuzzer and Windows/macOS come from CI.",
   "targets": {
     "CMakeLists.txt": "sha256:95b648548c56440a521ece18f189d23d9e36ca2b5f44701f2574b7ad752237a4",
-    "encoder/envelock.py": "sha256:9755090ea8bdc3c935de712fe806de28c3c6874db696c7f34097c72d95a445a1",
+    "encoder/envelock.py": "sha256:d4e37b142251b56b305e3eee5dd4b9b6d425e970f6684c2ebb5192a3668678c4",
     "encoder/virtualize.php": "sha256:af816f10669a088c563f1fd117b07e128b6832a5c8d93e0956f507733af78125",
     "extension/config.m4": "sha256:8bf1a0f44ef422aff0f6ddcf7fdee3d659e7824d8274aead71256de8c5cf59af",
     "extension/config.w32": "sha256:2a0aaa46c12f0ecbab543a9b26b1ac3fc3d73b5b03466a20724eab6e3ecbe2c8",
@@ -63,7 +63,7 @@
     "gui/_e2e.py": "sha256:a509d78b573967696f72debd9c81771a206d8db9eff7971fdb7c97302c854db3",
     "gui/actions.py": "sha256:94bb258fbbe192448fdfffb88314453cbc33d84cb49800956173b30190bf6f2f",
     "gui/envelock-assistant.spec": "sha256:6ca98fb256565e9ab863fe849037f41fe83ed89944a0bf22f9daefc10b972f8b",
-    "gui/envelock_gui.py": "sha256:6bb19a667b772cca3ed862169da7c3dd6efccf6251c9a6d387e39679e33a6d42",
+    "gui/envelock_gui.py": "sha256:eff87d1c288dc87bbf862636f3ea155ad0b8d17d6ec2816dac207a68b9ca1b3c",
     "scripts/bench.py": "sha256:418aec143d1f9b308ccaad63965f5c7d8ce9b44db162853e009a12c72bbbd308",
     "scripts/build-gui.sh": "sha256:17f7a98bbd1bbd0eaeb1e2d0cadbda4dfc0ab10e9320be466503dba872f60e1a",
     "scripts/build-unix.sh": "sha256:fc896e9aee6d8c40e53e71e5530b041338bae8bc5682ad7aa6938fc71627537f",
@@ -76,11 +76,11 @@
     "tests/fuzz_crypto.c": "sha256:5f3e0e24c2d91df3ca8445f0f8e88638d419ca8dbb152bd2c221b19f615c5fc9",
     "tests/test_ast_rename.py": "sha256:c60a31d224087ca25720601fb2ab5a0d78894e22d042cafdcba704f195da8336",
     "tests/test_bytecode_guard.py": "sha256:9da4f80a3dc95c3b615afb9d001a99cf81db2a26cdf702052eb7ddb98867d4e0",
-    "tests/test_encoder.py": "sha256:ba8781a3619da69bcc938479e2dff3f3b7df1d35670429ec77d21ad0fc3064ef",
+    "tests/test_encoder.py": "sha256:1800c36120c8b99f50e43a1b53a60ded759944676384628a7ae807ea7a56c936",
     "tests/test_encoder_audit.py": "sha256:3961ceee2a900bdf1e7f7899c2fa4e3f72f471beb17fde5d9d8f26c861b0b696",
     "tests/test_frameworks.py": "sha256:4c84ced6cd65a580d51e7171e30298dc3d135ee85ad76fdae7400b1c9e83524a",
     "tests/test_gui_actions.py": "sha256:6a4f4c2c93a1983e025560f3deb6038d46c6bec174c3ccebb19542abe7501dce",
-    "tests/test_gui_smoke.py": "sha256:520e492271a827c25798ee2d74e911283d5f7b1b3729576338a00aafcc7ff0b4",
+    "tests/test_gui_smoke.py": "sha256:d75ce9c54c2f0e8b3937b98b1b0e8fb598f70531f0b5d8399f56e7d97e1da0e6",
     "tests/test_hardening.py": "sha256:e695a185b5c5236ce3e2cacf9d18286870321dd98ab8dafcde4e38cab839f77a",
     "tests/test_keys_cli.py": "sha256:cd5769adc7c214b9164f6f524ea34ab80b35ae8ece0f5d9d9d48faab906ebec1",
     "tests/test_names_allowlist.py": "sha256:e3875f50115f6e684606f189090d4f00530778b2eb068f5a71dd27224a786040",

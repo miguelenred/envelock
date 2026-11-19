@@ -4431,6 +4431,20 @@ def pack_tree(
                         assets_used.add(pattern)
         if not sources:
             raise ValueError("No PHP files found to protect")
+        # Composer's vendor/ (the same test as recommend_options: a top-level vendor/autoload.php) packed
+        # encrypted. OPcache cannot cache protected files, so every request recompiles the ones it uses in
+        # every worker's own memory; recommend leaves vendor/ out, and the caller warns when a pack did not.
+        # Counted from what is really packed (an --exclude 'vendor/*' leaves nothing), before any rewrite.
+        # Case-insensitive on Windows, as the file system (and --exclude matching, ENC-10) are there.
+        vendor_top = "vendor/".casefold() if os.name == "nt" else "vendor/"
+        vendor_names = ([n for n in sources
+                         if (n.casefold() if os.name == "nt" else n).startswith(vendor_top)]
+                        if (source / "vendor" / "autoload.php").is_file() else [])
+        vendor_encrypted = ({"files": len(vendor_names), "bytes": sum(len(sources[n]) for n in vendor_names)}
+                            if vendor_names else None)
+        # The memory ceiling of what this pack encrypts (the same estimate as recommend's): the original
+        # source, measured before any rewrite, which is what the ratio was measured against.
+        packed_memory = memory_estimate(len(sources), sum(len(data) for data in sources.values()))
         # C-17: when NO source-rewriting pass will run, nothing parses the PHP, so a syntax error would
         # ship silently. Lint the files with the real tokenizer and surface a warning (never fatal: the
         # transforming passes below already stop the pack on a parse error, and this must not block a
@@ -4636,6 +4650,10 @@ def pack_tree(
         info["assets_not_copied"] = assets_not_copied
         # Likewise caller-only (C-17): PHP files that did not parse under the operator's CLI php.
         info["syntax_warnings"] = syntax_warnings
+        # Caller-only as well: how much of Composer's vendor/ went in encrypted (None when none did), and
+        # the memory ceiling of everything this pack encrypted.
+        info["vendor_encrypted"] = vendor_encrypted
+        info["memory_estimate"] = packed_memory
         return info
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -5286,6 +5304,41 @@ def _tree_matches(source: Path, extensions: set, pattern, skip_top: frozenset = 
     return hits
 
 
+# Memory a protected file's compiled code takes per byte of its source, measured (docs/VERIFICACION.md,
+# 'Measured memory'): Laravel 13.43's framework code under PHP-FPM 8.4 (549 files, 6.3 MB of source,
+# 21 MB more per request than with OPcache: 3.4x) and a dense generated project (11.0 MB -> 102 MB: 9.3x).
+_COMPILED_PER_SOURCE_BYTE = (3, 9)
+
+
+def _mb(value: float) -> str:
+    """Megabytes for a recommendation note, one decimal (callers say 'less than 0.1 MB' themselves)."""
+    return f"{value:.1f}"
+
+
+def _size(n: int) -> str:
+    """A source size in the unit that reads naturally: 13 bytes, 55 KB, 6.28 MB (never '0.00 MB')."""
+    return f"{n} bytes" if n < 1024 else f"{n / 1024:.0f} KB" if n < 1048576 else f"{n / 1048576:.2f} MB"
+
+
+PHP_DEFAULT_MEMORY_LIMIT_MB = 128
+
+
+def memory_estimate(protected_files: int, protected_bytes: int) -> dict:
+    """The ceiling of the extra memory one request needs without OPcache for this much protected PHP: what
+    a request that loaded every one of these files would compile into its own memory, at the measured
+    _COMPILED_PER_SOURCE_BYTE. A real request loads only the files it uses; measure it to know."""
+    low, high = (protected_bytes * k / 1048576 for k in _COMPILED_PER_SOURCE_BYTE)
+    return {"protected_files": protected_files, "protected_source_bytes": protected_bytes,
+            "worst_case_extra_mb": [round(low, 1), round(high, 1)]}
+
+
+def _extra_mb_phrase(protected_bytes: int) -> str:
+    """'roughly 1.5-4.5 MB', 'up to about 0.3 MB' or 'less than 0.1 MB' (never '0.0-0.0 MB')."""
+    low, high = (protected_bytes * k / 1048576 for k in _COMPILED_PER_SOURCE_BYTE)
+    return ("less than 0.1 MB" if high < 0.05 else
+            f"up to about {_mb(high)} MB" if low < 0.05 else f"roughly {_mb(low)}-{_mb(high)} MB")
+
+
 def recommend_options(source: Path, extensions: set, masks: dict | None = None) -> dict:
     """Analyse the tree and recommend the STRONGEST protection that measurement shows is SAFE for it,
     turning OFF only what would break THIS project. Grounded in the four-CMS matrix and the preflight
@@ -5547,6 +5600,27 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
         "laboratory only: the mini-VM is quarantined (known semantic differences, needs "
         "--unsafe-vm-laboratory); never for production.")
 
+    # Memory sizing (docs/RENDIMIENTO.md, 'Memory, and large projects'): OPcache cannot cache protected
+    # files, so each request compiles the protected files it uses into its own memory, in every PHP
+    # worker. Give the order of magnitude from what THIS recommendation encrypts (vendor/, caches and the
+    # cleartext list are not in it), with the measured ratio, and how to measure the real figure.
+    cleartext = {f for files in exclude.values() for f in files}
+    protected_paths = [p for p in scanned if p not in cleartext]
+    protected_bytes = sum((source / p).stat().st_size for p in protected_paths)
+    memory = memory_estimate(len(protected_paths), protected_bytes)
+    if protected_paths:
+        notes.append(
+            f"Memory: this recommendation encrypts {len(protected_paths)} PHP file(s), "
+            f"{_size(protected_bytes)} of source. OPcache cannot cache protected files, so each "
+            "request compiles the ones it uses into its own memory, in every PHP worker: a request that "
+            f"loaded all of them would need {_extra_mb_phrase(protected_bytes)} more than with OPcache "
+            "(compiled code measured at about 3x its source size on Laravel 13's framework code and 9x on "
+            "dense generated code; docs/VERIFICACION.md)." +
+            (" Leaving vendor/ out is what keeps this small: on a Laravel 13 app, protecting only the "
+             "application's code measured about 1 MB per request, the same as unprotected; protecting "
+             "vendor/ too, 22 MB." if "vendor/*" in exclude_patterns else "") +
+            " Size memory_limit and the number of PHP workers (pm.max_children) from a real protected "
+            "request: memory_get_peak_usage(true).")
     if encryption_breaking:
         notes.append("Keep the files below CLEARTEXT (--exclude) or re-architect them (PHP 8 attributes "
                      "/ a pre-generated cache): they read their own source TEXT and break even with base "
@@ -5556,7 +5630,7 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
                      "given with --asset): deploy the package over a copy of the application so those "
                      "files stay in place, removing first only the files the package replaces.")
     return {"on": on, "verify": verify, "off": off, "exclude": exclude, "exclude_patterns": exclude_patterns,
-            "notes": notes}
+            "notes": notes, "memory": memory}
 
 
 def _cleartext_php_entry_points(source: Path, skip_top: frozenset = frozenset()) -> list[str]:
@@ -6447,6 +6521,37 @@ def main() -> int:
                           "derived from them (cache keys, error maps) will silently change. Run "
                           "'envelock preflight --source " + str(args.source) + "' for the list, then "
                           "--exclude those files or drop --compact.", file=sys.stderr)
+            # Composer's vendor/ went in encrypted (recommend leaves it out). Not an error, and sometimes
+            # needed (--include-protection with vendor/ needs it packed: MANUAL, H-03), but it is where the
+            # memory of a protected app goes: OPcache cannot cache protected files, so each request
+            # recompiles the ones it uses in every PHP worker (docs/RENDIMIENTO.md).
+            # How much memory this package can cost per request, said where it is packed: a ceiling (every
+            # file loaded by one request), with how to measure the real figure (docs/RENDIMIENTO.md).
+            mem = info.get("memory_estimate")
+            if mem and mem["protected_files"]:
+                print(f"Note: memory: this package encrypts {mem['protected_files']} PHP file(s), "
+                      f"{_size(mem['protected_source_bytes'])} of source. OPcache cannot cache protected files, "
+                      "so each request compiles the ones it uses into its own memory, in every PHP worker: a "
+                      f"request that loaded all of them would need {_extra_mb_phrase(mem['protected_source_bytes'])}"
+                      " more than with OPcache (3-9x the source, measured)." +
+                      (f" That is above PHP's default memory_limit ({PHP_DEFAULT_MEMORY_LIMIT_MB} MB), though a "
+                       "real request loads only the files it uses."
+                       if mem["worst_case_extra_mb"][1] > PHP_DEFAULT_MEMORY_LIMIT_MB else "") +
+                      " This is a ceiling, not a forecast: measure a real request with "
+                      "memory_get_peak_usage(true) and size memory_limit and the PHP workers from it "
+                      "(docs/RENDIMIENTO.md).", file=sys.stderr)
+            vendor = info.get("vendor_encrypted")
+            if vendor:
+                print(f"WARNING: vendor/ (Composer dependencies) is in the package encrypted: {vendor['files']} "
+                      f"PHP file(s), {vendor['bytes'] / 1048576:.1f} MB of source. OPcache cannot cache "
+                      "protected files, so every request recompiles the ones it uses, in every PHP worker: "
+                      "more memory and time per request than the same code costs unencrypted "
+                      "(docs/RENDIMIENTO.md, 'Memory, and large projects'). " +
+                      ("--include-protection needs vendor/ packed, so this is expected: size memory_limit and "
+                       "the number of PHP workers for it." if args.include_protection else
+                       "Unless you need it, add --exclude 'vendor/*' and deploy vendor/ next to the package "
+                       "(composer install --no-dev on the server); 'envelock recommend' does this for you."),
+                      file=sys.stderr)
             print("Tip: for third-party or framework code, run 'envelock preflight --source " +
                   str(args.source) + "' first to flag code that reads its own source "
                   "(annotations, class maps) and would break after encryption.", file=sys.stderr)

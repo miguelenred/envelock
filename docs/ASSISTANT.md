@@ -101,7 +101,13 @@ advanced transforms the assistant deliberately omits (`--obfuscate-flatten`, `--
 `--virtualize`, `--bytecode`), which `recommend` never enables on its own. Deploy the output folder; leave `vendor/` out of the encryption and
 deploy it separately ([MANUAL](MANUAL.md) §14). With `vendor/` left out, keep **Include protection**
 off: an error or shutdown handler registered from `vendor/` would be refused when it loads one of your
-protected classes ([MANUAL](MANUAL.md) §14, `--include-protection`).
+protected classes ([MANUAL](MANUAL.md) §14, `--include-protection`). If Composer's `vendor/` does go
+into the package encrypted, the result says so with its file count and size: OPcache cannot cache
+protected files, so every request would recompile the library code it uses, in every PHP worker (on a
+Laravel 13 app, 22 MB per request instead of about 1 MB; [VERIFICACION](VERIFICACION.md#measured-memory)).
+After every pack the result also states the memory ceiling of what was encrypted — the extra memory a
+request that loaded all of it would need without OPcache — as information: a real request loads only
+the files it uses, so measure one before sizing the server.
 
 Not sure which options to turn on? Use the **Recommend tab** (next section) first.
 
@@ -130,7 +136,9 @@ the Composer autoloader, or `--sealed` when the code uses `eval()`). For a frame
 `vendor/` (Composer) and the run-time caches out of the encryption, keeps Blade templates cleartext, turns
 `--include-protection` off when a console entry point (`artisan`, `bin/console`) would stay unencrypted
 or when it leaves `vendor/` out (an error handler registered from there could not load your protected
-classes; external audit 2026-11-12, H-03), and lists what the server's `php.ini` must allow for `--no-ffi`, `--no-prepend` and `--bytecode`. Its
+classes; external audit 2026-11-12, H-03), and lists what the server's `php.ini` must allow for `--no-ffi`, `--no-prepend` and `--bytecode`.
+Its notes also say how much PHP it would encrypt and roughly how much more memory a request that loaded
+all of it would need without OPcache, so you can size `memory_limit` and the number of PHP workers. Its
 suggested command was run as printed on real Laravel and Symfony apps (Windows 11, PHP 8.4): every web
 route and the console matched the unprotected app. Command equivalent:
 `python encoder/envelock.py recommend --source <folder>` (add `--json` for machine-readable output).

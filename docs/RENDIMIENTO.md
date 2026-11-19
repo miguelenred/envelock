@@ -125,6 +125,18 @@ Two consequences for sizing a server:
   own code (leave the framework and `vendor/` to OPcache), by bundling (below), and by a resident
   worker (option B), which compiles each file once per worker. See
   [VERIFICACION.md](VERIFICACION.md#measured-memory) and MANUAL.md §14.
+- **The tools already apply the first of those.** `envelock recommend` and the assistant's Recommend
+  tab leave Composer's `vendor/` and the run-time caches out of the encryption, suggest
+  `--strip-comments` only when nothing reads docblocks at run time, and state how much PHP they would
+  encrypt with the worst-case extra memory per request (3–9 times that source size, measured); `pack`
+  (command line and assistant) states the same ceiling for what it has just encrypted, naming PHP's
+  default `memory_limit` (128 MB) when the ceiling passes it, and warns when Composer's `vendor/` goes
+  into a package encrypted. The ceiling assumes one request loads every protected file; a real request
+  loads only the ones it uses, so measure one. On a
+  real Laravel 13 app under PHP-FPM with OPcache this is the whole difference: about 1 MB per request
+  with only the application's code protected, the same as unprotected, against 22 MB with `vendor/`
+  encrypted too ([VERIFICACION.md](VERIFICACION.md#measured-memory)). Sizing `memory_limit` and
+  `pm.max_children`, bundling and a resident worker remain the operator's decisions.
 
 **Packaging, not the running server, is where whole-tree memory can bite.** `pack`'s optional
 transform passes (`--obfuscate`, `--strip-comments`, `--compact`, `--bytecode`, `--virtualize`) hand

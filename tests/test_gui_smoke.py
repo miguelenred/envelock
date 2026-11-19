@@ -135,6 +135,49 @@ def test_pack_summary_shows_what_the_cli_prints_to_stderr():
         app.destroy()
 
 
+def test_pack_summary_warns_when_composer_vendor_is_encrypted():
+    """The CLI's vendor/ memory warning, in the assistant too: the exclude advice normally, the sizing
+    note when 'Include protection' is on (it needs vendor/ packed), and nothing when vendor/ was left out."""
+    g = _load()
+    app = _assistant(g)
+    try:
+        base = {"protected_files": 9, "copied_assets": 0, "project_id": "p", "serial": 1}
+        vendor = {"files": 3, "bytes": 3 * 1048576}
+        text, warned = app._pack_summary(dict(base, vendor_encrypted=vendor), False)
+        assert warned and app.t("pack_vendor", n=3, mb="3.0") in text
+        assert app.t("pack_vendor_ip", n=3, mb="3.0") not in text
+        text, warned = app._pack_summary(dict(base, vendor_encrypted=vendor, include_protection=True), False)
+        assert warned and app.t("pack_vendor_ip", n=3, mb="3.0") in text
+        assert app.t("pack_vendor", n=3, mb="3.0") not in text
+        text, warned = app._pack_summary(dict(base, vendor_encrypted=None), False)
+        assert not warned and "vendor/" not in text
+    finally:
+        app.destroy()
+
+
+def test_pack_summary_states_the_memory_ceiling_as_information():
+    """The CLI's memory ceiling, in the assistant: always shown after a pack, never marking the result as
+    a warning; PHP's default memory_limit named only above it; never a misleading 0.0-0.0 MB."""
+    g = _load()
+    app = _assistant(g)
+    try:
+        base = {"protected_files": 2, "copied_assets": 0, "project_id": "p", "serial": 1}
+        mem = {"protected_files": 2, "protected_source_bytes": 500_000, "worst_case_extra_mb": [1.4, 4.3]}
+        text, warned = app._pack_summary(dict(base, memory_estimate=mem), False)
+        assert not warned
+        assert app.t("pack_memory", n=2, size="488 KB", extra=app.t("mem_range", low="1.4", high="4.3"),
+                     limit="") in text
+        big = {"protected_files": 2, "protected_source_bytes": 16_800_000, "worst_case_extra_mb": [48.1, 144.2]}
+        text, warned = app._pack_summary(dict(base, memory_estimate=big), False)
+        assert not warned and app.t("pack_memory_limit", mb=128) in text
+        tiny = {"protected_files": 1, "protected_source_bytes": 13, "worst_case_extra_mb": [0.0, 0.0]}
+        text, _ = app._pack_summary(dict(base, memory_estimate=tiny), False)
+        assert app.t("mem_lt") in text and "13 bytes" in text and "0.0-0.0" not in text
+        assert app.t("pack_memory_limit", mb=128) not in text
+    finally:
+        app.destroy()
+
+
 def test_files_to_write_are_made_absolute_before_use(tmp_path, monkeypatch):
     """Audit 2026-11-17: a bare suggested name (owner.enc.json) was written to the process's current
     folder and the notice named the bare file only. _need makes every save field absolute first, so

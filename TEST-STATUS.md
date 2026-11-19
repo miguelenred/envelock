@@ -6,6 +6,27 @@ binaries under `prebuilt/` are a convenience and are reproducible from `docs/BUI
 
 Date: 2026-11-18 (final 1.1.0 source and the rebuild of every binary; the records below are kept as history).
 
+## After 1.1.0: the memory guidance applied by the tools (2026-11-18/19, source only)
+
+`pack` now warns when Composer's `vendor/` goes into a package encrypted and states the memory ceiling of
+what it encrypted; `recommend` states the same estimate (command line and assistant; `CHANGELOG.md`,
+*Unreleased*). Encoder and assistant only: the loader (C) is unchanged, so the loaders in `prebuilt/` are
+unaffected. The assistants in `prebuilt/` (built 2026-11-17) predate the change and do not show the new
+notes until they are rebuilt.
+
+| Where | Suite | Result |
+|---|---|---|
+| AlmaLinux 8, Laravel 13.43 under PHP-FPM 8.4.27 + OPcache, 1.1.0 release loader | memory per request, plain / own code / own code + `--strip-comments` / `vendor/` too | 0.99 / 1.05 / 1.05 / 22.2 MB (`/widgets`); every response identical to the plain app's ([VERIFICACION.md](docs/VERIFICACION.md#measured-memory)) |
+| Windows 11, CPython 3.12 | the new and neighbouring tests (`pack`, `recommend`, assistant summary) | 21 passed, 0 failed |
+| Same | mutation check: each new piece undone in turn | 35 of 35 caught (two rounds), files restored byte for byte |
+| Same | whole suite without the native tests, before the `pack` estimate was added | 750 passed, 43 skipped, 2 failed: `test_release_guard` (the evidence not yet regenerated) and the obfuscator fuzzer's 600 s limit under load (passes alone, 490 s) |
+| AlmaLinux 8, `/root/venv-dev` | `ruff check encoder tests gui scripts`, `bandit -q -r encoder gui scripts` | clean |
+| Same, PHP 8.3.6 | `scripts/regen-reports.sh` → `docs/reports/junit-php-8.3.6.xml` | 1824 tests, 0 failed, 0 errors, 51 skipped (1041 native cases run); `scripts/check_release.py --require-complete` passes |
+
+The separate local rehearsal of the CI's unix command was not run this time: the workstation shut itself
+down twice during long full-suite runs (no crash dump; Windows logged an unclean restart), and the
+evidence run above already executes the whole suite on PHP 8.3.6. GitHub's CI is the authoritative run.
+
 ## The minor findings of the code audit, and the rebuild of `prebuilt/` (2026-11-17/18)
 
 The remaining findings of the code audit (`docs/AUDITORIA.md` Pass 35, `CHANGELOG.md`) were fixed:

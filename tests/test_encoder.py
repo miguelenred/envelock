@@ -1039,6 +1039,149 @@ def test_cli_pack_warns_include_protection_without_no_prepend(tmp_path):
     assert neither.returncode == 0 and "--include-protection without --no-prepend" not in neither.stderr
 
 
+def _composer_tree(root, autoload=True):
+    """A small Composer-style project: own code in app/, two library files in vendor/."""
+    files = {"app/A.php": "<?php namespace App; class A {}",
+             "app/vendor/Local.php": "<?php function local_vendor_named_dir() {}",
+             "vendor/acme/lib/Lib.php": "<?php namespace Acme; class Lib { /* " + "x" * 3000 + " */ }"}
+    if autoload:
+        files["vendor/autoload.php"] = "<?php return null;"
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    return files
+
+
+def test_pack_reports_composer_vendor_packed_encrypted_to_the_caller_only(tmp_path):
+    """Memory guidance (docs/RENDIMIENTO.md): recommend leaves Composer's vendor/ out because OPcache
+    cannot cache protected files, so a pack that encrypts it costs every PHP worker the compile of every
+    library file a request uses. pack_tree reports what it really encrypted from vendor/, counted after
+    --exclude, for the caller to warn; like the other caller-only keys it is not in the package's
+    envelock-package.json."""
+    owner, rcpt = a.make_owner(), a.make_recipient("srv")
+    pubs = [a.recipient_public(rcpt)]
+    src = tmp_path / "src"
+    files = _composer_tree(src)
+    vendor_bytes = sum(len(files[n].encode()) for n in files if n.startswith("vendor/"))
+    info = a.pack_tree(src, tmp_path / "all", pubs, owner, str(uuid.uuid4()))
+    assert info["vendor_encrypted"] == {"files": 2, "bytes": vendor_bytes}
+    meta = json.loads((tmp_path / "all" / "envelock-package.json").read_text())
+    assert "vendor_encrypted" not in meta
+    # Excluded: nothing from vendor/ in the package, nothing reported (app/vendor/ is the app's own).
+    info = a.pack_tree(src, tmp_path / "own", pubs, owner, str(uuid.uuid4()), exclude=["vendor/*"])
+    assert info["vendor_encrypted"] is None
+    assert (tmp_path / "own" / "app" / "vendor" / "Local.php").is_file()
+    assert not (tmp_path / "own" / "vendor").exists()
+    # Partly excluded: what is still encrypted is what is reported.
+    info = a.pack_tree(src, tmp_path / "part", pubs, owner, str(uuid.uuid4()), exclude=["vendor/acme/*"])
+    assert info["vendor_encrypted"] == {"files": 1, "bytes": len(files["vendor/autoload.php"].encode())}
+    # A vendor/ folder that is not Composer's (no vendor/autoload.php) is the project's own code.
+    other = tmp_path / "other"
+    _composer_tree(other, autoload=False)
+    info = a.pack_tree(other, tmp_path / "other-out", pubs, owner, str(uuid.uuid4()))
+    assert info["vendor_encrypted"] is None
+
+
+def test_pack_reports_the_memory_ceiling_of_exactly_what_it_encrypts(tmp_path):
+    """At encryption time pack returns recommend's memory ceiling (memory_estimate) for exactly what it
+    encrypted: the original PHP source after --exclude — not assets, not excluded files, and measured
+    before any rewrite (the 3-9x ratio was measured against original source). Caller-only: never in
+    the package's envelock-package.json."""
+    owner, rcpt = a.make_owner(), a.make_recipient("srv")
+    src = tmp_path / "src"
+    for name, size in {"a.php": 300_000, "lib/b.php": 200_000, "skip/c.php": 900_000}.items():
+        (src / name).parent.mkdir(parents=True, exist_ok=True)
+        (src / name).write_bytes(b"<?php /* " + b"x" * (size - 12) + b" */")
+    (src / "style.css").write_bytes(b"s" * 500_000)
+    pubs = [a.recipient_public(rcpt)]
+    info = a.pack_tree(src, tmp_path / "out", pubs, owner, str(uuid.uuid4()), assets=["*.css"],
+                       exclude=["skip/*"])
+    assert info["copied_assets"] == 1
+    assert info["memory_estimate"] == a.memory_estimate(2, 500_000)
+    assert info["memory_estimate"]["worst_case_extra_mb"] == [1.4, 4.3]
+    assert "memory_estimate" not in json.loads((tmp_path / "out" / "envelock-package.json").read_text())
+    if HAVE_PHP:
+        # --strip-comments removes those comments; the ceiling is still that of the original source.
+        info = a.pack_tree(src, tmp_path / "stripped", pubs, owner, str(uuid.uuid4()), exclude=["skip/*"],
+                           strip_comments=True)
+        assert info["comments_stripped"] and info["memory_estimate"] == a.memory_estimate(2, 500_000)
+
+
+def test_cli_pack_states_the_memory_ceiling_once(tmp_path):
+    """The command line says it where the package is made, once: the size encrypted, the ceiling, that it
+    is a ceiling and how to measure; PHP's default memory_limit is named only when the ceiling passes it."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", tmp_path / "r.json", "--label", "s",
+               "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", tmp_path / "r.json",
+               "--out", tmp_path / "p.json").returncode == 0
+    small, big = tmp_path / "small", tmp_path / "big"
+    small.mkdir()
+    (small / "i.php").write_bytes(b"<?php echo 1;")
+    big.mkdir()
+    for name in ("a.php", "b.php"):
+        (big / name).write_bytes(b"<?php /* " + b"x" * (8_400_000 - 12) + b" */")
+    base = ["pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+            "--project", str(uuid.uuid4())]
+    out = run(*base, "--source", small, "--output", tmp_path / "s")
+    assert out.returncode == 0, out.stderr
+    assert out.stderr.count("Note: memory:") == 1, out.stderr
+    assert "1 PHP file(s), 13 bytes of source" in out.stderr and "less than 0.1 MB more" in out.stderr
+    assert "memory_get_peak_usage(true)" in out.stderr and "memory_limit (128 MB)" not in out.stderr
+    assert json.loads(out.stdout)["memory_estimate"]["protected_files"] == 1
+    out = run(*base, "--source", big, "--output", tmp_path / "b")
+    assert out.returncode == 0, out.stderr
+    assert out.stderr.count("Note: memory:") == 1
+    assert "2 PHP file(s), 16.02 MB of source" in out.stderr and "roughly 48.1-144.2 MB more" in out.stderr
+    assert "above PHP's default memory_limit (128 MB)" in out.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file names are case-insensitive")
+def test_pack_reports_a_differently_cased_vendor_folder_on_windows(tmp_path):
+    """On Windows 'Vendor/' is Composer's vendor/ (the file system and --exclude matching ignore case,
+    ENC-10), so it must be counted, and an --exclude 'vendor/*' must leave nothing to report."""
+    owner, rcpt = a.make_owner(), a.make_recipient("srv")
+    src = tmp_path / "src"
+    (src / "Vendor" / "acme").mkdir(parents=True)
+    (src / "Vendor" / "autoload.php").write_text("<?php return 1;")
+    (src / "Vendor" / "acme" / "L.php").write_text("<?php class L {}")
+    (src / "index.php").write_text("<?php echo 1;")
+    info = a.pack_tree(src, tmp_path / "a", [a.recipient_public(rcpt)], owner, str(uuid.uuid4()))
+    assert info["vendor_encrypted"]["files"] == 2
+    info = a.pack_tree(src, tmp_path / "b", [a.recipient_public(rcpt)], owner, str(uuid.uuid4()),
+                       exclude=["vendor/*"])
+    assert info["vendor_encrypted"] is None
+
+
+def test_cli_pack_warns_once_when_composer_vendor_is_encrypted(tmp_path):
+    """The CLI says it where the choice is made, once, with the numbers and the fix; with
+    --include-protection (which needs vendor/ packed, H-03) it says to size memory instead of telling
+    the operator to exclude it; and a pack that leaves vendor/ out stays quiet."""
+    run = _cli(tmp_path)
+    assert run("keygen", "owner", "--out", tmp_path / "o.json", "--no-encrypt").returncode == 0
+    assert run("keygen", "recipient", "--out", tmp_path / "r.json", "--label", "s",
+               "--no-encrypt").returncode == 0
+    assert run("export-public", "--recipient", tmp_path / "r.json",
+               "--out", tmp_path / "p.json").returncode == 0
+    src = tmp_path / "src"
+    _composer_tree(src)
+    base = ["pack", "--owner", tmp_path / "o.json", "--recipient", tmp_path / "p.json",
+            "--project", str(uuid.uuid4()), "--source", src]
+    marker = "vendor/ (Composer dependencies) is in the package encrypted"
+    warn = run(*base, "--output", tmp_path / "a")
+    assert warn.returncode == 0, warn.stderr
+    assert warn.stderr.count(marker) == 1, warn.stderr
+    assert "2 PHP file(s)" in warn.stderr and "--exclude 'vendor/*'" in warn.stderr
+    assert json.loads(warn.stdout)["vendor_encrypted"]["files"] == 2
+    quiet = run(*base, "--output", tmp_path / "b", "--exclude", "vendor/*")
+    assert quiet.returncode == 0 and marker not in quiet.stderr, quiet.stderr
+    ip = run(*base, "--output", tmp_path / "c", "--include-protection", "--no-prepend")
+    assert ip.returncode == 0 and ip.stderr.count(marker) == 1, ip.stderr
+    assert "--include-protection needs vendor/ packed" in ip.stderr
+    assert "Unless you need it" not in ip.stderr
+
+
 @pytest.mark.skipif(not HAVE_PHP, reason="--obfuscate-names needs a php CLI")
 def test_cli_pack_warns_when_obfuscate_names_renames_nothing(tmp_path):
     """C-24: --obfuscate-names declines the WHOLE package on a risky construct (try/catch/throw,
@@ -1379,6 +1522,57 @@ def test_recommend_leaves_composer_vendor_caches_and_blade_templates_in_the_clea
     (plain / "lib").mkdir(parents=True)
     (plain / "lib" / "x.php").write_text("<?php function x(){}")
     assert a.recommend_options(plain, ext)["exclude_patterns"] == []
+
+
+def test_recommend_estimates_memory_from_exactly_what_it_encrypts(tmp_path):
+    """Memory sizing (docs/RENDIMIENTO.md): recommend says how much PHP it would encrypt and the extra
+    memory a request loading all of it would need without OPcache (3x-9x the source, measured), and how
+    to measure. Only what the recommendation encrypts counts: not vendor/, not the run-time caches, not
+    the Blade templates nor a file that reads its own source, which it keeps cleartext."""
+    ext = {".php"}
+    app = tmp_path / "app"
+    sizes = {"app/A.php": 400_000, "app/B.php": 120_000}
+    tree = {"vendor/autoload.php": "<?php return 1;",
+            "vendor/acme/Big.php": "<?php /* " + "v" * 900_000 + " */",
+            "bootstrap/cache/packages.php": "<?php /* " + "c" * 50_000 + " */ return [];",
+            "resources/views/w.blade.php": "<h1>{{ $t }}</h1>" + "t" * 70_000,
+            "app/Reads.php": "<?php $me = file_get_contents(__FILE__); /* " + "r" * 80_000 + " */"}
+    tree.update({name: "<?php /* " + "x" * (size - 15) + " */ ?>" for name, size in sizes.items()})
+    for name, text in tree.items():
+        (app / name).parent.mkdir(parents=True, exist_ok=True)
+        (app / name).write_bytes(text.encode())
+    for name, size in sizes.items():
+        assert (app / name).stat().st_size == size
+    rec = a.recommend_options(app, ext)
+    assert "app/Reads.php" in {f for files in rec["exclude"].values() for f in files}
+    total = sum(sizes.values())
+    assert rec["memory"] == {"protected_files": 2, "protected_source_bytes": total,
+                             "worst_case_extra_mb": [round(total * 3 / 1048576, 1),
+                                                     round(total * 9 / 1048576, 1)]}
+    note = [n for n in rec["notes"] if n.startswith("Memory:")]
+    assert len(note) == 1
+    assert "encrypts 2 PHP file(s), 508 KB of source" in note[0] and "roughly 1.5-4.5 MB more" in note[0]
+    assert "Leaving vendor/ out" in note[0] and "memory_get_peak_usage(true)" in note[0]
+    assert note[0] in a.format_recommendation(rec)
+    # No Composer vendor/: the same figures, without the vendor/ sentence.
+    plain = tmp_path / "plain"
+    (plain / "lib").mkdir(parents=True)
+    (plain / "lib" / "x.php").write_bytes(b"<?php /* " + b"y" * 2_000_000 + b" */")
+    note = [n for n in a.recommend_options(plain, ext)["notes"] if n.startswith("Memory:")][0]
+    assert "1.91 MB of source" in note and "roughly 5.7-17.2 MB more" in note
+    assert "Leaving vendor/ out" not in note
+    # Tiny: never a misleading "0.00 MB" or "0.0-0.0 MB".
+    tiny = tmp_path / "tiny"
+    tiny.mkdir()
+    (tiny / "i.php").write_bytes(b"<?php echo 1;")
+    note = [n for n in a.recommend_options(tiny, ext)["notes"] if n.startswith("Memory:")][0]
+    assert "13 bytes of source" in note and "less than 0.1 MB more" in note and "0.0" not in note
+    # Nothing to encrypt (only a template): no memory note at all.
+    views = tmp_path / "views"
+    views.mkdir()
+    (views / "w.blade.php").write_text("<p>{{ $x }}</p>")
+    rec = a.recommend_options(views, ext)
+    assert rec["memory"]["protected_files"] == 0 and not any(n.startswith("Memory:") for n in rec["notes"])
 
 
 def test_recommend_turns_include_protection_off_for_a_cleartext_console_entry_point(tmp_path):

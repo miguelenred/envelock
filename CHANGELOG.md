@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**Memory: the tools now apply the memory guidance themselves.** Protected files cannot be cached by
+OPcache, so each request compiles the ones it uses into its own memory, in every PHP worker. Measured on
+a real Laravel 13.43 app under PHP-FPM with OPcache (`docs/VERIFICACION.md`, *Measured memory*):
+protecting only the application's code costs about 1 MB per request, the same as unprotected; protecting
+`vendor/` too costs 22 MB per request.
+- **`pack` warns when Composer's `vendor/` goes into a package encrypted** (command line and assistant),
+  with its file count and size and the fix (`--exclude 'vendor/*'`; `recommend` already does it). With
+  `--include-protection`, which needs `vendor/` packed, it says to size the memory instead. The figure
+  is returned to the caller (`vendor_encrypted`) and never written into the package.
+- **`recommend` estimates the memory** (command line and the assistant's Recommend tab): how much PHP it
+  would encrypt and roughly how much more memory a request that loaded all of it would need without
+  OPcache (3–9 times the source size, measured), and how to measure the real figure; `--json` gives it
+  as `memory`.
+- **`pack` states the same ceiling for what it has just encrypted** (command line and assistant), after
+  `--exclude` and measured on the original source; it names PHP's default `memory_limit` (128 MB) when
+  the ceiling passes it, and says it is a ceiling, not a forecast — a real request loads only the files
+  it uses. Information, not a warning; returned to the caller as `memory_estimate`, never written into
+  the package.
+- **Documentation:** `docs/RENDIMIENTO.md`, `docs/VERIFICACION.md`, `docs/MANUAL.md` and
+  `docs/ASSISTANT.md` say that `recommend` and the assistant already leave Composer's `vendor/` out
+  and suggest `--strip-comments` only when it is safe, with the Laravel figures.
+
 ## 1.1 — 2026-11-16 (consolidated-audit follow-up)
 
 A second-pass review consolidated 16 external reports into 36 findings. 1.0.0 already fixed or decided
