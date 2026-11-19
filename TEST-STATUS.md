@@ -20,7 +20,7 @@ notes until they are rebuilt.
 | Windows 11, CPython 3.12 | the new and neighbouring tests (`pack`, `recommend`, assistant summary) | 21 passed, 0 failed |
 | Same | mutation check: each new piece undone in turn | 35 of 35 caught (two rounds), files restored byte for byte |
 | Same | whole suite without the native tests, before the `pack` estimate was added | 750 passed, 43 skipped, 2 failed: `test_release_guard` (the evidence not yet regenerated) and the obfuscator fuzzer's 600 s limit under load (passes alone, 490 s) |
-| AlmaLinux 8, `/root/venv-dev` | `ruff check encoder tests gui scripts`, `bandit -q -r encoder gui scripts` | clean |
+| AlmaLinux 8, the development tools of `requirements-dev.lock` | `ruff check encoder tests gui scripts`, `bandit -q -r encoder gui scripts` | clean |
 | Same, PHP 8.3.6 | `scripts/regen-reports.sh` → `docs/reports/junit-php-8.3.6.xml` | 1824 tests, 0 failed, 0 errors, 51 skipped (1041 native cases run); `scripts/check_release.py --require-complete` passes |
 
 The separate local rehearsal of the CI's unix command was not run this time: the workstation shut itself
