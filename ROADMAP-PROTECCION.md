@@ -6,7 +6,7 @@ brake: a protector that breaks the app protects nothing.
 
 > **Version note.** The anti-root architecture this roadmap calls "2.0" is the internal **codename** for
 > the work, not a released version number. It shipped in Envelock's first release, 1.0.0 (2026-11-12), and is part of the current
-> **1.1.0** release (all of it opt-in and off by default). "2.0" throughout this file means that codename.
+> **1.1.1** release (all of it opt-in and off by default). "2.0" throughout this file means that codename.
 
 **Honest threat model.** Envelock does not fully defeat the administrator/root of the server that
 runs the application: with full control, root can still read process memory. No tool in this class

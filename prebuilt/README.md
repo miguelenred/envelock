@@ -7,14 +7,17 @@ installed. Their source code is in
 this repository (`extension/` and [`third_party/`](../third_party/README.md)); how to compile them
 yourself: [docs/BUILDING.md](../docs/BUILDING.md).
 
-> **These binaries are built from the final 1.1.0 source (2026-11-17/18).** The five Linux loaders and
-> the eight Windows DLLs carry every fix of the 1.1 consolidated audit, of the second audit of the 1.1.0
-> source (C-05 fixed in the emitter and the loader) and of the code audit that followed
-> (`docs/AUDITORIA.md` Pass 35, `CHANGELOG.md`), built with the same toolchains the per-section notes
-> below describe. Each Windows DLL passes `tests/test_native.py` with 964 passed, 0 failed. The two
-> assistants were rebuilt on 2026-11-17, after the last change to the encoder and the assistant. The
-> dated build/test descriptions below document those methods (first used for the 1.0.0 binaries);
-> `TEST-STATUS.md` holds the rebuild record and `SHA256SUMS` the per-file hashes.
+> **The loaders are the 1.1.1 builds (2026-11-19); the assistants are the 1.1.0 ones (2026-11-17).**
+> 1.1.1 changes the loader only in the version it reports (`CHANGELOG.md`), so the loaders were rebuilt
+> from the 1.1.1 source (commit `acaee98`; later commits change documentation only): the five Linux ones
+> here on AlmaLinux 8 with the method below, the eight Windows DLLs by the repository's GitHub CI. Each
+> passes `tests/test_native.py` with 0 failed against the shipped binary, and each reports 1.1.1 to PHP.
+> They are the same files as the assets of the GitHub Release 1.1.1 that PIE installs. They carry every
+> fix of the 1.1 consolidated audit, of the second audit of the 1.1.0 source (C-05) and of the code audit
+> that followed (`docs/AUDITORIA.md` Pass 35). The two assistants were built on 2026-11-17 and predate
+> the memory notes 1.1.1 adds to `pack` and `recommend`: the assistant run from source shows them, these
+> executables once rebuilt. The dated build/test descriptions below document the methods (first used
+> for the 1.0.0 binaries); `TEST-STATUS.md` holds the build records and `SHA256SUMS` the per-file hashes.
 
 Every file is listed in [`SHA256SUMS`](SHA256SUMS). Check it before use:
 
@@ -61,7 +64,7 @@ and thread safety (`php -i | findstr /C:"PHP Extension Build"` on Windows,
   RHEL/AlmaLinux/Rocky/CloudLinux 8+, Amazon Linux 2023 — and **no OpenSSL from the system**: OpenSSL
   3.5.9 is linked into each loader (static, its symbols hidden), so it coexists with whatever OpenSSL
   PHP uses. Not for musl (Alpine) or ARM64 ([docs/HOSTING.md](../docs/HOSTING.md) §2.2).
-- **How they were built (2026-11-18; the 1.1 and 1.0.0 sets used the same method on 2026-11-16/17 and 2026-11-12):** portable builds ([PLATAFORMAS](../docs/PLATAFORMAS.md),
+- **How they were built (2026-11-19, for 1.1.1; the 1.1.0, 1.1 and 1.0.0 sets used the same method on 2026-11-18, 2026-11-16/17 and 2026-11-12):** portable builds ([PLATAFORMAS](../docs/PLATAFORMAS.md),
   "Portable build"): AlmaLinux 8.10 (glibc 2.28) under WSL1, gcc 8.5, `scripts/build-unix.sh` with
   `ENVELOCK_OPENSSL_STATIC` and `ENVELOCK_MAX_GLIBC=2.28`, against PHP 8.2.35, 8.3.36, 8.4.27 (NTS and
   ZTS) and 8.5.12 built from the php.net tarballs. Measured in each: needs only `libc.so.6`,
@@ -69,9 +72,9 @@ and thread safety (`php -i | findstr /C:"PHP Extension Build"` on Windows,
   `__bss_start`/`_edata`/`_end` markers). They carry every fix up to `docs/AUDITORIA.md` Pass 35 (2026-11-17) on top of the hosting fixes of 2026-11-11 (HOST-1, HOST-6).
   An earlier set, built on Ubuntu 24.04, needed glibc 2.38 and the system's OpenSSL 3 (HOST-2).
 - **How they were tested:** TEST-STATUS.md — for this set, `tests/test_native.py` against each shipped
-  `.so` on AlmaLinux 8 (0 failed), and the 8.3 loader on Ubuntu 24.04 with its own PHP 8.3.6 and
-  OpenSSL 3.0.13; earlier sets also with the system's OpenSSL 1.1.1k in the same PHP process and real
-  PHP-FPM requests.
+  `.so` on AlmaLinux 8 (986 to 992 passed, 0 failed); the 1.1.0 set's 8.3 loader also on Ubuntu 24.04
+  with its own PHP 8.3.6 and OpenSSL 3.0.13, earlier sets also with the system's OpenSSL 1.1.1k in the
+  same PHP process and real PHP-FPM requests.
   Install: [MANUAL](../docs/MANUAL.md) §10, or `pie install envelock/loader`.
 
 **Windows x64**
@@ -81,11 +84,17 @@ and thread safety (`php -i | findstr /C:"PHP Extension Build"` on Windows,
   uses only what such a PHP already ships: `php8.dll`/`php8ts.dll`, its `libcrypto-3-x64.dll`
   (OpenSSL 3.x) and the Visual C++ runtime (measured with `dumpbin /dependents`;
   [docs/HOSTING.md](../docs/HOSTING.md) §2.1). Install: [MANUAL](../docs/MANUAL.md) §11.
-- **Rebuilt 2026-11-17/18** from the final 1.1.0 source (every fix of `docs/AUDITORIA.md` Pass 35,
-  among them the Windows access list of `envelock.harden_memory` and the debugger check of
-  `envelock.paranoid`), same machine, toolchain and method as below. Each of the eight passed
-  `build-windows.ps1`'s gates and `tests/test_native.py` with **964 passed, 77 skipped, 0 failed**
-  (TEST-STATUS.md). The description below is that of the 2026-11-10 build, whose method these repeat.
+- **1.1.1 (2026-11-19): built and tested by the repository's GitHub CI** (workflow `checks.yml`, job
+  `windows`, run 44508354072 on commit `acaee98`, all 24 jobs green): on GitHub's `windows-2022`
+  runners, with `scripts/build-windows.ps1` and the official `php/php-windows-builder` pinned at commit
+  `5f63433` (PHP SDK 2.8.4), MSVC 14.29 for PHP 8.2/8.3 and 14.44 for 8.4/8.5: the script, gates and
+  compilers of the description below, on a clean machine. Each of the eight passed `tests/test_native.py`
+  there, with an identity made for the job and discarded with the runner: **966 passed, 76 skipped,
+  0 failed**. Each DLL was then checked here: the hash the job listed, only the version 1.1.1 inside
+  (`phpversion()` and the `phpinfo()` row), no byte of the public demo keys or of any path, and
+  DYNAMICBASE/HIGHENTROPYVA/NXCOMPAT/CFG set in its PE header (TEST-STATUS.md). The 1.1.0 set was built
+  natively on Windows 11 on 2026-11-17/18 with the method below and passed with 964 passed, 77 skipped,
+  0 failed. The description below is that of the 2026-11-10 build, whose method these repeat.
 - **How they were built (2026-11-10, natively on Windows 11 x64):** with
   `scripts/build-windows.ps1`, i.e. the official `php/php-windows-builder` module
   (`BuildPhpExtension` 1.9.0, PHP SDK 2.8.1) and PHP's own Windows build system (`phpize` +
@@ -99,10 +108,10 @@ and thread safety (`php -i | findstr /C:"PHP Extension Build"` on Windows,
   machine: sources and `config.w32` embed relative names only, and the builder refuses a DLL that
   embeds the user profile, TEMP, build or source folder. The earlier sets were cross-built under Wine
   with `scripts/build-windows-wine.sh` ([BUILDING](../docs/BUILDING.md) §2).
-- **How they were tested (same machine, official php.net PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12, NTS and
+- **How the 1.1.0 and earlier sets were tested (same machine, official php.net PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12, NTS and
   TS, zips checked against windows.php.net's SHA-256):** `tests/test_native.py` against each DLL:
   964 passed / 77 skipped, **0 failed** on all eight (the 1.1 rebuild of 2026-11-16/17 measured 948/68,
-  the 1.0.0 set 932/70 for 8.2–8.4 and 943/59 for 8.5); the skips need
+  the 1.0.0 set 932/70 for 8.2–8.4 and 943/59 for 8.5; the 1.1.1 set 966/76 on CI, above); the skips need
   POSIX facilities, a C toolchain or an emitter build. Each DLL exports only `get_module`, the
   production DLLs contain no `envelock_bc_emit`/`envelock_bc_run`/`envelock_trusted_time`, and
   DYNAMICBASE/HIGHENTROPYVA/NXCOMPAT/CFG are set. With the 8.4 NTS DLL, a small app packed as source
@@ -128,6 +137,8 @@ how to add the exception for your own module, and how to sign and notarize it:
 One self-contained file each (Python, Tkinter and cryptography inside), built with PyInstaller
 6.22.3 from `gui/envelock-assistant.spec` (docs/BUILDING.md §5). On Linux make it executable
 (`chmod +x`); on Windows double-click it. Usage: [docs/ASSISTANT.md](../docs/ASSISTANT.md).
+These are the 1.1.0 builds below: they do not yet show the memory notes of 1.1.1 (the vendor/ warning
+and the memory estimate in the packing summary); `gui/envelock_gui.py` run from source does.
 
 - **Windows:** rebuilt natively on Windows 11 x64 on 2026-11-16/17 (the recommender now explains every
   option and says which ones need checking), with the python.org CPython 3.12.10 (the exe bundles its

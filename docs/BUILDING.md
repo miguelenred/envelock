@@ -129,15 +129,16 @@ keys. The full recipes are in [PLATAFORMAS.md](PLATAFORMAS.md); in short:
   `ENVELOCK_TEST_EXTENSION=<dll> ENVELOCK_TEST_OWNER=owner.json ENVELOCK_TEST_RECIPIENT=recipient.json python -m pytest tests/test_native.py`.
   The tests adapt their expectations (permission messages, paths) to the PHP they run.
 
-*Run for 1.1.0:* the five Linux x86-64 loaders in `prebuilt/` (PHP 8.2, 8.3, 8.4 NTS/ZTS, 8.5)
-are portable builds remade on 2026-11-18 on AlmaLinux 8 with `build-unix.sh`, `ENVELOCK_OPENSSL_STATIC`
+*Run for 1.1.1:* the five Linux x86-64 loaders in `prebuilt/` (PHP 8.2, 8.3, 8.4 NTS/ZTS, 8.5)
+are portable builds made on 2026-11-19 on AlmaLinux 8 with `build-unix.sh`, `ENVELOCK_OPENSSL_STATIC`
 and `ENVELOCK_MAX_GLIBC=2.28` (PLATAFORMAS.md, "Portable build"): glibc 2.28+ and no system OpenSSL
-needed (`TEST-STATUS.md`). The eight Windows x64 DLLs (8.2–8.5, NTS and TS) are rebuilt
-natively with `build-windows.ps1` on Windows 11 from the final 1.1.0 source (2026-11-17/18) and pass
-`tests/test_native.py` there with 964 passed, 0 failed on each (`TEST-STATUS.md`); the earlier sets were
-cross-built with `build-windows-wine.sh`. The assistant executables are built with `build-gui.sh`
-(its spec lists the hidden imports the bundled code needs; a test keeps the list complete). *Not run:*
-macOS (no Mac; see PLATAFORMAS.md for building, signing and notarizing there).
+needed; each passes `tests/test_native.py` with 0 failed (`TEST-STATUS.md`). The eight Windows x64 DLLs
+(8.2–8.5, NTS and TS) are built with `build-windows.ps1` by the repository's GitHub CI (job `windows` of
+`checks.yml`, GitHub's `windows-2022` runners) from the 1.1.1 source and pass `tests/test_native.py` there
+with 966 passed, 0 failed on each; the 1.1.0 set was built natively on Windows 11 (964 passed, 0 failed
+on each), the earlier sets cross-built with `build-windows-wine.sh`. The assistant executables are built
+with `build-gui.sh` (its spec lists the hidden imports the bundled code needs; a test keeps the list
+complete). *Not run:* macOS (no Mac; see PLATAFORMAS.md for building, signing and notarizing there).
 
 ## 3. OpenSSL 4.0.3
 
@@ -276,7 +277,7 @@ script -qefc "wine $WINPY -m PyInstaller --clean --noconfirm --distpath dist/win
 xvfb-run script -qefc "wine dist/win/envelock-assistant.exe --selftest" /dev/null
 ```
 
-*Run for 1.1.0:* the Windows executable natively on Windows 11 (2026-11-16/17, CPython 3.12.10,
+*Run for 1.1.0 (not rebuilt for 1.1.1):* the Windows executable natively on Windows 11 (2026-11-16/17, CPython 3.12.10,
 PyInstaller 6.22.3, from the 1.1 source), passing `--selftest`; the Linux executable with `build-gui.sh`
 on AlmaLinux 8 (2026-11-16/17, CPython 3.12.15, glibc 2.28+), passing `--selftest` under a virtual
 display (Xvfb). *Not run:* macOS.
