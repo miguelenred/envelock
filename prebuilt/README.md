@@ -7,16 +7,16 @@ installed. Their source code is in
 this repository (`extension/` and [`third_party/`](../third_party/README.md)); how to compile them
 yourself: [docs/BUILDING.md](../docs/BUILDING.md).
 
-> **The loaders are the 1.1.1 builds (2026-11-19); the assistants are the 1.1.0 ones (2026-11-17).**
+> **The loaders and the assistants are the 1.1.1 builds (2026-11-19).**
 > 1.1.1 changes the loader only in the version it reports (`CHANGELOG.md`), so the loaders were rebuilt
 > from the 1.1.1 source (commit `acaee98`; later commits change documentation only): the five Linux ones
 > here on AlmaLinux 8 with the method below, the eight Windows DLLs by the repository's GitHub CI. Each
 > passes `tests/test_native.py` with 0 failed against the shipped binary, and each reports 1.1.1 to PHP.
 > They are the same files as the assets of the GitHub Release 1.1.1 that PIE installs. They carry every
 > fix of the 1.1 consolidated audit, of the second audit of the 1.1.0 source (C-05) and of the code audit
-> that followed (`docs/AUDITORIA.md` Pass 35). The two assistants were built on 2026-11-17 and predate
-> the memory notes 1.1.1 adds to `pack` and `recommend`: the assistant run from source shows them, these
-> executables once rebuilt. The dated build/test descriptions below document the methods (first used
+> that followed (`docs/AUDITORIA.md` Pass 35). The two assistants were rebuilt from the 1.1.1 source
+> (commit `16d456b`), so they show the memory notes 1.1.1 adds to `pack` and `recommend`; the encoder
+> they carry is byte-identical to that source. The dated build/test descriptions below document the methods (first used
 > for the 1.0.0 binaries); `TEST-STATUS.md` holds the build records and `SHA256SUMS` the per-file hashes.
 
 Every file is listed in [`SHA256SUMS`](SHA256SUMS). Check it before use:
@@ -137,19 +137,24 @@ how to add the exception for your own module, and how to sign and notarize it:
 One self-contained file each (Python, Tkinter and cryptography inside), built with PyInstaller
 6.22.3 from `gui/envelock-assistant.spec` (docs/BUILDING.md §5). On Linux make it executable
 (`chmod +x`); on Windows double-click it. Usage: [docs/ASSISTANT.md](../docs/ASSISTANT.md).
-These are the 1.1.0 builds below: they do not yet show the memory notes of 1.1.1 (the vendor/ warning
-and the memory estimate in the packing summary); `gui/envelock_gui.py` run from source does.
+Both were rebuilt on 2026-11-19 from the 1.1.1 source (commit `16d456b`) with the toolchains of the
+2026-11-16/17 builds. In each, the encoder, the actions layer and the vendored PHP parser it carries are
+byte-identical to that source, and the packing summary, run with the code taken out of the executable,
+shows the 1.1.1 notes (the `vendor/` warning and the memory estimate) in English and Spanish
+(`TEST-STATUS.md`).
 
-- **Windows:** rebuilt natively on Windows 11 x64 on 2026-11-16/17 (the recommender now explains every
-  option and says which ones need checking), with the python.org CPython 3.12.10 (the exe bundles its
-  Visual C++ runtime). It passed `--selftest` and `--e2e` (keys, encryption, the PHP download path, and
-  the vendored PHP parser run by the official PHP 8.4.27 NTS); a scan of every bundled file found no
-  path of the build machine (only generic text of the bundled libraries, such as an example path in a
-  Python docstring). The 2026-11-10 build had first added the hidden imports the Wine-built exe lacked
-  (`shlex`, `calendar`, `ctypes.util`, `socket`, `types`).
-- **Linux:** rebuilt on 2026-11-16/17 on AlmaLinux 8.10 (glibc 2.28) under WSL1 with its CPython 3.12.15
-  and Tk 8.6, so it runs on the same systems as the portable loaders. It passed `--selftest` (under a
-  virtual X display) and `--e2e` with PHP 8.4.27; no path of the build machine in any bundled file.
+- **Windows:** rebuilt natively on Windows 11 x64 on 2026-11-19 with the python.org CPython 3.12.10,
+  PyInstaller 6.22.3 and cryptography 50.0.2 (the exe bundles its Visual C++ runtime). It passed
+  `--selftest` and `--e2e` (keys, encryption, the PHP download path, and the vendored PHP parser run by
+  the official PHP 8.4.27 NTS); a scan of every bundled file found no path of the build machine (only
+  generic text of the bundled libraries, such as an example path in a Python docstring, and the build
+  paths the official cryptography wheel carries). The 2026-11-10 build had first added the hidden
+  imports the Wine-built exe lacked (`shlex`, `calendar`, `ctypes.util`, `socket`, `types`).
+- **Linux:** rebuilt on 2026-11-19 on AlmaLinux 8.10 (glibc 2.28) under WSL1 with its CPython 3.12.15
+  and Tk 8.6, so it runs on the same systems as the portable loaders: over its 63 bundled ELF files it
+  needs GLIBC_2.28 at most, and from the system only glibc and `libxcb.so.1`. It passed `--selftest`
+  (under a virtual X display) and `--e2e` with PHP 8.4.27; no path of the build machine in any bundled
+  file (the official cryptography wheel's own build path aside).
   PyInstaller was installed without hash verification (no Linux lock file in `scripts/`; see the
   warning in `scripts/build-gui.sh`). The earlier Linux build (Ubuntu 24.04) needed glibc 2.38 and lacked
   the `shlex` import.

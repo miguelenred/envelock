@@ -13,8 +13,8 @@ what it encrypted; `recommend` states the same estimate (command line and assist
 1.1.1). The loader's only change is its version string (1.1.1), defined once as `PHP_ENVELOCK_VERSION`
 (the first 1.1.1 build still said 1.1.0 in its `phpinfo()` row: that build was discarded before release,
 and two tests now pin the version). The 1.1.1 loaders were built from this source (commit `acaee98`) and
-tested as recorded below. The assistants in `prebuilt/` (built 2026-11-17) predate the change and do not
-show the new notes until they are rebuilt.
+tested as recorded below. The two assistants in `prebuilt/` were rebuilt from the 1.1.1 source (commit
+`16d456b`) on 2026-11-19 and show the new notes; their records are the last rows of the table.
 
 | Where | Suite | Result |
 |---|---|---|
@@ -30,6 +30,9 @@ show the new notes until they are rebuilt.
 | AlmaLinux 8.10 (WSL1), gcc 8.5, OpenSSL 3.5.9 static, `ENVELOCK_MAX_GLIBC=2.28` | `scripts/build-unix.sh` for the five Linux loaders (8.2, 8.3, 8.4 NTS, 8.4 ZTS, 8.5) | each reports 1.1.1 to `phpversion()` and `php --ri`; GLIBC_2.25 at most; no build-machine string |
 | Same, PHP 8.2.35 / 8.3.36 / 8.4.27 NTS / 8.4.27 ZTS / 8.5.12 | `tests/test_native.py` against each shipped `.so` (`ENVELOCK_REQUIRE_NATIVE=1`), one at a time with pauses | 987/55, 987/55, 992/50, 986/56, 987/55 passed/skipped; 0 failed |
 | Windows 11 | `scripts/package-pie-assets.py --version 1.1.1` → the 13 PIE assets of the GitHub Release | each zip holds exactly the tested binary (its hash in `prebuilt/SHA256SUMS`), LICENSE and NOTICE; `sha256sum -c` of the assets passes |
+| Windows 11, python.org CPython 3.12.10, PyInstaller 6.22.3, cryptography 50.0.2 | the Windows assistant from `gui/envelock-assistant.spec` (commit `16d456b`) | built; sha256 `1f4342891e15b7502acd68daf0844ee5e16266556debe697b7d7b4dcdbdea211`; `--selftest` OK; `--e2e` OK without a PHP and with the official PHP 8.4.27 NTS (`php-ast=ok`); `--e2e` without a folder exits with its usage line; no build-machine path in any of its 1587 entries (only generic library text and the official cryptography wheel's build paths) |
+| AlmaLinux 8.10 (WSL1), CPython 3.12.15, Tk 8.6, PyInstaller 6.22.3, cryptography 50.0.2 | the Linux assistant from the same spec and commit | built (0 PyInstaller warnings); sha256 `621a0ea19a3f5f7c82d64452c6d4b7f977f445eed2278e176b488639d8ca7041`; GLIBC_2.28 at most over its 63 bundled ELF files, and from the system only glibc and `libxcb.so.1`; `--selftest` under Xvfb OK; `--e2e` OK without a PHP and with PHP 8.4.27 NTS (`php-ast=ok`); no build-machine path (the cryptography wheel's own build path aside, identical to the wheel's file) |
+| Both assistants, and the 1.1.0 ones as a control | what each carries: its bundled files against the source, the 1.1.1 strings in its window code, and the packing summary run with the code taken out of the executable on a project whose `vendor/` is a Composer tree | 1.1.1: encoder, actions layer, e2e module and PHP parser byte-identical to the source (278 of 278 files), the 7 new strings present; the summary shows the `vendor/` warning (or, with `--include-protection`, the note) and the memory note, in English and Spanish, and only the memory note with `vendor/*` excluded. 1.1.0 control: its encoder differs and none of the strings is present |
 
 The separate local rehearsal of the CI's unix command was not run this time: the workstation shut itself
 down twice during long full-suite runs (no crash dump; Windows logged an unclean restart), and the

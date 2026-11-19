@@ -277,10 +277,12 @@ script -qefc "wine $WINPY -m PyInstaller --clean --noconfirm --distpath dist/win
 xvfb-run script -qefc "wine dist/win/envelock-assistant.exe --selftest" /dev/null
 ```
 
-*Run for 1.1.0 (not rebuilt for 1.1.1):* the Windows executable natively on Windows 11 (2026-11-16/17, CPython 3.12.10,
-PyInstaller 6.22.3, from the 1.1 source), passing `--selftest`; the Linux executable with `build-gui.sh`
-on AlmaLinux 8 (2026-11-16/17, CPython 3.12.15, glibc 2.28+), passing `--selftest` under a virtual
-display (Xvfb). *Not run:* macOS.
+*Run for 1.1.1:* the Windows executable natively on Windows 11 (2026-11-19, CPython 3.12.10, PyInstaller
+6.22.3, cryptography 50.0.2, from the 1.1.1 source), passing `--selftest` and `--e2e` with the official
+PHP 8.4.27 NTS; the Linux executable with PyInstaller and this spec on AlmaLinux 8 (2026-11-19, CPython
+3.12.15, Tk 8.6, GLIBC_2.28 at most over everything it bundles), passing `--selftest` under a virtual
+display (Xvfb) and `--e2e` with PHP 8.4.27 (`TEST-STATUS.md`). The 1.1.0 executables were built the same
+way on 2026-11-16/17. *Not run:* macOS.
 
 ## 6. Portable Python
 
