@@ -12,6 +12,7 @@ apps are present and skips when they are not.
     # 2. Run the checks:
     python3 scripts/framework-smoke.py --app /tmp/envelock-framework-fixtures/laravel --kind laravel
     python3 scripts/framework-smoke.py --app /tmp/envelock-framework-fixtures/symfony --kind symfony
+    python3 scripts/framework-smoke.py --app /tmp/envelock-framework-fixtures/codeigniter --kind codeigniter
 
     # A production loader has no envelock_bc_emit (always so on Windows): name the served loader
     # and a pack-time emitter build (--enable-envelock-bcemit) of the same PHP:
@@ -20,18 +21,22 @@ apps are present and skips when they are not.
 
 What it does, and why each step is shaped the way it is:
 
-- Both runs use disposable copies. Laravel is forced to use each copy's own SQLite fixture rather
-  than a DB_DATABASE from the environment or .env; the supplied application is not reset or served.
+- Both runs use disposable copies. Laravel and CodeIgniter are forced to use each copy's own SQLite
+  fixture rather than a database from the environment or .env; the supplied application is not reset
+  or served.
 - Only the application's OWN code is packed. `vendor/` and the caches generated at run time
-  (Laravel `bootstrap/cache`, Symfony `var/cache`, compiled templates) stay outside the packed tree:
+  (Laravel `bootstrap/cache`, Symfony `var/cache`, CodeIgniter `writable/`, compiled templates) stay
+  outside the packed tree:
   they are not the asset, and packing them would mean shipping a cache that has to be regenerated
   anyway.
 - Only the files the packer will actually replace are removed from the working copy. Removing the
   whole directory takes the non-PHP files with it — `config/*.yaml`, `.env`, templates — which the
   packer neither touches nor copies. In Symfony that is `config/routes.yaml`, and the symptom is an
   empty `debug:router` that looks exactly like an attribute-reflection failure and is not one.
-- `extensions` includes the empty suffix, because `artisan` and `bin/console` are own code with no
-  file extension. Without it the packer skips them silently and the app will not start at all.
+- `extensions` includes the empty suffix, because `artisan`, `bin/console` and `spark` are own code
+  with no file extension. Without it the packer skips them silently and the app will not start at all.
+  They are named one by one in OWN_CODE: inside a folder only `.php` files are packed, so a `.htaccess`
+  (also extensionless) stays what it is.
 - Public renaming (O6) is explicitly off. The pack report's `names_obfuscated` field must be the
   boolean False; the script fails if the field is missing or the feature was enabled.
 - OPcache must be off (or explicitly allowed). The loader refuses to run with OPcache enabled unless
@@ -112,12 +117,32 @@ def pack_framework_code(own, destination, recipient_public, owner, project, prot
     return info
 
 
-# Own code, per framework. Everything else — vendor/, storage/, var/, caches — stays put.
+# Own code, per framework. Everything else — vendor/, storage/, var/, writable/, caches — stays put.
+# A folder contributes its .php files; an extensionless entry script (artisan, bin/console, spark) is
+# named on its own, so a folder's .htaccess or .gitignore is never mistaken for PHP.
 OWN_CODE = {
     "laravel": ["app", "config", "routes", "database/migrations",
                 "bootstrap/app.php", "bootstrap/providers.php", "public/index.php", "artisan"],
     "symfony": ["src", "config", "public/index.php", "bin/console"],
+    "codeigniter": ["app", "public/index.php", "spark"],
 }
+
+# Own files that must stay CLEARTEXT, per framework, because the framework reads them as text.
+# CodeIgniter 4 finds the class in a Config/Filters.php by reading the file and tokenizing it
+# (FileLocator::getClassname, used by Filters::discoverFilters on every request while filter discovery
+# is on — the default): on an encrypted file it finds no class, takes the app's main filter config for
+# a module's and include()s it a second time, and every request dies with "Cannot redeclare class
+# Config\Filters" (measured, CodeIgniter 4.7.6). The same reader serves migrations (spark migrate) and
+# `spark routes`. Keep the file cleartext — it is configuration — or turn filter discovery off in
+# app/Config/Modules.php.
+CLEARTEXT = {"codeigniter": {"app/Config/Filters.php"}}
+
+# The fixture database, per framework that has one: (path in the copy, table the routes write).
+FIXTURE_DATABASE = {"laravel": ("database/database.sqlite", "widgets"),
+                    "codeigniter": ("writable/database.sqlite", "items")}
+
+# Run-time caches each framework regenerates; they stay out of the package but must exist.
+RUNTIME_CACHES = ("var/cache", "bootstrap/cache", "writable/cache")
 
 ROUTES = {
     "laravel": [("GET", "/ping", None), ("GET", "/widgets", None), ("GET", "/reflect", None),
@@ -128,10 +153,21 @@ ROUTES = {
     "symfony": [("GET", "/ping", None), ("GET", "/items", None), ("GET", "/reflect", None),
                 ("POST", "/items", b"tornillo"), ("GET", "/items", None),
                 ("POST", "/items", b"x" * 64), ("GET", "/no-existe", None)],
+    "codeigniter": [("GET", "/ping", None), ("GET", "/items", None), ("GET", "/reflect", None),
+                    ("POST", "/items", b'{"name":"tornillo"}'), ("GET", "/items", None),
+                    ("POST", "/items", b'{"name":"' + b"x" * 64 + b'"}'), ("GET", "/no-existe", None)],
 }
 
 EXPECTED_CODES = {"laravel": [200, 200, 200, 201, 200, 422, 200, 404, 200, 200],
-                  "symfony": [200, 200, 200, 201, 200, 422, 404]}
+                  "symfony": [200, 200, 200, 201, 200, 422, 404],
+                  "codeigniter": [200, 200, 200, 201, 200, 422, 404]}
+
+# The service each fixture's /reflect route reports, and the extra fields it must return.
+EXPECTED_REFLECTION = {
+    "laravel": (r"App\Services\ProbeService", {"table": "widgets", "attribute_name": "reflection"}),
+    "symfony": (r"App\Service\Catalogue", {"path": "/ping"}),
+    "codeigniter": (r"App\Libraries\Catalogue", {"table": "items", "attribute_name": "reflection"}),
+}
 
 
 def assert_probe_exercises_fixture(kind: str, responses: dict) -> None:
@@ -157,16 +193,14 @@ def assert_probe_exercises_fixture(kind: str, responses: dict) -> None:
 
     ping, first, reflection, created, second, rejected = (body(i) for i in range(6))
     item_key = "widgets" if kind == "laravel" else "items"
-    expected_service = r"App\Services\ProbeService" if kind == "laravel" else r"App\Service\Catalogue"
+    expected_service, expected_fields = EXPECTED_REFLECTION[kind]
     items_after = second.get(item_key)
     if (ping.get("pong") is not True or first.get(item_key) != []
             or created.get("name") != "tornillo" or not isinstance(items_after, list)
             or not any(item.get("name") == "tornillo" for item in items_after if isinstance(item, dict))
             or not rejected.get("errors") or reflection.get("service") != expected_service
             or not isinstance(reflection.get("attributes"), int) or reflection["attributes"] < 1
-            or (kind == "laravel" and (reflection.get("table") != "widgets"
-                                       or reflection.get("attribute_name") != "reflection"))
-            or (kind == "symfony" and reflection.get("path") != "/ping")):
+            or any(reflection.get(field) != value for field, value in expected_fields.items())):
         raise SystemExit(f"{kind}: expected fixture results (injection, attributes, state and validation)")
     if kind == "laravel" and (body(8).get("session") != "stored" or body(9).get("session") != "envelock-probe"):
         raise SystemExit("laravel: expected a cookie-backed session round trip")
@@ -286,15 +320,25 @@ def copy_fixture_sessions(source: pathlib.Path, target: pathlib.Path) -> None:
 
 def serve(directory: pathlib.Path, port: int, ini_dir: pathlib.Path | None, kind: str,
           php: str = "php") -> subprocess.Popen:
-    """Serve a disposable copy; for Laravel, force the copy's own SQLite database."""
+    """Serve a disposable copy; for Laravel and CodeIgniter, force the copy's own SQLite database."""
     environment = dict(os.environ)
     environment.update({"APP_ENV": "production" if kind == "laravel" else "prod", "APP_DEBUG": "0"})
+    router = "public/index.php"
     if kind == "laravel":
         # Never trust an absolute DB_DATABASE inherited from the source .env or the caller's shell.
         # The test routes write data, so both apps must use isolated copies of the fixture database.
         environment.update({"DB_CONNECTION": "sqlite", "DB_DATABASE": str(directory / "database" / "database.sqlite"),
                             "LARAVEL_STORAGE_PATH": str(directory / "storage"),
                             "CACHE_STORE": "array", "SESSION_DRIVER": "file", "QUEUE_CONNECTION": "sync"})
+    elif kind == "codeigniter":
+        # CodeIgniter reads its configuration overrides from $_ENV with the dots of the setting's
+        # name written as underscores. A bare SQLite file name resolves inside the copy's own
+        # writable/ folder (WRITEPATH), so each copy writes only its own database.
+        environment.update({"CI_ENVIRONMENT": "production", "database_default_DBDriver": "SQLite3",
+                            "database_default_database": "database.sqlite"})
+        # CodeIgniter's own router for the built-in server (what `php spark serve` runs): it sets
+        # SCRIPT_NAME to /index.php, without which the framework strips the route off the URI.
+        router = "vendor/codeigniter4/framework/system/rewrite.php"
     if ini_dir is not None:
         # The leading separator (':' on POSIX, ';' on Windows) keeps PHP's default ini locations,
         # including the framework's extensions.
@@ -302,7 +346,7 @@ def serve(directory: pathlib.Path, port: int, ini_dir: pathlib.Path | None, kind
     # Symfony's dotenv reads $_ENV/$_SERVER, not getenv(); Debian's default GPCS omits E and can
     # otherwise override our isolation and APP_ENV settings with values from the copied .env.
     command = [php, "-d", "variables_order=EGPCS", "-S", f"127.0.0.1:{port}",
-               "-t", "public", "public/index.php"]
+               "-t", "public", router]
     # stderr goes to a file, not a pipe: nobody reads a pipe here, so once the 64 KiB buffer fills
     # the server blocks mid-request and the app silently stops answering. The file also gives the
     # failure something to show.
@@ -337,12 +381,13 @@ def reset_state(directory: pathlib.Path, kind: str) -> None:
         (directory / "var" / "items.json").unlink(missing_ok=True)
         return
     import sqlite3
-    database = directory / "database" / "database.sqlite"
+    relative, table = FIXTURE_DATABASE[kind]
+    database = directory / relative
     if not database.is_file():
-        raise SystemExit("the Laravel fixture needs its own database/database.sqlite")
+        raise SystemExit(f"the {kind} fixture needs its own {relative}")
     with sqlite3.connect(database) as connection:
-        connection.execute("DELETE FROM widgets")
-        connection.execute("DELETE FROM sqlite_sequence WHERE name = 'widgets'")
+        connection.execute(f"DELETE FROM {table}")  # nosec B608 - a fixed table name from FIXTURE_DATABASE
+        connection.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table,))
 
 
 def _tail(path: pathlib.Path, lines: int = 25) -> str:
@@ -404,9 +449,11 @@ def main() -> int:
             source = app / relative
             if source.is_dir():
                 packed_paths += [f.relative_to(app) for f in sorted(source.rglob("*"))
-                                 if f.is_file() and f.suffix.lower() in (".php", "")]
+                                 if f.is_file() and f.suffix.lower() == ".php"]
             else:
                 packed_paths.append(pathlib.Path(relative))
+        cleartext = CLEARTEXT.get(arguments.kind, set())
+        packed_paths = [p for p in packed_paths if p.as_posix() not in cleartext]
         for relative in packed_paths:
             (protected / relative).unlink(missing_ok=True)
             target = own / relative
@@ -435,7 +482,7 @@ def main() -> int:
         # recreating it is a confusing "PackageManifest.php line 179" rather than anything that
         # points at the protector.
         for tree in (baseline_app, protected):
-            for cache in ("var/cache", "bootstrap/cache"):
+            for cache in RUNTIME_CACHES:
                 target = tree / cache
                 shutil.rmtree(target, ignore_errors=True)
                 if (tree / cache.split("/")[0]).is_dir():

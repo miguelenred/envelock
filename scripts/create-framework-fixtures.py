@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Create disposable Laravel and Symfony fixtures for scripts/framework-smoke.py.
+"""Create disposable Laravel, Symfony and CodeIgniter fixtures for scripts/framework-smoke.py.
 
-Requires Composer, PHP 8.4+, tokenizer, sqlite, mbstring and the frameworks' usual extensions.
+Requires Composer, PHP 8.4+, tokenizer, sqlite, mbstring, intl and the frameworks' usual extensions.
 The target directory must be empty: this tool never overwrites an existing application. Composer is
 `composer` on PATH (on Windows also composer.bat / composer.phar, run through PHP), or --composer.
 
@@ -67,7 +67,7 @@ def installed_version(app: Path, name: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--root", type=Path, required=True, help="An empty folder for the two disposable apps")
+    parser.add_argument("--root", type=Path, required=True, help="An empty folder for the disposable apps")
     parser.add_argument("--php", default=None, help="PHP CLI to use (default: php on PATH)")
     parser.add_argument("--composer", default=None,
                         help="Composer to use: composer, composer.bat or composer.phar (default: from PATH)")
@@ -80,7 +80,9 @@ def main() -> int:
         raise SystemExit("php not found: put a PHP 8.4+ CLI on PATH, or pass --php")
     composer = composer_command(php, args.composer)
     root.mkdir(parents=True, exist_ok=True)
-    for kind, project in (("laravel", "laravel/laravel"), ("symfony", "symfony/skeleton")):
+    for kind, project, package in (("laravel", "laravel/laravel", "laravel/framework"),
+                                   ("symfony", "symfony/skeleton", "symfony/framework-bundle"),
+                                   ("codeigniter", "codeigniter4/appstarter", "codeigniter4/framework")):
         app = root / kind
         command = [*composer, "create-project", project, str(app), "--no-interaction", "--prefer-dist"]
         if kind == "laravel":
@@ -94,9 +96,12 @@ def main() -> int:
             database = app / "database" / "database.sqlite"
             with sqlite3.connect(database) as connection:
                 connection.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+        elif kind == "codeigniter":
+            # CodeIgniter's SQLite3 driver opens a bare file name inside writable/ (its WRITEPATH).
+            with sqlite3.connect(app / "writable" / "database.sqlite") as connection:
+                connection.execute("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
         # The smoke script issues write requests and therefore refuses unmarked applications.
         (app / ".envelock-smoke-fixture").write_text(kind + "\n", encoding="utf-8")
-        package = "laravel/framework" if kind == "laravel" else "symfony/framework-bundle"
         print(f"{kind}: {installed_version(app, package)} -> {app}", flush=True)
     return 0
 

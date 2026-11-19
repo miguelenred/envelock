@@ -1,0 +1,89 @@
+name: Real application (Magento 2.4), protected vs unprotected
+# A whole Magento Open Source install packed with Envelock and compared with the unprotected shop,
+# request by request (scripts/magento-smoke.py). Run by hand (Actions > Run workflow) and on pushes to
+# apps-* branches, not on every push: it needs MariaDB, OpenSearch and some 14,000 packed files. The
+# lighter real-application checks (Laravel, Symfony, CodeIgniter) run in checks.yml's frameworks job.
+# Keys are throwaway, made by the script for each run and discarded with the runner.
+on:
+  push:
+    branches: ['apps-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  magento:
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [source, bytecode, recommended]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: magento
+          MARIADB_DATABASE: magento
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s --health-timeout=5s --health-retries=30
+      opensearch:
+        image: opensearchproject/opensearch:2.19.1
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: 'true'
+          DISABLE_INSTALL_DEMO_CONFIG: 'true'
+          OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+        ports: ['9200:9200']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: phpize, composer
+          ini-values: memory_limit=-1
+          extensions: bcmath, ctype, curl, dom, fileinfo, gd, iconv, intl, mbstring, openssl, pdo_mysql, simplexml, soap, sockets, sodium, tokenizer, xmlwriter, xsl, zip
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Build the 8.4 server loader and a pack-time bytecode emitter (never shipped)
+        run: |
+          bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
+          cp -R extension "$RUNNER_TEMP/emitter-src"
+          ( cd "$RUNNER_TEMP/emitter-src" && phpize && ./configure --enable-envelock --enable-envelock-bcemit && make -j2 )
+      - name: Install Magento Open Source 2.4.8 (git + Composer, no Adobe keys) against the services
+        run: |
+          until curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null; do sleep 5; done
+          git clone --quiet --depth 1 --branch 2.4.8 https://github.com/magento/magento2.git "$RUNNER_TEMP/magento"
+          cd "$RUNNER_TEMP/magento"
+          composer install --no-dev --no-interaction --prefer-dist --no-progress
+          php bin/magento setup:install --base-url=http://127.0.0.1:8180/ \
+            --db-host=127.0.0.1 --db-name=magento --db-user=root --db-password=magento \
+            --admin-firstname=Envelock --admin-lastname=Smoke --admin-email=smoke@example.com \
+            --admin-user=smoke --admin-password="Smoke$(openssl rand -hex 8)7" \
+            --language=en_US --currency=USD --timezone=UTC --use-rewrites=1 \
+            --search-engine=opensearch --opensearch-host=127.0.0.1 --opensearch-port=9200 \
+            --backend-frontname=admin
+          # Without the full-page cache every probe renders the page through the (protected) code;
+          # with it, a warmed page is served from the cache and most of the code never runs.
+          php bin/magento cache:disable full_page
+          php bin/magento deploy:mode:show
+          echo magento > .envelock-smoke-fixture
+      - name: Magento (${{ matrix.profile }}) protected vs unprotected must be identical
+        run: >-
+          python scripts/magento-smoke.py --app "$RUNNER_TEMP/magento" --profile ${{ matrix.profile }}
+          --loader "$RUNNER_TEMP/envelock.so" --emitter "$RUNNER_TEMP/emitter-src/modules/envelock.so"
+          --report "$RUNNER_TEMP/magento-${{ matrix.profile }}.json"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: magento-${{ matrix.profile }}
+          path: ${{ runner.temp }}/magento-${{ matrix.profile }}.json
+          if-no-files-found: ignore

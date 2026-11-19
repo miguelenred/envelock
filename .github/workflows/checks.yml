@@ -228,7 +228,7 @@ jobs:
           bash scripts/build-unix.sh "$RUNNER_TEMP/envelock.so"
           cp -R extension "$RUNNER_TEMP/emitter-src"
           ( cd "$RUNNER_TEMP/emitter-src" && phpize && ./configure --enable-envelock --enable-envelock-bcemit && make -j2 )
-      - name: Create disposable Laravel and Symfony fixtures (Composer + network)
+      - name: Create disposable Laravel, Symfony and CodeIgniter fixtures (Composer + network)
         run: python scripts/create-framework-fixtures.py --root "$RUNNER_TEMP/fw"
       - name: Protected vs unprotected must be identical (bytecode O1 + obfuscation defaults)
         run: |
@@ -237,6 +237,12 @@ jobs:
           ENVELOCK_FW_LOADER="$RUNNER_TEMP/envelock.so" \
           ENVELOCK_FW_EMITTER="$RUNNER_TEMP/emitter-src/modules/envelock.so" \
           python -m pytest -q tests/test_frameworks.py
+      # Run directly rather than through tests/test_frameworks.py, which the release evidence pins;
+      # it gains the CodeIgniter case when the evidence is next regenerated.
+      - name: CodeIgniter protected vs unprotected must be identical (bytecode O1 + obfuscation defaults)
+        run: >-
+          python scripts/framework-smoke.py --app "$RUNNER_TEMP/fw/codeigniter" --kind codeigniter
+          --loader "$RUNNER_TEMP/envelock.so" --emitter "$RUNNER_TEMP/emitter-src/modules/envelock.so"
 
   static-php:
     # Objective O10: Envelock linked INTO a statically built CLI PHP (the engine half of a

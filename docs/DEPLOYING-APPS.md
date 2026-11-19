@@ -153,6 +153,70 @@ Drupal declares plugins with PHP 8 attributes and autoloads via Composer PSR-4, 
 source-tokenizing annotation problem; `include_protection` stays off so the runtime-generated clear PHP
 (compiled Twig, the container) loads normally. See `docs/AUDITORIA.md` Pass 25.
 
+## Magento 2.4 (measured: the whole core, three profiles)
+
+Measured on 2026-11-19 on GitHub's runners (`.github/workflows/apps.yml`, `scripts/magento-smoke.py`):
+Magento Open Source 2.4.8 installed from its git release with Composer (no Adobe keys), PHP 8.4 on its
+built-in server with Magento's own `phpserver/router.php`, MariaDB 11.4 and OpenSearch 2.19, default
+mode, and the full-page cache off, so that every probe renders its page through the protected code.
+
+- **What was packed:** the whole core — `app/code`, `lib/internal`, the entry scripts (`pub/index.php`,
+  `pub/static.php`, `pub/get.php`, `bin/magento`, `phpserver/router.php`) and every `.phtml` template
+  (PHP that Magento `include`s; `pack` encrypts `.phtml` by default), without the modules' `Test/`
+  folders: 14,138 files, 42.7 MB. `vendor/` stays cleartext. `generated/` and every cache were deleted
+  before the protected run, so Magento regenerated its interceptors, factories and proxies from the
+  protected classes.
+- **Result: 15 of 15 identical in each of three profiles** — encryption only, `--bytecode` (no PHP
+  source shipped), and what `envelock recommend` turns on for this tree (`--encode-strings --obfuscate
+  --obfuscate-flow --obfuscate-methods --no-ffi --no-prepend`). The probes: the home page, customer
+  login and account creation, the cart, a catalog search (OpenSearch), the contact form, the 404 page,
+  the admin login page, REST (the currency, a country, creating a guest cart), GraphQL, and
+  `bin/magento --version`, `module:status` and `cache:status`. Status, full body and headers are
+  compared after masking only what Magento changes on every request even unprotected: the form key and
+  cookie values, CSP nonces, its random element ids (`id="idQ8Zu4JfG"`), the admin URL key and form key,
+  the static-content version stamp, the captcha timestamp and the server clock it prints.
+- **What `recommend` chose, and why.** It left `--strip-comments` and `--compact` off (Magento reads
+  docblocks at run time), `--sealed` off (templates use `eval()`), `--include-protection` off
+  (`bin/magento` has no `.php` extension and stays cleartext) and `--bytecode` off, keeping two framework
+  files that read their own source cleartext
+  (`lib/internal/Magento/Framework/App/DeploymentConfig/CommentParser.php` and
+  `.../Framework/Code/Reader/NamespaceResolver.php`). The bytecode profile, which packs those two files
+  too, was identical on these probes; recommend is conservative because their source-reading paths are
+  not among them.
+- **Speed.** Per request, both sides without OPcache (protected files are never cached by it, and the
+  unprotected baseline ran without it too): bytecode as fast as the unprotected shop, encryption only
+  about 20% slower, recommend's set about 28% slower (home page 0.26–0.28 s unprotected; 0.27 s bytecode,
+  0.32 s encryption only, 0.36 s with obfuscation). Against an unprotected shop WITH OPcache the gap is
+  larger. Packing took 16–23 s.
+- **Not measured:** production mode (`setup:di:compile`, which reads PHP files as text to find classes,
+  and `setup:static-content:deploy`), PHP-FPM and Varnish, sample data, a full checkout, and a single
+  protected extension under `app/code` — the usual case for an extension vendor, a smaller one than the
+  whole core.
+- **Recipe:** pack your module's folder under `app/code` (its `.php` and `.phtml`), leave `vendor/`
+  cleartext, deploy, delete `generated/` so Magento regenerates it from your protected classes, and run
+  `envelock recommend` on the module first.
+
+## CodeIgniter 4 (measured)
+
+Measured on 2026-11-19 on GitHub's runners with `scripts/framework-smoke.py` (the Laravel/Symfony check,
+run in the CI `frameworks` job): CodeIgniter 4.7.6 (`codeigniter4/appstarter`) with a small fixture
+(`tests/fixtures/frameworks/codeigniter/`: a service from `Config\Services`, a Model on SQLite, validation
+answering 422, a PHP 8 attribute read back by reflection, and a 404), its own code packed as bytecode with
+`--encode-strings --obfuscate --strip-comments --compact`, served in production mode. `vendor/` and
+`writable/` stay cleartext.
+
+- **Keep `app/Config/Filters.php` cleartext.** CodeIgniter finds the class in a `Config/Filters.php` by
+  reading the file and tokenizing it (`FileLocator::getClassname`, called by filter discovery on every
+  request, on by default). On an encrypted file it finds no class, takes the application's own filter
+  config for a module's and `include`s it a second time: every request dies with `Cannot redeclare class
+  Config\Filters` (measured). The file is configuration; keep it cleartext, or turn filter discovery off
+  in `app/Config/Modules.php` (it has been deprecated since 4.4.2 in favour of Registrars).
+- **The same reader** is used by migrations (`spark migrate`) and by `spark routes`'s controller finder:
+  keep `app/Database/Migrations/` cleartext if migrations run on the server (read in CodeIgniter's code,
+  not measured).
+- With that one file cleartext, every probe is identical to the unprotected application: status, full
+  body and headers.
+
 ## Obfuscation / hardening options vs real CMSs (measured)
 
 Which pack options keep a real CMS rendering identically, verified by packing the whole app, serving
