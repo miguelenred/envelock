@@ -4,7 +4,11 @@
 
 No format change: packages, identity files and licences are those of 1.1, so 1.1.0 and 1.1.1 packages and
 loaders work together in both directions, and nothing has to be repacked. **The loader's only change is
-its version** (`php --ri envelock` and `phpinfo()` now say 1.1.1); updating it is optional.
+its version** (`php --ri envelock` and `phpinfo()` now say 1.1.1); updating it is optional. The version
+is now defined once (`PHP_ENVELOCK_VERSION` in `extension/php_envelock.h`) for the module entry and the
+`phpinfo()` row, which had been separate literals (the first 1.1.1 build still showed 1.1.0 in the row);
+a source test pins it to the newest version in this changelog and a native test reads it back from the
+loaded module.
 
 **Memory: the tools now apply the memory guidance themselves.** Protected files cannot be cached by
 OPcache, so each request compiles the ones it uses into its own memory, in every PHP worker. Measured on

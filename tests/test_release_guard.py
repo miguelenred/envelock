@@ -1,6 +1,7 @@
 """scripts/check_release.py must catch private material wherever the scanned tree lives."""
 
 import json
+import re
 import subprocess
 import sys
 
@@ -776,3 +777,26 @@ def test_case_only_variants_on_this_filesystem(tmp_path):
         assert "P/P12: differs from its hash" in out and "P/evil: not listed" in out
     else:
         assert "P/putty: not listed" in result.stdout and "NOTE:" not in result.stdout
+
+
+def test_loader_version_is_defined_once_and_is_the_newest_release():
+    """The loader's version lives in ONE macro (extension/php_envelock.h) that the module entry
+    (phpversion(), php --re) and the phpinfo() row both use, and it is the newest release in
+    CHANGELOG.md. 1.1.1 was first built with the phpinfo() row still saying 1.1.0: the two were
+    separate literals, and only one was changed."""
+    header = (ROOT / "extension" / "php_envelock.h").read_text(encoding="utf-8")
+    found = re.search(r'^#define PHP_ENVELOCK_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"$', header, re.M)
+    assert found, "PHP_ENVELOCK_VERSION is not defined in extension/php_envelock.h"
+    version = found.group(1)
+    source = (ROOT / "extension" / "envelock.c").read_text(encoding="utf-8")
+    assert "    PHP_MINFO(envelock),\n    PHP_ENVELOCK_VERSION,\n" in source       # the module entry
+    assert 'php_info_print_table_row(2, "Envelock", PHP_ENVELOCK_VERSION " / offline");' in source
+    literals = [(path.relative_to(ROOT).as_posix(), literal)
+                for path in sorted((ROOT / "extension").rglob("*")) if path.suffix in (".c", ".h")
+                for literal in re.findall(r'"[^"\n]*\b[0-9]+\.[0-9]+\.[0-9]+\b[^"\n]*"',
+                                          path.read_text(encoding="utf-8", errors="replace"))]
+    assert literals == [("extension/php_envelock.h", f'"{version}"')], literals
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    newest = re.search(r"^## ([0-9]+\.[0-9]+\.[0-9]+)\b", changelog, re.M)
+    assert newest and newest.group(1) == version, (version, newest and newest.group(1))
+

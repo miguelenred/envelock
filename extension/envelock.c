@@ -2355,7 +2355,7 @@ static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(envelock)
 PHP_MINFO_FUNCTION(envelock)
 {
     php_info_print_table_start();
-    php_info_print_table_row(2, "Envelock", "1.1.0 / offline");
+    php_info_print_table_row(2, "Envelock", PHP_ENVELOCK_VERSION " / offline");
     php_info_print_table_row(2, "Format", "X25519+HKDF-SHA256+AES-256-GCM + Ed25519 / v2");
     php_info_print_table_row(2, "Trust store",
         (envelock_identity.recipient_count > 0 && envelock_identity.signer_count > 0)
@@ -2569,7 +2569,7 @@ zend_module_entry envelock_module_entry = {
     PHP_RINIT(envelock),
     PHP_RSHUTDOWN(envelock),
     PHP_MINFO(envelock),
-    "1.1.1",
+    PHP_ENVELOCK_VERSION,
     PHP_MODULE_GLOBALS(envelock),
     PHP_GINIT(envelock),
     PHP_GSHUTDOWN(envelock),

@@ -6689,3 +6689,22 @@ def test_bytecode_emits_with_opcache_caching_in_the_packing_php(native, tmp_path
     assert emit.returncode == 0, emit.stderr[-2000:]
     run = php(native, "-r", "if (!envelock_bc_run(file_get_contents($argv[1]))) { exit(4); }", str(image))
     assert run.returncode == 0 and run.stdout == "42|3", run.stdout + run.stderr[-2000:]
+
+
+def test_loader_reports_one_version_everywhere(native):
+    """The loaded module says one version everywhere a user or a tool reads it: phpversion(), php --re
+    and the 'Envelock' row of php --ri / phpinfo(), all PHP_ENVELOCK_VERSION. 1.1.1 was first built
+    with that row still at 1.1.0 (two separate literals; tests/test_release_guard.py pins the source)."""
+    version = re.search(r'^#define PHP_ENVELOCK_VERSION "([^"]+)"$',
+                        (ROOT / "extension" / "php_envelock.h").read_text(encoding="utf-8"), re.M).group(1)
+    run = php(native, "-r", 'echo phpversion("envelock");')
+    assert run.returncode == 0 and run.stdout == version, (run.stdout, run.stderr[-500:])
+    reflection = php(native, "--re", "envelock")
+    assert reflection.returncode == 0, reflection.stderr[-500:]
+    assert re.search(r"extension #\d+ envelock version " + re.escape(version) + r" \]", reflection.stdout), \
+        reflection.stdout[:300]
+    info = php(native, "--ri", "envelock")
+    assert info.returncode == 0, info.stderr[-500:]
+    assert re.search(r"^Envelock => " + re.escape(version) + r" / offline$", info.stdout, re.M), info.stdout
+    assert not re.search(r"\b\d+\.\d+\.\d+ / offline", info.stdout.replace(version + " / offline", "")), \
+        info.stdout
