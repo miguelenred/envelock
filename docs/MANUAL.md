@@ -1,4 +1,4 @@
-# Complete Envelock 1.1.0 manual
+# Complete Envelock 1.1.1 manual
 
 ## Table of contents
 

@@ -1,7 +1,7 @@
 # Envelock
 
 **Offline encoder and loader extension for PHP 8.2–8.5.**  
-Version **1.1.0** · Python + C + OpenSSL 3 · Apache-2.0 license.  
+Version **1.1.1** · Python + C + OpenSSL 3 · Apache-2.0 license.  
 Project page: **[miguelenred.es/envelock](https://miguelenred.es/envelock)** · Source: **[github.com/miguelenred/envelock](https://github.com/miguelenred/envelock)**
 
 Distribute PHP projects without shipping their files in readable text. A **generic** extension (with no embedded keys) verifies each file's signature, unwraps the content key with the recipient's private key, decrypts in memory and hands the result to PHP's normal compiler. The private key and the trusted signer are read from an external identity file pointed to by `envelock.identity` in `php.ini`. A single host can serve several projects from different folders, each encrypted with different keys.

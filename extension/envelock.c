@@ -2569,7 +2569,7 @@ zend_module_entry envelock_module_entry = {
     PHP_RINIT(envelock),
     PHP_RSHUTDOWN(envelock),
     PHP_MINFO(envelock),
-    "1.1.0",
+    "1.1.1",
     PHP_MODULE_GLOBALS(envelock),
     PHP_GINIT(envelock),
     PHP_GSHUTDOWN(envelock),

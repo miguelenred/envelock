@@ -6,13 +6,13 @@ binaries under `prebuilt/` are a convenience and are reproducible from `docs/BUI
 
 Date: 2026-11-18 (final 1.1.0 source and the rebuild of every binary; the records below are kept as history).
 
-## After 1.1.0: the memory guidance applied by the tools (2026-11-18/19, source only)
+## 1.1.1: the memory guidance applied by the tools (2026-11-18/19)
 
 `pack` now warns when Composer's `vendor/` goes into a package encrypted and states the memory ceiling of
 what it encrypted; `recommend` states the same estimate (command line and assistant; `CHANGELOG.md`,
-*Unreleased*). Encoder and assistant only: the loader (C) is unchanged, so the loaders in `prebuilt/` are
-unaffected. The assistants in `prebuilt/` (built 2026-11-17) predate the change and do not show the new
-notes until they are rebuilt.
+1.1.1). The loader's only change is its version string (1.1.1), so the 1.1.1 loaders are rebuilt from this
+source; until then the loaders in `prebuilt/` are the 1.1.0 ones. The assistants in `prebuilt/` (built
+2026-11-17) predate the change and do not show the new notes until they are rebuilt.
 
 | Where | Suite | Result |
 |---|---|---|

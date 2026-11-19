@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 — 2026-11-19 (memory guidance applied by the tools)
+
+No format change: packages, identity files and licences are those of 1.1, so 1.1.0 and 1.1.1 packages and
+loaders work together in both directions, and nothing has to be repacked. **The loader's only change is
+its version** (`php --ri envelock` and `phpinfo()` now say 1.1.1); updating it is optional.
 
 **Memory: the tools now apply the memory guidance themselves.** Protected files cannot be cached by
 OPcache, so each request compiles the ones it uses into its own memory, in every PHP worker. Measured on

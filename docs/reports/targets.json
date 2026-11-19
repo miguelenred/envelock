@@ -1,5 +1,5 @@
 {
-  "generated": "2026-11-19T07:39:42Z",
+  "generated": "2026-11-19T09:38:03Z",
   "format": "ENVLK02",
   "identity": "ENVLKID4",
   "environment": {
@@ -16,7 +16,7 @@
     "encoder/virtualize.php": "sha256:af816f10669a088c563f1fd117b07e128b6832a5c8d93e0956f507733af78125",
     "extension/config.m4": "sha256:8bf1a0f44ef422aff0f6ddcf7fdee3d659e7824d8274aead71256de8c5cf59af",
     "extension/config.w32": "sha256:2a0aaa46c12f0ecbab543a9b26b1ac3fc3d73b5b03466a20724eab6e3ecbe2c8",
-    "extension/envelock.c": "sha256:77f5de1ba53c8927a7d1987737038d514526a6c36ea5304545a6c31c71d1ce3e",
+    "extension/envelock.c": "sha256:75257807ffbd8d484f61733fdbe59af6b73ecbb06114fc560f3643015015292b",
     "extension/envelock_bc.h": "sha256:e75de394afed6f0d299070542beead3b057da53f5c6a40b53e5e5a1f9c515366",
     "extension/envelock_bcpoc.c": "sha256:67bbdfd57b8f6610345279d8c4acf385b6735efc7a2560848f1a0217405437cb",
     "extension/envelock_clock.c": "sha256:b63f7db5f16364d1eb8b1504a1b6f98d99336be2101b09dfdda8fa81e314a5c9",
