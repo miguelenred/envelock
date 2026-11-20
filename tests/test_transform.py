@@ -735,6 +735,41 @@ def test_obfuscate_flatten_function_that_falls_off_the_end_terminates(tmp_path):
     assert results[1] == results[0], (results[1], results[0])
 
 
+@needs_php
+def test_obfuscate_flatten_state_labels_are_a_random_permutation(tmp_path):
+    """The dispatch-loop state labels are a random permutation of 0..n-1, never the statement order
+    0,1,2,... (which would unflatten trivially): every pack is a valid routing and the order varies
+    across packs, while behaviour never changes. This is what makes the flattening worth applying."""
+    import re
+    source = (b"<?php\n"
+              b"function steps($x) {\n"
+              b"    $a = $x + 1;\n"
+              b"    $b = $a * 2;\n"
+              b"    $c = $b - 3;\n"
+              b"    $d = $c + $a;\n"
+              b"    $e = $d % 7;\n"
+              b"    return $a + $b + $c + $d + $e;\n"
+              b"}\n"
+              b"echo steps(5), \"\\n\";\n")
+    original = tmp_path / "original.php"
+    original.write_bytes(source)
+    want = run_php(original)
+    orders = set()
+    for _ in range(12):
+        out, stats = a._flatten_pass({"x.php": source}, PHP)
+        assert stats["flattened"] == 1, stats
+        body = out["x.php"]
+        labels = [int(m) for m in re.findall(rb"case (\d+):", body)]
+        assert sorted(labels) == list(range(len(labels))), labels   # a valid permutation of 0..n-1
+        assert len(labels) >= 6                                      # one case per statement
+        orders.add(tuple(labels))
+        changed = tmp_path / "changed.php"
+        changed.write_bytes(body)
+        assert run_php(changed) == want                             # behaviour never changes
+    assert len(orders) > 1                                           # the order is randomised, not fixed
+    assert any(list(o) != sorted(o) for o in orders)                # and not merely the sorted order
+
+
 def _run_with_vault_stub(tmp_path, source):
     """Run a vaulted source with a global __envelock_lit backed by its table (simulating the loader),
     and return its output. Mirrors how the C loader resolves \\__envelock_lit(idx)."""

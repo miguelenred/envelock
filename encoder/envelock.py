@@ -1987,7 +1987,12 @@ def protect(
     count = len(table) // RECIPIENT_SIZE
     if count > MAX_RECIPIENTS:
         raise ValueError("Too many recipients")
-    nonce = secrets.token_bytes(12) if file_nonce is None else file_nonce
+    # The content key also wraps vault data keys with a nonce whose top bit is SET
+    # (_vault_plaintext_encrypted); keep the file-body domain disjoint by clearing the top bit of a
+    # random default here, so a content-key nonce can never collide across the two domains even if a
+    # caller lets protect() pick the nonce. pack_tree already passes a small counter (top bit clear).
+    nonce = (bytes([secrets.token_bytes(1)[0] & 0x7F]) + secrets.token_bytes(11)) \
+        if file_nonce is None else file_nonce
     if len(nonce) != 12:
         raise ValueError("Incorrect file nonce")
     encoded_path = path.encode("utf-8")
@@ -3869,7 +3874,7 @@ echo json_encode($out);
 
 # Files emitted per PHP process in _bytecode_pass. Bounds the emitter's peak memory on large trees
 # (a single process emitting the whole tree runs out of memory); each process exits and frees between
-# batches. 500 emits fine within PHP's default memory on the CMSs tested.
+# batches. 500 emits fine within PHP's default memory on the applications tested.
 BYTECODE_BATCH = 500
 
 
@@ -3937,7 +3942,7 @@ def _bytecode_pass(files: dict[str, bytes], deploy_root: Path, php: str = "php",
             extra = ["-n", "-d", "memory_limit=-1", "-d", f"extension={loader}"]
         # Emit in batches, one PHP process per batch. Emitting every file in a single process
         # accumulates each compiled op_array in that process and runs out of memory on large trees
-        # (tens of thousands of files, e.g. a full CMS); a batch releases its memory when the
+        # (tens of thousands of files, e.g. a large application); a batch releases its memory when the
         # process exits. Each file compiles independently, so batching changes nothing in the output.
         images: dict[str, str] = {}
         items = list(paths.items())
@@ -4154,13 +4159,19 @@ foreach ($in["files"] as $name => $b64) {
         }
         if (!$ok) { $res["skipped"]['unexpected statement span'] = ($res["skipped"]['unexpected statement span'] ?? 0) + 1; continue; }
         $n = count($spans);
+        // Opaque state labels: a random permutation of 0..n-1, so the case values and the transitions
+        // between them do not reveal the statement order (sequential labels 0,1,2,... would unflatten
+        // trivially). Behaviour is unchanged — the labels only route the dispatch loop, and the switch
+        // matches a case wherever it sits — so the differential fuzzer stays the proof (O6).
+        $perm = range(0, $n - 1);
+        for ($k = $n - 1; $k > 0; $k--) { $j = mt_rand(0, $k); $tmp = $perm[$k]; $perm[$k] = $perm[$j]; $perm[$j] = $tmp; }
         for ($i = 0; $i < $n; $i++) {
             [$s, $e] = $spans[$i];
-            $label = ($i === 0 ? "$state=0;while(true){switch($state){" : "") . "case $i:";
+            $label = ($i === 0 ? "{$state}={$perm[0]};while(true){switch({$state}){" : "") . "case {$perm[$i]}:";
             $edits[] = [$s, 1, $seq++, $label];
             # The last segment leaves the whole dispatch loop: a plain `break` only leaves the switch and the
             # while would run the segment again (O6 regression, see test_obfuscate_flatten_function_that_falls_off_the_end_terminates).
-            $tail = $i === $n - 1 ? "break 2;default:break 2;}}" : "$state=" . ($i + 1) . ";break;";
+            $tail = $i === $n - 1 ? "break 2;default:break 2;}}" : "{$state}={$perm[$i + 1]};break;";
             $edits[] = [$e, 0, $seq++, $tail];
         }
         $res["flattened"]++;
@@ -5068,9 +5079,6 @@ COMPAT_PATTERNS = [
     ("source-tokenizer", re.compile(r"\btoken_get_all\s*\(|\bPhpToken\s*::\s*tokenize\s*\(", re.IGNORECASE),
      "tokenizes PHP source at run time (e.g. to build a class map). Ship the map/cache generated "
      "from a cleartext build, or exclude this file from encryption."),
-    ("file-header-reader", re.compile(r"\bget_file_data\s*\(", re.IGNORECASE),
-     "reads header comments from the file text (e.g. plugin/theme headers). Keep the file that "
-     "carries the header unencrypted (--exclude it)."),
     ("reads-own-source", re.compile(
         r"\b(?:php_strip_whitespace|highlight_file|show_source)\s*\(|"
         r"\b(?:file|file_get_contents|fopen|readfile)\s*\(\s*__FILE__|"
@@ -5078,25 +5086,21 @@ COMPAT_PATTERNS = [
         r"__COMPILER_HALT_OFFSET__", re.IGNORECASE),
      "reads its own source text at run time (its own file, or the data after __halt_compiler()). "
      "Exclude the file if that path is actually used."),
-    ("doctrine-annotation", re.compile(
-        r"^\s*(?:/\*\*|\*)\s*@(?:ORM|Route|Assert|Serializer|ApiResource|Groups|Embedded)\b"),
-     "mapping declared as a docblock ANNOTATION: the reader tokenizes the file's use-statements from "
-     "source, which an encrypted file no longer exposes. Use PHP 8 ATTRIBUTES (#[...], read via "
-     "reflection, unaffected by encryption), or ship a pre-generated metadata cache (warm it in the "
-     "clear, deploy it non-debug). Both are validated in docs/DEPLOYING-APPS.md."),
-    ("wp-file-header", re.compile(
-        r"^\s*(?:\*\s*)?(?:Plugin Name|Theme Name|Template Name|Slug)\s*:", re.IGNORECASE),
-     "a WordPress file header read from the file TEXT via get_file_data (a block pattern's 'Slug:', "
-     "or a plugin/theme/page-template header). Encryption hides the header, so WordPress stops "
-     "registering the pattern / recognising the plugin or template — on a block (FSE) theme the "
-     "templates then render empty. Keep these files unencrypted, e.g. "
-     "--exclude 'wp-content/themes/*/patterns/*'. Validated in docs/DEPLOYING-APPS.md."),
+    # A docblock ANNOTATION: a tag named like a class (capitalised, or namespaced), the PHP convention
+    # for annotations; PHPDoc's own tags are lower-case. Common upper-case markers are not annotations.
+    ("docblock-annotation", re.compile(
+        r"^\s*(?:/\*\*|\*)\s*@(?!(?:TODO|FIXME|XXX|HACK|NOTE|BUG)\b)[A-Z]\w*"),
+     "configuration declared as a docblock ANNOTATION (@Name or @Name(...)): an annotation reader "
+     "resolves the class names it uses from the file's use-statements, which it reads from the SOURCE, "
+     "and an encrypted file no longer exposes it. Use PHP 8 ATTRIBUTES (#[...], read via reflection, "
+     "unaffected by encryption), or ship a pre-generated metadata cache (warm it in the clear, deploy "
+     "it non-debug). Both are validated in docs/DEPLOYING-APPS.md."),
     ("reads-own-docblock", re.compile(r"\bgetDocComment\s*\(", re.IGNORECASE),
      "reads its own docblock comments at run time via Reflection getDocComment() (e.g. a custom "
-     "annotation such as PrestaShop's @arrayAccess on a LazyArray presenter). Plain encryption KEEPS "
-     "docblocks, so this is safe on a base pack — but --strip-comments and --compact REMOVE them, so "
-     "the annotation vanishes and the code silently misbehaves (on PrestaShop the front-office product "
-     "data stops rendering, HTTP 200 with the section simply absent). Do not use --strip-comments / "
+     "annotation that changes how a class behaves). Plain encryption KEEPS docblocks, so this is safe "
+     "on a base pack — but --strip-comments and --compact REMOVE them, so the annotation vanishes and "
+     "the code silently misbehaves (measured: a page section stopped rendering, HTTP 200 with the "
+     "section simply absent). Do not use --strip-comments / "
      "--compact on a tree that contains this, or --exclude the affected files. "
      "Validated in docs/DEPLOYING-APPS.md."),
     ("line-number-logic", re.compile(r"__LINE__|\bgetLine\s*\(|\bgetTrace(?:AsString)?\s*\("),
@@ -5109,17 +5113,17 @@ COMPAT_PATTERNS = [
 
 # Categories whose findings are destroyed specifically by --strip-comments / --compact (they remove
 # the docblocks/comments those patterns rely on). Used for the active pack-time warning.
-_COMMENT_SENSITIVE_CATEGORIES = frozenset({"doctrine-annotation", "wp-file-header", "reads-own-docblock"})
+_COMMENT_SENSITIVE_CATEGORIES = frozenset({"docblock-annotation", "reads-own-docblock"})
 # Categories broken by --compact ALONE (it renumbers lines; --strip-comments keeps them). Line-number
 # logic is safe under plain encryption and --strip-comments but not under --compact (audit C-28).
 _COMPACT_SENSITIVE_CATEGORIES = frozenset({"line-number-logic"})
 
-# Categories whose evidence lives in a COMMENT, not in code: a plugin/theme header and a Doctrine
-# docblock annotation. When a token-based scan is available (below) these are matched only against the
-# file's comment text, so a PHP 8 NAMED ARGUMENT like f(slug: $x) is no longer mistaken for a
-# WordPress 'Slug:' header (audit 2026-11, C-01). Every other category is matched against code text,
-# so eval()/FFI/token_get_all/getDocComment written inside a comment or a string no longer misfire.
-_COMMENT_TEXT_CATEGORIES = frozenset({"doctrine-annotation", "wp-file-header"})
+# Categories whose evidence lives in a COMMENT, not in code: a docblock annotation. When a token-based
+# scan is available (below) it is matched only against the file's comment text, so the same text in
+# code or in a string ('@Name' in an e-mail template, an error message) no longer misfires (audit
+# 2026-11, C-01). Every other category is matched against code text, so eval()/FFI/token_get_all/
+# getDocComment written inside a comment or a string no longer misfire.
+_COMMENT_TEXT_CATEGORIES = frozenset({"docblock-annotation"})
 
 # A PHP program that classifies each byte of every file as code, comment or string using the real
 # tokenizer, and returns two masked copies per file: `code` (comment and string text blanked to
@@ -5250,8 +5254,7 @@ def format_compatibility_report(findings: dict, max_examples: int = 6) -> str:
 # Categories whose files break under ANY encryption (the code reads its own SOURCE TEXT at run time),
 # so the file must stay cleartext (--exclude) or be re-architected (PHP 8 attributes / a warmed cache).
 _ENCRYPTION_BREAKING_CATEGORIES = frozenset({
-    "source-tokenizer", "file-header-reader", "reads-own-source",
-    "doctrine-annotation", "wp-file-header"})
+    "source-tokenizer", "reads-own-source", "docblock-annotation"})
 # Run-time string compilation --sealed refuses while active: recommending --sealed over such a tree
 # would break it. assert('string') compiles its argument; create_function() is an eval() wrapper.
 # Case-insensitive (PHP keywords/functions are), and DOTALL so `eval\n(...)` split across lines is
@@ -5273,12 +5276,22 @@ def _tree_uses_runtime_compile(source: Path, extensions: set, skip_top: frozense
 # FFI or dl() used by the project itself: --no-ffi refuses to load while either is reachable, so a
 # project that needs them cannot use it. `\FFI::cdef`, `FFI\CData`, `dl('x.so')`; not `->dl(`/`::dl(`.
 _FFI_RE = re.compile(r"\bFFI\s*(?:::|\\)|(?<![\w$>:])\\?dl\s*\(", re.IGNORECASE)
-# Laravel Blade templates: .php files the framework READS AS TEXT and compiles into its view cache.
-# Encrypted, the compiler gets the container instead of the template (and bytecode has no text at all).
-_TEMPLATE_SUFFIXES = (".blade.php",)
-# Run-time caches of the common frameworks: regenerated on the server, never part of the asset
-# (MANUAL §14). Each is recommended for exclusion only when it exists in the tree.
-_RUNTIME_CACHE_DIRS = ("bootstrap/cache", "storage/framework", "var/cache")
+
+
+def _files_without_php_code(source: Path, files: list) -> list[str]:
+    """Files with a PHP extension that hold no PHP code at all: not one `<?` in them (no <?php, no <?=,
+    no short tag). There is nothing in such a file to protect, and what reads it is a template engine
+    that takes its TEXT (an encrypted one hands it the container; a bytecode image has no text at all),
+    so it is kept cleartext. A generic rule: it names no framework and needs none."""
+    found = []
+    for rel in files:
+        try:
+            data = (source / rel).read_bytes()
+        except OSError:
+            continue
+        if b"<?" not in data:
+            found.append(rel)
+    return sorted(found)
 
 
 def _tree_matches(source: Path, extensions: set, pattern, skip_top: frozenset = frozenset(),
@@ -5305,7 +5318,7 @@ def _tree_matches(source: Path, extensions: set, pattern, skip_top: frozenset = 
 
 
 # Memory a protected file's compiled code takes per byte of its source, measured (docs/VERIFICACION.md,
-# 'Measured memory'): Laravel 13.43's framework code under PHP-FPM 8.4 (549 files, 6.3 MB of source,
+# 'Measured memory'): a large framework's code under PHP-FPM 8.4 (549 files, 6.3 MB of source,
 # 21 MB more per request than with OPcache: 3.4x) and a dense generated project (11.0 MB -> 102 MB: 9.3x).
 _COMPILED_PER_SOURCE_BYTE = (3, 9)
 
@@ -5341,8 +5354,8 @@ def _extra_mb_phrase(protected_bytes: int) -> str:
 
 def recommend_options(source: Path, extensions: set, masks: dict | None = None) -> dict:
     """Analyse the tree and recommend the STRONGEST protection that measurement shows is SAFE for it,
-    turning OFF only what would break THIS project. Grounded in the four-CMS matrix and the preflight
-    detectors (docs/DEPLOYING-APPS.md): it never recommends an option known to break the project.
+    turning OFF only what would break THIS project. Grounded in the measured application matrix and the
+    generic preflight detectors (docs/DEPLOYING-APPS.md): it never recommends an option known to break the project.
     Every pack option is accounted for: in `on` (and also in `verify` when it may or may not work here
     — it depends on the server or on code the static analysis cannot see — with why and how to check),
     or in `off` with the reason it is not recommended.
@@ -5354,8 +5367,8 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
     exclude_patterns: list[str] = []
     # Composer dependencies: the documented layout is to encrypt only the application's own code and
     # deploy vendor/ separately (MANUAL §14: OPcache keeps caching it, and a protected file costs a
-    # decrypt + compile per request). Third-party code also trips the source-reading detectors
-    # (Blade's compiler tokenizes TEMPLATES, not itself) and would wrongly switch options off.
+    # decrypt + compile per request). Third-party code also trips the source-reading detectors (a
+    # template compiler tokenizes TEMPLATES, not itself) and would wrongly switch options off.
     skip_top: frozenset = frozenset()
     if (source / "vendor" / "autoload.php").is_file():
         skip_top = frozenset({"vendor"})
@@ -5364,27 +5377,14 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
                      "deploy it next to the package yourself (composer install --no-dev "
                      "--optimize-autoloader on the server, or a copy from your clean build). Encrypting it "
                      "would cost a decrypt and compile per request for code that is not yours to hide.")
-    for cache in _RUNTIME_CACHE_DIRS:
-        if (source / cache).is_dir():
-            exclude_patterns.append(cache + "/*")
-    if any(p.endswith("/*") and p != "vendor/*" for p in exclude_patterns):
-        notes.append("Run-time cache folders (" + ", ".join(p[:-2] for p in exclude_patterns
-                                                           if p != "vendor/*") +
-                     ") are regenerated on the server and are not packed; they must still exist and be "
-                     "writable there.")
     findings = compatibility_findings(source, extensions, skip_top, masks=masks)
-    for cache in _RUNTIME_CACHE_DIRS:
-        for data in findings.values():
-            data["hits"] = [h for h in data["hits"] if not h[0].startswith(cache + "/")]
-    findings = {c: d for c, d in findings.items() if d["hits"]}
     comment_sensitive = {c: d for c, d in findings.items() if c in _COMMENT_SENSITIVE_CATEGORIES}
     compact_sensitive = {c: d for c, d in findings.items() if c in _COMPACT_SENSITIVE_CATEGORIES}
     encryption_breaking = {c: d for c, d in findings.items() if c in _ENCRYPTION_BREAKING_CATEGORIES}
     eval_hits = _tree_uses_runtime_compile(source, extensions, skip_top, masks=masks)
     ffi_hits = _tree_matches(source, extensions, _FFI_RE, skip_top, masks=masks)
     scanned = [p.relative_to(source).as_posix() for p in _scanned_files(source, extensions, skip_top)]
-    scanned = [p for p in scanned if not any(p.startswith(c + "/") for c in _RUNTIME_CACHE_DIRS)]
-    templates = sorted(p for p in scanned if p.lower().endswith(_TEMPLATE_SUFFIXES))
+    templates = _files_without_php_code(source, scanned)
     entry_scripts = _cleartext_php_entry_points(source, skip_top)
     other_php = _php_in_other_extensions(source, extensions, skip_top)
     if other_php:
@@ -5400,30 +5400,25 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
     off: dict[str, str] = {}
     verify: dict[str, str] = {}
     exclude = {c: sorted({h[0] for h in d["hits"]}) for c, d in encryption_breaking.items()}
-    # Composer libraries that read TYPE information from @var/@param docblocks of the application's
-    # classes at run time (Symfony's PropertyInfo/Serializer through phpDocumentor): the docblock
-    # detectors look only at the application's own code, so they cannot see this use.
-    docblock_readers = [name for name in ("phpdocumentor/reflection-docblock", "symfony/property-info")
-                        if (source / "vendor" / name).is_dir()]
     if templates:
-        # Templates are not code to hide (markup plus echo); they are kept cleartext and do NOT stop
-        # --bytecode for the rest, unlike the files below that read their own source.
-        exclude["template-source"] = templates
-        notes.append("Blade templates (*.blade.php) are read as TEXT and compiled by Laravel into its "
-                     "view cache: keep them cleartext (they are in the cleartext list and must be deployed "
-                     "as they are).")
-    # Byte-identical on all four CMSs measured — the balanced hardening core.
+        # No PHP code, so nothing to hide; kept cleartext, and they do NOT stop --bytecode for the
+        # rest, unlike the files below that read their own source.
+        exclude["no-php-code"] = templates
+        notes.append("Some files have a PHP extension but contain no PHP code (not one <? tag): there "
+                     "is nothing in them to protect, and a template engine may read them as TEXT, so "
+                     "they are in the cleartext list and must be deployed as they are.")
+    # Byte-identical on every application measured — the balanced hardening core.
     on += ["--encode-strings", "--obfuscate", "--obfuscate-flow", "--obfuscate-methods"]
     verify["--obfuscate-methods"] = (
-        "very probably fine (it skips every dynamic call it can see, and was byte-identical on four "
-        "CMSs), but a private method reached through a name built at run time (e.g. "
+        "very probably fine (it skips every dynamic call it can see, and was byte-identical on every "
+        "application measured), but a private method reached through a name built at run time (e.g. "
         "[$this, 'on' . $event] or a string handed to a callback) would break. Check: test the parts of "
         "the app that dispatch by name; if one breaks, drop this option")
     # include protection: a protected file refuses to load unless a protected file of the same project
     # is already on the call stack, or it is the entry script. Recommend turning it OFF whenever
     # anything in THIS recommendation would run project code with no protected frame on the stack. Only
-    # cross-checking the extensionless entry point and vendor/ (not every cleartext .php, a Composer app
-    # whose vendor/ is absent, or a WordPress plugin) was audit 2026-11 C-04; H-03 is the vendor/ case.
+    # cross-checking the extensionless entry point and vendor/ (not every cleartext .php, or a Composer
+    # app whose vendor/ is absent) was audit 2026-11 C-04; H-03 is the vendor/ case.
     cleartext_php_now = sorted({h[0] for d in encryption_breaking.values() for h in d["hits"]
                                 if h[0].lower().endswith(".php")})
     ip_off = []
@@ -5444,9 +5439,6 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
         ip_off.append("some .php must stay cleartext (e.g. " + cleartext_php_now[0] + ", which reads its "
                       "own source), and such a file cannot share the include-protection call stack with "
                       "the protected ones")
-    if "wp-file-header" in findings:
-        ip_off.append("this looks like a WordPress plugin/theme, which an unprotected WordPress core "
-                      "loads directly")
     if ip_off:
         off["--include-protection"] = (
             "; ".join(ip_off) + ". Under include protection the request dies with "
@@ -5475,17 +5467,14 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
     on.append("--no-prepend")
     verify["--no-prepend"] = (
         "depends on the server: auto_prepend_file and auto_append_file must be empty there, and some "
-        "hosting security or monitoring agents set one (Wordfence's firewall, for instance); otherwise the "
+        "hosting security or monitoring agents set one (a web application firewall, for instance); otherwise the "
         "package refuses to load. Check: run scripts/envelock-preflight.php on the server")
-    # strip-comments: only when nothing reads its own docblocks/comments at run time (PrestaShop's
-    # AbstractLazyArray did, so this broke it — four-CMS matrix). --strip-comments KEEPS line numbers.
+    # strip-comments: only when nothing reads its own docblocks/comments at run time (a measured
+    # application did, and it broke). --strip-comments KEEPS line numbers.
     docblock_why = ("no code here reads its own docblocks in a way the analysis knows (annotations, "
-                    "getDocComment(), file headers), but a library can read the application's "
-                    "@var/@param docblocks for type information at run time")
-    if docblock_readers:
-        docblock_why += (" — and this project has one (" + ", ".join("vendor/" + n for n in docblock_readers) +
-                         ", used e.g. by Symfony's serializer and forms): with the comments gone it can "
-                         "silently change how data is (de)serialised")
+                    "getDocComment()), but a library can read the application's @var/@param docblocks "
+                    "for type information at run time (serialisers, validators, form builders): with "
+                    "the comments gone it can silently change how data is (de)serialised")
     if comment_sensitive:
         files = sorted({h[0] for d in comment_sensitive.values() for h in d["hits"]})
         off["--strip-comments"] = ("the tree reads its own docblocks/comments at run time (" +
@@ -5517,7 +5506,7 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
                                               "(a cache key, an error map) would change. Check: test "
                                               "those paths; if anything changes, drop it")
         notes.append("--compact collapses each file's lines: error messages, stack traces and listings "
-                     "that show source positions (e.g. `artisan route:list`) report the collapsed line "
+                     "that show source positions (e.g. a console command listing routes) report the collapsed line "
                      "numbers, and any code that uses the line number as DATA (a 'build-'.__LINE__ cache "
                      "key, an error map keyed by getLine()) changes value. Leave it off if you need "
                      "production line numbers or use them as logic.")
@@ -5529,8 +5518,8 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
         cleartext_php.insert(0, "vendor/")
     if eval_hits:
         off["--sealed"] = ("the tree uses eval()/create_function()/assert('...') (e.g. " + eval_hits[0] +
-                           "), which --sealed refuses while active (this is why it broke WordPress and "
-                           "PrestaShop)")
+                           "), which --sealed refuses while active (this is what broke it on the "
+                           "applications measured)")
     elif cleartext_php:
         off["--sealed"] = ("this project keeps some .php cleartext under the tree (e.g. " + cleartext_php[0] +
                            "), and --sealed refuses cleartext .php under the tree. Use it only if you can "
@@ -5544,10 +5533,10 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
             "PHP into, then test every page and command; if the app ships or writes cleartext .php you "
             "cannot allowlist, drop --sealed")
     # --bytecode ships NO PHP source at all — the strongest protection, and measured byte-identical on
-    # all four CMSs. It is now part of the production toolchain: the shipped server loaders include the
+    # every application measured. It is now part of the production toolchain: the shipped server loaders include the
     # bytecode layer, and the packer emits with a bc-emit build. Recommend it when the project is
     # compatible — i.e. no file needs to keep its own SOURCE, because a bytecode image has no source for
-    # such a file to read (the source-reading part of the `exclude` set; templates kept cleartext do not
+    # such a file to read (the source-reading part of the `exclude` set; files without PHP code do not
     # count). It binds the package to its exact deploy path and PHP build, so it also needs --deploy-root
     # (ENV-2026-12, re-enabled after integration).
     if encryption_breaking:
@@ -5576,17 +5565,27 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
             "have none); (4) --deploy-root is the absolute path the app will run from. Check: "
             "scripts/envelock-preflight.php on the server shows its PHP version and thread safety. If any "
             "of these does not hold, drop --bytecode (and consider --sealed instead)")
-    # Never auto-recommend: HIGH-RISK or whole-tree-impractical options (they broke CMSs when measured).
+    # Never auto-recommend: HIGH-RISK or whole-tree-impractical options (they broke applications when
+    # measured).
     off["--obfuscate-properties"] = ("HIGH RISK: renaming private properties breaks the Composer "
                                      "autoloader and object serialisation (sessions/caches) — it broke "
-                                     "every CMS measured (HTTP 500). Only for a self-contained app you "
+                                     "every application measured (HTTP 500). Only for a self-contained app you "
                                      "can test exhaustively and that never serialises those objects.")
     off["--vault-strings"] = ("impractical on a whole large tree (did not finish on 13.6 k files) and "
                               "incompatible with --bytecode; use it per-file on a small hot module.")
-    off["--obfuscate-flatten"] = (
-        "experimental and not part of the four-CMS measurement: it MAY well work here (statement text and "
-        "line numbers are kept, unsafe bodies are left alone), but it adds a dispatch loop to every call. "
-        "Try it yourself and compare the packaged app with the original, pages and timings.")
+    # Control-flow flattening: safe by construction (every statement keeps its own text and line, a body
+    # that could observe the frame is left exactly as written, and the result is re-parsed before it is
+    # shipped), and the differential fuzzer proves behaviour is unchanged. It is the strongest
+    # obfuscation that does not risk the execution, so recommend enables it; its one cost is speed (a
+    # dispatch loop per function), named in the check note.
+    on.append("--obfuscate-flatten")
+    verify["--obfuscate-flatten"] = (
+        "it keeps every statement's text and line and leaves a function that could observe its own frame "
+        "(generators, compact/extract/get_defined_vars, dynamic variables, include/eval, goto, inline "
+        "HTML) exactly as written, and the differential fuzzer shows behaviour is unchanged — so it is "
+        "safe, but it wraps each remaining function in a dispatch loop, which costs some speed. Check: "
+        "compare the packaged app against the original (pages and timings); drop it only if the cost "
+        "matters more than the stronger control-flow hiding")
     off["--obfuscate-names"] = (
         ("not for this project: it renames classes and functions across files, and Composer/PSR-4 "
          "autoloading finds classes by their names, so renamed ones are no longer found."
@@ -5602,7 +5601,7 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
 
     # Memory sizing (docs/RENDIMIENTO.md, 'Memory, and large projects'): OPcache cannot cache protected
     # files, so each request compiles the protected files it uses into its own memory, in every PHP
-    # worker. Give the order of magnitude from what THIS recommendation encrypts (vendor/, caches and the
+    # worker. Give the order of magnitude from what THIS recommendation encrypts (vendor/ and the
     # cleartext list are not in it), with the measured ratio, and how to measure the real figure.
     cleartext = {f for files in exclude.values() for f in files}
     protected_paths = [p for p in scanned if p not in cleartext]
@@ -5614,9 +5613,9 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
             f"{_size(protected_bytes)} of source. OPcache cannot cache protected files, so each "
             "request compiles the ones it uses into its own memory, in every PHP worker: a request that "
             f"loaded all of them would need {_extra_mb_phrase(protected_bytes)} more than with OPcache "
-            "(compiled code measured at about 3x its source size on Laravel 13's framework code and 9x on "
+            "(compiled code measured at about 3x its source size on a large framework's code and 9x on "
             "dense generated code; docs/VERIFICACION.md)." +
-            (" Leaving vendor/ out is what keeps this small: on a Laravel 13 app, protecting only the "
+            (" Leaving vendor/ out is what keeps this small: on a measured framework app, protecting only the "
              "application's code measured about 1 MB per request, the same as unprotected; protecting "
              "vendor/ too, 22 MB." if "vendor/*" in exclude_patterns else "") +
             " Size memory_limit and the number of PHP workers (pm.max_children) from a real protected "
@@ -5634,7 +5633,7 @@ def recommend_options(source: Path, extensions: set, masks: dict | None = None) 
 
 
 def _cleartext_php_entry_points(source: Path, skip_top: frozenset = frozenset()) -> list[str]:
-    """Extensionless PHP scripts (artisan, bin/console, cron scripts with a php shebang): pack only
+    """Extensionless PHP scripts (console scripts, cron scripts with a php shebang): pack only
     encrypts files with a PHP extension, so these stay cleartext entry points."""
     found: list[str] = []
     def skip(rel: Path) -> bool:
@@ -5656,8 +5655,8 @@ def _cleartext_php_entry_points(source: Path, skip_top: frozenset = frozenset())
 
 
 def _php_in_other_extensions(source: Path, extensions: set, skip_top: frozenset = frozenset()) -> list[str]:
-    """Files whose EXTENSION is not in the PHP set but whose content starts with `<?php` (Drupal's
-    .module/.install, a .dist template, etc.). pack neither encrypts them (wrong extension) nor copies
+    """Files whose EXTENSION is not in the PHP set but whose content starts with `<?php` (a .module or
+    .install file, a .dist template, etc.). pack neither encrypts them (wrong extension) nor copies
     them (not an --asset), so they go missing on the server unless added with --php-ext (C-03)."""
     found: list[str] = []
     php_ext = {e.lower() for e in extensions}
@@ -6496,8 +6495,8 @@ def main() -> int:
                       "and keep the folder unwritable by the web server (docs/SEGURIDAD.md).",
                       file=sys.stderr)
             # --strip-comments / --compact physically REMOVE docblocks. Code that reads its own
-            # docblocks at run time (custom annotations such as PrestaShop's @arrayAccess, Doctrine
-            # @ORM, WP file headers) then silently misbehaves with no pack-time error. This is the one
+            # docblocks at run time (custom annotations, docblock annotations read by an annotation
+            # reader) then silently misbehaves with no pack-time error. This is the one
             # flag combination that can corrupt a tree invisibly, so actively scan and warn for it.
             if args.strip_comments or args.compact:
                 warn_masks = (_php_code_comment_masks(args.php, args.source, extensions)

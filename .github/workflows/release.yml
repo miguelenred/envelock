@@ -1,0 +1,200 @@
+name: Release build (PIE loaders, tested and attested)
+# Builds the 13 PIE loaders of a release from its source on GitHub's runners, tests each one against its
+# PHP, packs the PIE assets and ATTESTS every binary and every asset: a signed record of the workflow,
+# commit and run that produced the file, checkable by anyone with
+#   gh attestation verify <file> --repo miguelenred/envelock
+# Linux: the portable build of docs/PLATAFORMAS.md (AlmaLinux 8 = glibc 2.28, gcc 8.5, OpenSSL 3.5.9 linked
+# in, PHP from the php.net tarball; every download checked against its published SHA-256). Windows:
+# scripts/build-windows.ps1 with the pinned official builder. It runs on every release tag and by hand;
+# it never publishes: the maintainer checks the artifact and attaches it to the GitHub Release.
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: 8.2-nts
+            php: '8.2.36'
+            sha256: df50a00d2b453096608bf2bd98a9fab9a3df8678a77b93011b65c3cfe9a018fa
+            zts: ''
+          - variant: 8.3-nts
+            php: '8.3.37'
+            sha256: 0237af84478b7a7649d3964153f1b8653d622550b846f56d63062de683fb86bb
+            zts: ''
+          - variant: 8.4-nts
+            php: '8.4.28'
+            sha256: 0c8ec360e5dd8154f270b2fd50cd44ecc824e6ee39c85f911312b80d4daecd72
+            zts: ''
+          - variant: 8.4-zts
+            php: '8.4.28'
+            sha256: 0c8ec360e5dd8154f270b2fd50cd44ecc824e6ee39c85f911312b80d4daecd72
+            zts: '--enable-zts'
+          - variant: 8.5-nts
+            php: '8.5.13'
+            sha256: 607602acaf0c3061818e9916ec44a058e8b3d43959a83862b9cd3ec7bf5b785f
+            zts: ''
+    runs-on: ubuntu-24.04
+    container: almalinux:8.10@sha256:768bedc30fe0a536adb0a65d2eddb7caad364e514fbddd0ae9e026975f590342
+    timeout-minutes: 120
+    steps:
+      - name: Toolchain (AlmaLinux 8.10, gcc 8.5, glibc 2.28)
+        run: >-
+          dnf -y -q install gcc make autoconf pkgconf-pkg-config perl perl-IPC-Cmd perl-Pod-Html
+          perl-Time-Piece openssl-devel xz tar git findutils file binutils diffutils which
+          python3.12 python3.12-pip
+      - name: Give the container a machine identity (a real server has one)
+        # The loader's machine-bound-licence test expects this host to HAVE an identity (it reads
+        # /etc/machine-id on Linux); a bare container has none, so the test would see "no machine
+        # identity" instead of the "different machine" refusal it asserts. Write a stable id, exactly
+        # as a provisioned server carries one. Does not affect the shipped loader (no keys, no binding).
+        run: cat /proc/sys/kernel/random/uuid | tr -d - > /etc/machine-id
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: OpenSSL 3.5.9, static and position-independent (docs/PLATAFORMAS.md)
+        working-directory: /tmp
+        run: |
+          curl -fsSL -o openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          echo "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl.tar.gz" | sha256sum -c -
+          tar -xzf openssl.tar.gz
+          cd openssl-3.5.9
+          ./Configure linux-x86_64 no-shared no-module no-engine no-autoload-config no-tests no-docs -fPIC \
+            --prefix=/opt/envelock-openssl --openssldir=/etc/envelock-openssl --libdir=lib > /dev/null
+          make -j4 build_libs > /dev/null
+          make install_dev > /dev/null
+      - name: PHP ${{ matrix.php }} ${{ matrix.zts }} from the php.net tarball
+        working-directory: /tmp
+        run: |
+          curl -fsSL -o php.tar.xz "https://www.php.net/distributions/php-${{ matrix.php }}.tar.xz"
+          echo "${{ matrix.sha256 }}  php.tar.xz" | sha256sum -c -
+          tar -xf php.tar.xz
+          cd "php-${{ matrix.php }}"
+          ./configure --prefix=/opt/php --disable-all --enable-cli --disable-cgi --enable-fpm \
+            --disable-phpdbg --enable-opcache --disable-opcache-jit --enable-tokenizer --enable-ctype \
+            --enable-posix --enable-pcntl --enable-filter --with-openssl ${{ matrix.zts }} > /dev/null
+          make -j4 > /dev/null
+          make install > /dev/null
+          /opt/php/bin/php -v
+      - name: Loader (portable build; refused if it needs a newer glibc or a system OpenSSL)
+        run: >-
+          PHP=/opt/php/bin/php PHPIZE=/opt/php/bin/phpize PHP_CONFIG=/opt/php/bin/php-config
+          ENVELOCK_OPENSSL_STATIC=/opt/envelock-openssl ENVELOCK_MAX_GLIBC=2.28 ENVELOCK_JOBS=4
+          bash scripts/build-unix.sh "out/linux-x86_64/php-${{ matrix.variant }}/envelock.so"
+      - name: tests/test_native.py against the built loader (throwaway identity)
+        run: |
+          python3.12 -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install -q --require-hashes -r requirements.lock
+          mkdir -p /tmp/keys
+          /tmp/venv/bin/python encoder/envelock.py init-owner --no-encrypt --out /tmp/keys/owner.json
+          /tmp/venv/bin/python encoder/envelock.py init-recipient --no-encrypt --label ci-release --out /tmp/keys/recipient.json
+          export PATH="/opt/php/bin:$PATH" PKG_CONFIG_PATH=/opt/envelock-openssl/lib/pkgconfig \
+            PKG_CONFIG="pkg-config --static" LDFLAGS="-Wl,--exclude-libs,ALL" ENVELOCK_REQUIRE_NATIVE=1 \
+            ENVELOCK_TEST_EXTENSION="$PWD/out/linux-x86_64/php-${{ matrix.variant }}/envelock.so" \
+            ENVELOCK_TEST_OWNER=/tmp/keys/owner.json ENVELOCK_TEST_RECIPIENT=/tmp/keys/recipient.json
+          /tmp/venv/bin/python -m pytest -q -p no:cacheprovider tests/test_native.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loader-linux-${{ matrix.variant }}
+          path: out/
+          if-no-files-found: error
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+        thread: [nts, ts]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Fetch pinned official Windows builder
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          repository: php/php-windows-builder
+          ref: 5f63433eb2bda2ca8d0d970fe487be84f7ab195c
+          path: _builder
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - name: Build the DLL and run tests/test_native.py on it (throwaway identity)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/keys" | Out-Null
+          python encoder/envelock.py init-owner --no-encrypt --out "$env:RUNNER_TEMP/keys/owner.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Throwaway owner failed' }
+          python encoder/envelock.py init-recipient --no-encrypt --label ci-release --out "$env:RUNNER_TEMP/keys/recipient.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Throwaway recipient failed' }
+          Import-Module "$env:GITHUB_WORKSPACE/_builder/extension/BuildPhpExtension/BuildPhpExtension.psm1" -Force
+          ./scripts/build-windows.ps1 -Owner "$env:RUNNER_TEMP/keys/owner.json" -Recipient "$env:RUNNER_TEMP/keys/recipient.json" -PhpVersion '${{ matrix.php }}' -ThreadSafety '${{ matrix.thread }}' -OutputDirectory "$env:RUNNER_TEMP/built"
+          $target = "out/windows-x64/php-${{ matrix.php }}-${{ matrix.thread }}"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/built/php_envelock.dll" $target
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loader-windows-${{ matrix.php }}-${{ matrix.thread }}
+          path: out/
+          if-no-files-found: error
+
+  package:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: loader-*
+          path: stage/prebuilt/loader
+          merge-multiple: true
+      - name: Check the version and stage the loaders (prebuilt/ layout and SHA256SUMS)
+        run: |
+          version=$(sed -nE 's/^#define PHP_ENVELOCK_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' extension/php_envelock.h)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match PHP_ENVELOCK_VERSION $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          cd stage/prebuilt
+          find loader -type f | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 13 ] || { echo "expected 13 loaders"; exit 1; }
+          while read -r _ file; do
+            grep -aqF "$version / offline" "$file" || { echo "$file does not carry version $version"; exit 1; }
+          done < SHA256SUMS
+      - name: Pack the PIE assets
+        run: |
+          python scripts/package-pie-assets.py --version "$VERSION" --prebuilt stage/prebuilt --out dist/pie
+          ( cd dist/pie && sha256sum -c SHA256SUMS )
+      - name: Attest every loader and every PIE asset
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            stage/prebuilt/loader/**/envelock.so
+            stage/prebuilt/loader/**/php_envelock.dll
+            dist/pie/*.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: envelock-${{ env.VERSION }}-release
+          path: |
+            dist/pie/
+            stage/prebuilt/
+          if-no-files-found: error

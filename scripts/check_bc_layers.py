@@ -24,6 +24,26 @@ HEADER_REQUIRED = [
     "static size_t envelock_fc_size;",
     "#define ENVELOCK_BOUND_COUNT(p, count)",
     "#define ENVELOCK_FC_EXTENT(p, bytes)",
+    # Fuzzing, Nov 2026 (UBSan): offsets must be aligned, an initialized table must have data, and a
+    # special AST node never reaches zend_ast_get_num_children().
+    "#define ENVELOCK_FC_ALIGNED(offset)",
+    # Ownership (fuzzing Nov 2026): every structure the image allocated is claimed; overlaps refused.
+    "static void envelock_fc_claim(const void *p, size_t bytes, uint32_t kind)",
+    'ENVELOCK_FC_FAIL("structures overlap");',
+    "envelock_fc_owner = ecalloc(",
+    # one byte per granule: its owner's kind, ENVELOCK_FC_START on the owner's first granule
+    "#define ENVELOCK_FC_START 0x80",
+    "} else if (UNEXPECTED(owner[first] != head)) {",
+    "} else if (UNEXPECTED(owner[g] != body)) {",
+    "ENVELOCK_FC_CLAIM(s, _ZSTR_HEADER_SIZE + ZSTR_LEN(s) + 1, ENVELOCK_FC_K_STRING);",
+    "ENVELOCK_FC_CLAIM(data, data_size, ENVELOCK_FC_K_TABLE_DATA);",
+    'ENVELOCK_FC_FAIL("hash table without data");',
+    'ENVELOCK_FC_FAIL("special node in a constant expression");',
+    'ENVELOCK_FC_FAIL("hash table data overlaps the table");',
+    'ENVELOCK_FC_FAIL("enum table in the image");',
+    # every function and class carries the name and file the install step reads unchecked
+    "static zend_always_inline void envelock_fc_check_op_array_names(",
+    'ENVELOCK_FC_FAIL("class without a name or a file");',
     "static zend_never_inline void envelock_fc_check_stack(void)",
     "zend_call_stack_overflowed(EG(stack_limit))",
     "static zend_always_inline void envelock_fc_check_string(zend_string *s)",
@@ -38,6 +58,15 @@ HEADER_REQUIRED = [
     "envelock_fc_optype_ok(opline->op1_type)",
     "static void envelock_fc_set_handlers(zend_op_array *op_array)",
     "ZEND_VM_SET_OPCODE_HANDLER(",
+    # BC-16: every branch target must land on an aligned, in-range opline of this op_array
+    "static zend_always_inline void envelock_fc_require_opline(const zend_op_array *op_array, const void *target)",
+    'ENVELOCK_FC_FAIL("jump target outside the opcode array");',
+    "static void envelock_fc_check_jumptable(const zend_op_array *op_array, const zend_op *opline)",
+    'ENVELOCK_FC_FAIL("switch/match jump table entry is not an offset");',
+    "static void envelock_fc_check_jumps(const zend_op_array *op_array)",
+    "OP_JMP_ADDR(opline, opline->op1)",
+    "ZEND_OFFSET_TO_OPLINE(opline, opline->extended_value)",
+    "\tenvelock_fc_check_jumps(op_array);\n\tfor (; opline < end; opline++) {",
     # C-05: every call made generic before its handler is chosen (DO_UCALL on an internal callee crashed)
     "static zend_always_inline void envelock_fc_generic_call(zend_op *opline)",
     "opline->opcode == ZEND_DO_UCALL || opline->opcode == ZEND_DO_ICALL",
@@ -61,31 +90,40 @@ FILE_CACHE_REQUIRED = [
     ('#include "../envelock_bc_harden.h"', 1),
     ("#define IS_SERIALIZED(ptr) \\\n\t((size_t)(ptr) <= envelock_fc_size)", 1),
     ("(const char*)(ptr) >= envelock_fc_base", 1),
-    ('"Envelock: corrupt bytecode image (pointer out of range)"', 1),
-    ('"Envelock: corrupt bytecode image (string out of range)"', 1),
-    ("envelock_fc_check_string((zend_string*)(ptr));", 1),
-    ("GC_DEL_FLAGS(ptr, IS_STR_CLASS_NAME_MAP_PTR);", 1),            # BC-8
+    ('"Envelock: corrupt bytecode image (pointer out of range or misaligned)"', 1),
+    ('"Envelock: corrupt bytecode image (string out of range or misaligned)"', 1),
+    ("if (UNEXPECTED(!IS_SERIALIZED(ptr) || !ENVELOCK_FC_ALIGNED(ptr))) {", 2),   # both relocations
+    ("ENVELOCK_FC_CLAIM(ht, sizeof(HashTable), ENVELOCK_FC_K_TABLE);", 2),    # static vars, attributes
+    ("ENVELOCK_FC_CLAIM(attr, ZEND_ATTRIBUTE_SIZE(attr->argc), ENVELOCK_FC_K_ATTRIBUTE);", 1),
+    ("ENVELOCK_FC_CLAIM(list, ZEND_TYPE_LIST_SIZE(list->num_types), ENVELOCK_FC_K_TYPE_LIST);", 1),
+    ("envelock_fc_check_string(envelock_str_);", 1),
+    ("(ptr) = (void*)envelock_str_;", 1),        # assigned last, never read back (fuzzing Nov 2026)
+    ("GC_DEL_FLAGS(envelock_str_, IS_STR_CLASS_NAME_MAP_PTR);", 1),  # BC-8
     ('"Envelock: corrupt bytecode image (interned string not allowed)"', 1),
     ("envelock_fc_begin(buf, size,", 1),                             # BC-5
     ("envelock_fc_finish(script);", 1),
     # BC-3/BC-4: every count-driven walk
     ("ENVELOCK_BOUND_COUNT(p, ht->nNumUsed);", 2),
-    ("ENVELOCK_BOUND_COUNT(p, op_array->last_literal);", 1),
-    ("ENVELOCK_BOUND_COUNT(opline, op_array->last);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(p, op_array->last_literal, ENVELOCK_FC_K_ZVALS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(opline, op_array->last, ENVELOCK_FC_K_OPCODES);", 1),
     ("envelock_fc_check_arg_info(op_array);", 1),                    # BC-15
-    ("ENVELOCK_BOUND_COUNT(p, op_array->last_var);", 1),
-    ("ENVELOCK_BOUND_COUNT(op_array->dynamic_func_defs, op_array->num_dynamic_func_defs);", 1),
-    ("ENVELOCK_BOUND_COUNT(p, ce->default_properties_count);", 1),
-    ("ENVELOCK_BOUND_COUNT(p, ce->default_static_members_count);", 1),
-    ("ENVELOCK_BOUND_COUNT(ce->properties_info_table, ce->default_properties_count);", 1),
-    ("ENVELOCK_BOUND_COUNT(ce->interface_names, ce->num_interfaces);", 1),
-    ("ENVELOCK_BOUND_COUNT(ce->trait_names, ce->num_traits);", 1),
+    ("envelock_fc_check_op_array_names(op_array, op_array == &script->script.main_op_array);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(p, op_array->last_var, ENVELOCK_FC_K_PTRS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(op_array->dynamic_func_defs, op_array->num_dynamic_func_defs, ENVELOCK_FC_K_PTRS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(p, ce->default_properties_count, ENVELOCK_FC_K_ZVALS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(p, ce->default_static_members_count, ENVELOCK_FC_K_ZVALS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(ce->properties_info_table, ce->default_properties_count, ENVELOCK_FC_K_PTRS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(ce->interface_names, ce->num_interfaces, ENVELOCK_FC_K_CLASS_NAMES);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(ce->trait_names, ce->num_traits, ENVELOCK_FC_K_CLASS_NAMES);", 1),
+    # BC-17: mandatory interface/trait names must not be NULL (NULL deref at link time)
+    ('ENVELOCK_FC_FAIL("interface name without a name");', 1),
+    ('ENVELOCK_FC_FAIL("trait name without a name");', 1),
     ("ENVELOCK_BOUND_COUNT(q->exclude_class_names, q->num_excludes);", 1),
-    ("ENVELOCK_BOUND_COUNT(p, 1);", 4),
+    ("ENVELOCK_FC_CLAIM_ARRAY(p, 1, ENVELOCK_FC_K_SLOT);", 4),
     ("ENVELOCK_BOUND_COUNT(attr->args, attr->argc);", 1),
     ("ENVELOCK_BOUND_COUNT(list->types, list->num_types);", 1),
-    ("ENVELOCK_BOUND_COUNT(script->warnings, script->num_warnings);", 1),
-    ("ENVELOCK_BOUND_COUNT(script->early_bindings, script->num_early_bindings);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(script->warnings, script->num_warnings, ENVELOCK_FC_K_PTRS);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(script->early_bindings, script->num_early_bindings, ENVELOCK_FC_K_MISC);", 1),
     ('"early binding cache slot out of range"', 1),                  # BC-6
     # BC-13: recursion budget in every recursive unserializer
     ("envelock_fc_check_stack();", 5),
@@ -105,15 +143,15 @@ FILE_CACHE_REQUIRED = [
     ("envelock_fc_check_op_array_seen(op_array);", 1),
     ("envelock_fc_check_op_array_arrays(op_array);", 1),
     # values and classes
-    ("envelock_fc_check_zval_type(zv,", 1),
+    ("envelock_fc_check_zval_type(zv, 0)", 1),   # BC-18: IS_PTR refused in the general zval walk (all versions)
     ("envelock_fc_fix_array(zv);", 1),
     ("envelock_fc_fix_ast_ref(zv);", 2),
     ("envelock_fc_fix_class(ce);", 1),
     ("envelock_fc_check_prop(Z_PTR_P(zv));", 1),
-    ("ENVELOCK_FC_EXTENT(ce, sizeof(zend_class_entry));", 1),
-    ("ENVELOCK_FC_EXTENT(func, sizeof(zend_op_array));", 1),
+    ("ENVELOCK_FC_CLAIM(ce, sizeof(zend_class_entry), ENVELOCK_FC_K_CLASS);", 1),
+    ("ENVELOCK_FC_CLAIM(func, sizeof(zend_op_array), ENVELOCK_FC_K_OP_ARRAY);", 1),
     ("ENVELOCK_FC_EXTENT(op_array, sizeof(zend_op_array));", 1),
-    ("ENVELOCK_FC_EXTENT(script, sizeof(*script));", 1),
+    ("ENVELOCK_FC_CLAIM(script, sizeof(*script), ENVELOCK_FC_K_SCRIPT);", 1),
     ("envelock_fc_base = (const char *) script->mem;", 1),           # pack side bound
     # Reproducible images: the pack side keeps no engine callback (process addresses that a
     # position-independent PHP moves in every process; the loader clears them anyway). CI, 2026-11-18.
@@ -134,13 +172,17 @@ FILE_CACHE_REQUIRED_PRE84 = [
 
 # PHP 8.4+: property hooks. PHP 8.5: constant-expression closures and attributed constants (BC-14).
 FILE_CACHE_REQUIRED_84 = [
-    ("ENVELOCK_BOUND_COUNT(prop->hooks, ZEND_PROPERTY_HOOK_COUNT);", 1),
+    ("ENVELOCK_FC_CLAIM_ARRAY(prop->hooks, ZEND_PROPERTY_HOOK_COUNT, ENVELOCK_FC_K_PTRS);", 1),
 ]
 FILE_CACHE_REQUIRED_85 = [
     ("ZEND_MAP_PTR_INIT(fcc->fptr, NULL);", 1),
     ('"declaration in a constant expression"', 1),
     ("&& opline > op_array->opcodes", 1),
     ('"attributed constant without its attributes"', 2),
+    # BC-18: IS_PTR literals (attribute pointers) are skipped in the literals walk and every one must be
+    # consumed (relocated) by a DECLARE_ATTRIBUTED_CONST OP_DATA; a raw one left over is refused.
+    ("if (Z_TYPE_P(p) != IS_PTR) {", 1),
+    ('ENVELOCK_FC_FAIL("unclaimed attribute pointer in a literal");', 1),
     ("ENVELOCK_FC_EXTENT(ast, sizeof(zend_ast_op_array));", 1),
     # A closure default shared by a same-file subclass is walked twice: relocate its op_array once
     # (audit 2026-11-17: valid PHP 8.5 code could not be packed).
@@ -154,6 +196,8 @@ UNSERIALIZE_FORBIDDEN = [
     ("script->corrupted", "control state read back from the image (BC-5)"),
     ("script->size", "bound read back from the image (BC-5)"),
     ("ZEND_UNREACHABLE()", "undefined behaviour in a release build (BC-14)"),
+    ("ZEND_ASSERT(", "an assumption in a release build: on image data, undefined behaviour when false; "
+                     "check and fail instead (bytecode deserializer fuzzing, Nov 2026)"),
     ("#define ENVELOCK_BOUND_COUNT", "a local copy of the bound macro that ignores the captured bound"),
 ]
 FILE_FORBIDDEN = [

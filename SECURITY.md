@@ -2,7 +2,7 @@
 
 ## Status
 
-Envelock 1.1.1 is a prototype: it has not been independently audited and it is not promised to be free of vulnerabilities. The effective verification matrix is in `docs/VERIFICACION.md`; code targeting a platform is not equivalent to a binary certified for it.
+Envelock 1.1.2 is a prototype: it has not been independently audited and it is not promised to be free of vulnerabilities. The effective verification matrix is in `docs/VERIFICACION.md`; code targeting a platform is not equivalent to a binary certified for it.
 
 Hiding the source from an administrator who controls the runtime is not guaranteed. Recovering code through a modified PHP or extracting the secret from the binary are known limits of the model, not security promises that can be resolved with AES alone.
 

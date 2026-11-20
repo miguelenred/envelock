@@ -87,14 +87,16 @@ def test_layer_checker_flags_a_layer_that_lost_its_bounds(tmp_path):
     shutil.copytree(ROOT / "extension" / "opcache", copy)
     target = copy / "php83" / "envelock_file_cache.c"
     text = target.read_text(encoding="utf-8")
-    assert "ENVELOCK_BOUND_COUNT(p, op_array->last_literal);" in text
-    text = text.replace("\t\tENVELOCK_BOUND_COUNT(p, op_array->last_literal);\n", "")
+    needle = "ENVELOCK_FC_CLAIM_ARRAY(p, op_array->last_literal, ENVELOCK_FC_K_ZVALS);"
+    assert needle in text
+    text = text.replace(needle, "")
+    assert needle not in text
     text = text.replace("envelock_fc_set_handlers(op_array);", "zend_deserialize_opcode_handler(opline);")
     target.write_text(text, encoding="utf-8")
     r = subprocess.run([sys.executable, str(CHECKER), "--root", str(copy)],
                        capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout
-    assert "php83/envelock_file_cache.c: missing 'ENVELOCK_BOUND_COUNT(p, op_array->last_literal);'" in r.stdout
+    assert f"php83/envelock_file_cache.c: missing '{needle}'" in r.stdout
     assert "zend_deserialize_opcode_handler(" in r.stdout
 
 

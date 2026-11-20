@@ -373,6 +373,11 @@ static zend_op_array *(*envelock_own_compile_file)(zend_file_handle *, int) = NU
  * interrupt handler before any extension's MINIT (measured: it is non-NULL in a bare
  * `php -n -r`), so testing it against NULL would refuse every process. Only a *change* is news. */
 static void (*envelock_own_interrupt_function)(zend_execute_data *) = NULL;
+/* The zend_compile_string hook Envelock installs (envelock_compile_string): the eval() gate that
+ * refuses eval() while a sealed package is active. Recorded at MINIT so a sealed package can refuse
+ * to run if that hook was replaced afterwards and its refusal silently dropped. NULL until MINIT. */
+static zend_op_array *(*envelock_own_compile_string)(zend_string *, const char *,
+    zend_compile_position) = NULL;
 
 PHP_INI_BEGIN()
     PHP_INI_ENTRY("envelock.identity", "", PHP_INI_SYSTEM, NULL)
@@ -394,11 +399,11 @@ PHP_INI_BEGIN()
      * the operator opts in (C-16). An explicit "0"/"1" overrides the auto choice. */
     PHP_INI_ENTRY("envelock.allow_bytecode", "", PHP_INI_SYSTEM, NULL)
     /* Paths allowed to run as PLAIN PHP under a --sealed tree: a PATH_SEPARATOR-separated list of
-     * absolute path prefixes. A sealed package refuses all cleartext PHP by default; a CMS, however,
-     * legitimately runs some cleartext under its tree — its config file and the PHP it GENERATES at
-     * run time (Drupal's compiled Twig and service container under sites/default/files, WordPress's
-     * cache). List those app-controlled directories here so --sealed can be used with such an app
-     * while every other plain file under the tree is still refused. Only list directories the
+     * absolute path prefixes. A sealed package refuses all cleartext PHP by default; an application,
+     * however, may legitimately run some cleartext under its tree — its config file and the PHP it
+     * GENERATES at run time (compiled templates, a service container, a page cache). List those
+     * app-controlled directories here so --sealed can be used with such an app while every other
+     * plain file under the tree is still refused. Only list directories the
      * application itself writes; an attacker able to drop a .php into an allowed directory could run
      * it, so keep untrusted uploads non-executable at the web server, as usual. */
     PHP_INI_ENTRY("envelock.sealed_cleartext", "", PHP_INI_SYSTEM, NULL)
@@ -1506,6 +1511,16 @@ static const char *envelock_policy(const envelock_header *h, zend_file_handle *f
         ZVAL_STRINGL(&value, (const char *)identity, sizeof(identity));
         seen = zend_hash_add_new(&ENVELOCK_G(roots), key, &value);
         if (identity[36]) {
+            /* C9: the eval() gate (our zend_compile_string hook) is what refuses eval() while this
+             * sealed package is active. If it was replaced after MINIT, eval would run unguarded here,
+             * so refuse the sealed package rather than run it with the gate gone. A chaining hook cannot
+             * be told from a replacing one at this point, so sealed mode requires our hook on top
+             * (fail closed). Non-sealed packages are unaffected. */
+            if (envelock_own_compile_string != NULL && zend_compile_string != envelock_own_compile_string) {
+                zend_string_release(key);
+                return "the eval() gate (zend_compile_string) was replaced after start-up; a sealed "
+                       "package refuses to run without it";
+            }
             ENVELOCK_G(sealed_active)++;   /* a sealed package is now active (C9) */
             /* Remember this sealed root for the WORKER's lifetime, so a plain file injected into the
              * tree and requested directly (before any sealed file loads this request) is still
@@ -2253,6 +2268,7 @@ PHP_MINIT_FUNCTION(envelock)
     envelock_own_interrupt_function = zend_interrupt_function;   /* O3: ditto, see above */
     envelock_previous_compile_string = zend_compile_string;   /* eval() gate for sealed packages (C9) */
     zend_compile_string = envelock_compile_string;
+    envelock_own_compile_string = zend_compile_string;   /* the gate itself: "still ours" for sealed (C9) */
     return SUCCESS;
 }
 

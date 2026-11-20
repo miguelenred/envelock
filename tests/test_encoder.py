@@ -1288,16 +1288,22 @@ def test_preflight_flags_self_introspecting_code(tmp_path):
         "<?php foreach (token_get_all(file_get_contents($f)) as $t) {}\n")
     (tmp_path / "Entity.php").write_text(
         "<?php\n/**\n * @ORM\\Table(name=\"x\")\n */\nclass X { public int $id = 0; }\n")
+    (tmp_path / "Mine.php").write_text(
+        "<?php\n/**\n * @Cache(ttl=60)\n */\nfunction cached() {}\n")       # any annotation, any library
     (tmp_path / "header.php").write_text("<?php $d = get_file_data(__FILE__, []);\n")
     (tmp_path / "clean.php").write_text(
-        "<?php function add(int $a, int $b): int { return $a + $b; }\n")
+        "<?php\n/**\n * Adds.\n * @param int $a\n * @return int\n * @TODO faster\n */\n"
+        "function add(int $a, int $b): int { return $a + $b; }\n")
     findings = a.compatibility_findings(tmp_path, a.DEFAULT_EXTENSIONS)
     assert "source-tokenizer" in findings
-    assert "doctrine-annotation" in findings
-    assert "file-header-reader" in findings
+    assert sorted({h[0] for h in findings["docblock-annotation"]["hits"]}) == ["Entity.php", "Mine.php"]
+    # Generic only: no category tied to one CMS's API or file headers.
+    assert set(findings) <= {c for c, _, _ in a.COMPAT_PATTERNS}
+    assert not {"file-header-reader", "wp-file-header", "doctrine-annotation"} & {c for c, _, _ in a.COMPAT_PATTERNS}
     flagged = {rel for data in findings.values() for rel, _ in data["hits"]}
-    assert "autoload.php" in flagged and "Entity.php" in flagged and "header.php" in flagged
-    assert "clean.php" not in flagged  # ordinary code is never flagged
+    assert "autoload.php" in flagged and "Entity.php" in flagged
+    assert "header.php" not in flagged  # a CMS API name is not a condition
+    assert "clean.php" not in flagged  # ordinary code and PHPDoc tags are never flagged
 
 
 def test_preflight_clean_tree_reports_no_issues(tmp_path):
@@ -1407,15 +1413,30 @@ def test_bytecode_pass_keeps_preexisting_deploy_root(tmp_path, monkeypatch):
     assert not (deploy / "sub").exists()                 # the dir this pass created is cleaned up
 
 
-def test_preflight_flags_wordpress_file_headers(tmp_path):
-    """WordPress reads a block pattern's 'Slug:' header (and plugin/theme/template headers) from the
-    file TEXT via get_file_data; encryption hides it, so a block (FSE) theme renders empty. Preflight
-    must flag these files so the developer keeps them unencrypted (audit: Envelock + WordPress FSE)."""
+def test_analysis_has_no_cms_specific_condition(tmp_path):
+    """Envelock works with any PHP project, with no condition for a named CMS or framework: a CMS's
+    file headers, template file names, cache folders or packages change nothing in the analysis (what
+    each CMS needs is in docs/DEPLOYING-APPS.md). The encoder's code names none of them."""
+    ext = {".php"}
     (tmp_path / "banner.php").write_text(
-        "<?php\n/**\n * Title: Hero\n * Slug: mytheme/banner-hero\n * Categories: banner\n */\nreturn;\n")
-    findings = a.compatibility_findings(tmp_path, {".php"})
-    assert "wp-file-header" in findings
-    assert findings["wp-file-header"]["hits"][0][0] == "banner.php"
+        "<?php\n/**\n * Title: Hero\n * Slug: mytheme/banner-hero\n * Plugin Name: Demo\n */\nreturn;\n")
+    (tmp_path / "views").mkdir()
+    (tmp_path / "views" / "page.blade.php").write_text("<?php echo $title; ?>")   # has PHP code
+    for cache in ("bootstrap/cache", "storage/framework", "var/cache"):
+        (tmp_path / cache).mkdir(parents=True)
+        (tmp_path / cache / "c.php").write_text("<?php return [];")
+    (tmp_path / "vendor" / "symfony" / "property-info").mkdir(parents=True)
+    assert a.compatibility_findings(tmp_path, ext) == {}
+    rec = a.recommend_options(tmp_path, ext)
+    assert rec["exclude"] == {} and rec["exclude_patterns"] == []
+    assert "--include-protection" in rec["on"]
+    words = ("wordpress", "drupal", "joomla", "prestashop", "magento", "codeigniter", "laravel",
+             "symfony", "blade", "artisan", "doctrine", "wp-content", "get_file_data", "bootstrap/cache",
+             "storage/framework", "var/cache")
+    source = (Path(a.__file__)).read_text(encoding="utf-8").lower()
+    assert [w for w in words if w in source] == []
+    report = a.format_recommendation(rec).lower()
+    assert [w for w in words if w in report] == []
 
 
 def test_preflight_flags_reads_own_docblock(tmp_path):
@@ -1436,21 +1457,24 @@ def test_preflight_flags_reads_own_docblock(tmp_path):
     assert findings["reads-own-docblock"]["hits"][0][0] == "LazyArray.php"
 
 
-def test_recommend_options_is_conservative_and_matches_the_cms_matrix(tmp_path):
+def test_recommend_options_is_conservative_and_matches_the_measured_matrix(tmp_path):
     """The recommender enables the strongest options measurement shows are safe and never enables one
-    known to break the project (grounded in the four-CMS matrix and the preflight detectors)."""
+    known to break the project (grounded in the measured application matrix and the generic detectors)."""
     ext = {".php"}
     # A clean tree with no file that needs its own source: the full safe set, plus --bytecode (the
     # strongest option, now part of the production toolchain). --bytecode ships no source, so --sealed
-    # is superseded and moves to off; the high-risk ones stay off.
+    # is superseded and moves to off; the high-risk ones stay off. Control-flow flattening is on: it is
+    # safe by construction (unsafe bodies are left as written, the result is re-parsed) and the
+    # differential fuzzer proves its behaviour, so it is the strongest obfuscation that is still safe.
     clean = tmp_path / "clean"
     clean.mkdir()
     (clean / "a.php").write_text("<?php class A { function f(){ return 1; } }\n")
     rec = a.recommend_options(clean, ext)
     for flag in ("--encode-strings", "--obfuscate", "--obfuscate-flow", "--obfuscate-methods",
-                 "--include-protection", "--no-ffi", "--no-prepend",
+                 "--obfuscate-flatten", "--include-protection", "--no-ffi", "--no-prepend",
                  "--strip-comments", "--compact", "--bytecode"):
         assert flag in rec["on"], flag
+    assert "--obfuscate-flatten" not in rec["off"] and "heck" in rec["verify"]["--obfuscate-flatten"]
     # bytecode supersedes sealed (ships no source at all); both-on is untested, so sealed goes off.
     assert "--bytecode" not in rec["off"]
     assert "--sealed" in rec["off"] and "--sealed" not in rec["on"]
@@ -1490,11 +1514,13 @@ def test_recommend_options_is_conservative_and_matches_the_cms_matrix(tmp_path):
     assert cmd.count("--exclude t.php") == 1   # shlex.quote leaves a safe name bare
 
 
-def test_recommend_leaves_composer_vendor_caches_and_blade_templates_in_the_clear(tmp_path):
-    """Measured on real Laravel/Symfony apps (2026-11-10): analysing vendor/ made third-party files
-    (Blade's compiler tokenizes TEMPLATES, not itself) switch --bytecode and --strip-comments off, and
-    the suggested command would have encrypted vendor/, the run-time caches and the Blade templates
-    Laravel reads as text. The documented layout (MANUAL §14) packs only the application's own code."""
+def test_recommend_leaves_composer_vendor_and_files_without_php_code_in_the_clear(tmp_path):
+    """Measured on real framework apps (2026-11-10): analysing vendor/ made third-party files (a
+    template compiler tokenizes TEMPLATES, not itself) switch --bytecode and --strip-comments off, and
+    the suggested command would have encrypted vendor/ and templates the framework reads as text. The
+    documented layout (MANUAL §14) packs only the application's own code; a file with a PHP extension
+    and no PHP code (not one <? tag) has nothing to protect and stays cleartext — a generic rule, no
+    framework named. A framework's run-time cache folder is the developer's --exclude (docs)."""
     ext = {".php"}
     app = tmp_path / "app"
     for name, text in {
@@ -1508,13 +1534,13 @@ def test_recommend_leaves_composer_vendor_caches_and_blade_templates_in_the_clea
         (app / name).parent.mkdir(parents=True, exist_ok=True)
         (app / name).write_text(text)
     rec = a.recommend_options(app, ext)
-    assert rec["exclude_patterns"][:2] == ["vendor/*", "bootstrap/cache/*"]
-    assert rec["exclude"] == {"template-source": ["resources/views/welcome.blade.php"]}
+    assert rec["exclude_patterns"] == ["vendor/*"]
+    assert rec["exclude"] == {"no-php-code": ["resources/views/welcome.blade.php"]}
     for flag in ("--bytecode", "--strip-comments", "--compact"):         # vendor no longer decides
         assert flag in rec["on"], flag
     assert "--sealed" in rec["off"]                                      # vendor/ stays cleartext .php
     cmd = a.format_recommendation(rec)
-    assert "--exclude 'vendor/*'" in cmd and "--exclude 'bootstrap/cache/*'" in cmd
+    assert "--exclude 'vendor/*'" in cmd and "bootstrap/cache" not in cmd
     assert "--exclude resources/views/welcome.blade.php" in cmd
     assert "--bytecode-loader" in cmd and "--bytecode-php" in cmd       # a production loader cannot emit
     # Without Composer's autoloader there is no vendor/ rule and everything is the project's own code.
@@ -1527,14 +1553,13 @@ def test_recommend_leaves_composer_vendor_caches_and_blade_templates_in_the_clea
 def test_recommend_estimates_memory_from_exactly_what_it_encrypts(tmp_path):
     """Memory sizing (docs/RENDIMIENTO.md): recommend says how much PHP it would encrypt and the extra
     memory a request loading all of it would need without OPcache (3x-9x the source, measured), and how
-    to measure. Only what the recommendation encrypts counts: not vendor/, not the run-time caches, not
-    the Blade templates nor a file that reads its own source, which it keeps cleartext."""
+    to measure. Only what the recommendation encrypts counts: not vendor/, not a file without PHP code
+    nor a file that reads its own source, which it keeps cleartext."""
     ext = {".php"}
     app = tmp_path / "app"
     sizes = {"app/A.php": 400_000, "app/B.php": 120_000}
     tree = {"vendor/autoload.php": "<?php return 1;",
             "vendor/acme/Big.php": "<?php /* " + "v" * 900_000 + " */",
-            "bootstrap/cache/packages.php": "<?php /* " + "c" * 50_000 + " */ return [];",
             "resources/views/w.blade.php": "<h1>{{ $t }}</h1>" + "t" * 70_000,
             "app/Reads.php": "<?php $me = file_get_contents(__FILE__); /* " + "r" * 80_000 + " */"}
     tree.update({name: "<?php /* " + "x" * (size - 15) + " */ ?>" for name, size in sizes.items()})
@@ -1567,7 +1592,7 @@ def test_recommend_estimates_memory_from_exactly_what_it_encrypts(tmp_path):
     (tiny / "i.php").write_bytes(b"<?php echo 1;")
     note = [n for n in a.recommend_options(tiny, ext)["notes"] if n.startswith("Memory:")][0]
     assert "13 bytes of source" in note and "less than 0.1 MB more" in note and "0.0" not in note
-    # Nothing to encrypt (only a template): no memory note at all.
+    # Nothing to encrypt (only a file without PHP code): no memory note at all.
     views = tmp_path / "views"
     views.mkdir()
     (views / "w.blade.php").write_text("<p>{{ $x }}</p>")
@@ -1619,8 +1644,8 @@ def test_recommend_turns_include_protection_off_when_it_leaves_vendor_out(tmp_pa
 
 def test_recommend_include_protection_off_on_cross_checked_cases(tmp_path):
     """C-04: --include-protection is also turned off when the recommendation leaves any .php cleartext
-    (it reads its own source), when composer.json is present but vendor/ is not installed, or for a
-    WordPress plugin/theme an unprotected core loads; a clean app with none of these stays ON."""
+    (it reads its own source) or when composer.json is present but vendor/ is not installed; a clean
+    app with none of these stays ON. A CMS plugin header is no condition (docs/DEPLOYING-APPS.md)."""
     ext = {".php"}
     # (a) a .php that reads its own source stays cleartext -> off, and the file is named.
     a1 = tmp_path / "a1"
@@ -1637,12 +1662,13 @@ def test_recommend_include_protection_off_on_cross_checked_cases(tmp_path):
     (a2 / "src.php").write_text("<?php class S { function f(){ return 1; } }")
     r2 = a.recommend_options(a2, ext)
     assert "--include-protection" not in r2["on"] and "composer.json" in r2["off"]["--include-protection"]
-    # (c) a WordPress plugin header file -> off (loaded by an unprotected core).
+    # (c) a CMS plugin header is not a condition: nothing here turns it off.
     a3 = tmp_path / "a3"
     a3.mkdir()
     (a3 / "plugin.php").write_text("<?php\n/**\n * Plugin Name: Demo\n */\nfunction demo(){}")
     r3 = a.recommend_options(a3, ext)
-    assert "--include-protection" not in r3["on"] and "WordPress" in r3["off"]["--include-protection"]
+    assert "--include-protection" in r3["on"]
+    assert "only part of an application" in r3["verify"]["--include-protection"]
     # (d) a clean app with none of these -> still ON (no false turn-off).
     a4 = tmp_path / "a4"
     a4.mkdir()
@@ -1783,7 +1809,7 @@ def test_recommend_explains_every_option_and_says_when_it_is_unsure(tmp_path):
     clean.mkdir()
     (clean / "index.php").write_text("<?php class A { private function f() { return 1; } }")
     app = tmp_path / "app"
-    (app / "vendor" / "symfony" / "property-info").mkdir(parents=True)
+    (app / "vendor" / "acme" / "serializer").mkdir(parents=True)
     (app / "vendor" / "autoload.php").write_text("<?php")
     (app / "index.php").write_text("<?php require 'vendor/autoload.php';")
     (app / "bin").mkdir()
@@ -1805,9 +1831,10 @@ def test_recommend_explains_every_option_and_says_when_it_is_unsure(tmp_path):
         assert flag in clean_rec["verify"], flag
     assert "only part of an application" in clean_rec["verify"]["--include-protection"]
     assert "NTS" in clean_rec["verify"]["--bytecode"]
-    # A docblock-reading library in vendor/ is named in the doubt about stripping comments.
+    # The doubt about stripping comments names the generic risk, never a package.
     app_rec = a.recommend_options(app, ext)
-    assert "vendor/symfony/property-info" in app_rec["verify"]["--strip-comments"]
+    assert "@var/@param docblocks" in app_rec["verify"]["--strip-comments"]
+    assert "vendor/" not in app_rec["verify"]["--strip-comments"]
     assert "Composer" in app_rec["off"]["--obfuscate-names"]
     assert "uncertain" in clean_rec["off"]["--obfuscate-names"]
 
@@ -1845,43 +1872,43 @@ def test_recommend_robust_against_evasion_and_shell_metachars(tmp_path):
 
 
 def test_compat_token_masks_route_detectors_and_kill_false_positives(tmp_path):
-    """C-01: with token-aware masks, comment categories (wp header, Doctrine annotation) match only the
+    """C-01: with token-aware masks, the comment category (docblock annotation) matches only the
     COMMENT text and code categories (eval, FFI, token_get_all, getDocComment) match only the CODE text.
-    So a PHP 8 named argument `slug:` on its own line is no longer a WordPress header, and a genuine
-    header in a comment still is. The masks are supplied directly (as _php_code_comment_masks would
+    So a multiplication continued on a line `* @Helper::rate()` (the @ silences errors) is no longer an
+    annotation, and a genuine annotation in a docblock still is. The masks are supplied directly (as _php_code_comment_masks would
     build them) so the test needs no php."""
     ext = {".php"}
     src = tmp_path / "proj"
     src.mkdir()
-    # x.php: a named argument `slug:` on its own line — the exact raw-text false positive from the
-    # audit — plus a $r->eval( method call. Here the file text has no comments/strings, so the raw
-    # scan sees this text verbatim.
+    # x.php: a product continued on its own line, `* @Helper::rate()` — code that looks like an
+    # annotation to a raw-text scan — plus a $r->eval( method call. Here the file text has no
+    # comments/strings, so the raw scan sees this text verbatim.
     fp_code = ("<?php\n"
-               "$x = foo(\n"
-               "    slug: $s,\n"          # named arg on its own line: a WP-header false positive in raw
-               ");\n"
+               "$x = $base\n"
+               "    * @Helper::rate();\n"   # code: an annotation false positive in raw
+               ";\n"
                "$r->eval($y);\n")        # method call, not the eval() construct
     (src / "x.php").write_text(fp_code)
-    # plug.php: a genuine WordPress header, which lives in a COMMENT.
+    # plug.php: a genuine annotation, which lives in a COMMENT.
     (src / "plug.php").write_text("<?php\n")
 
-    # Raw scan (no php): the named argument MISFIRES as a header, which is what the token path fixes.
+    # Raw scan (no php): the code line MISFIRES as an annotation, which is what the token path fixes.
     raw = a.compatibility_findings(src, ext)
-    assert "x.php" in {h[0] for h in raw.get("wp-file-header", {"hits": []})["hits"]}
+    assert "x.php" in {h[0] for h in raw.get("docblock-annotation", {"hits": []})["hits"]}
     # The eval lookbehind already rejects the ->eval( method call even in raw mode (no mask needed):
     assert a._tree_uses_runtime_compile(src, ext) == []
 
-    # Token masks: slug: is CODE (the comment blob is empty), so the header false positive is gone;
-    # the real header in plug.php's comment blob is still found, on its own line.
+    # Token masks: that line is CODE (the comment blob is empty), so the false positive is gone;
+    # the real annotation in plug.php's comment blob is still found, on its own line.
     masks = {
         "x.php": {"code": fp_code, "comments": "\n\n\n\n\n"},
         "plug.php": {"code": "     \n     \n                 \n    \n",
-                     "comments": "\n/**\n * Plugin Name: Z\n */\n"},
+                     "comments": "\n/**\n * @Route(\"/z\")\n */\n"},
     }
     findings = a.compatibility_findings(src, ext, masks=masks)
     cats = {c: sorted({h[0] for h in d["hits"]}) for c, d in findings.items()}
-    assert cats.get("wp-file-header") == ["plug.php"]       # only the real header, not the named arg
-    assert sorted(ln for f, ln in findings["wp-file-header"]["hits"] if f == "plug.php") == [3]
+    assert cats.get("docblock-annotation") == ["plug.php"]  # only the real annotation, not the code
+    assert sorted(ln for f, ln in findings["docblock-annotation"]["hits"] if f == "plug.php") == [3]
     assert "source-tokenizer" not in cats
     assert a._tree_uses_runtime_compile(src, ext, masks=masks) == []
     assert a._tree_matches(src, ext, a._FFI_RE, masks=masks) == []
@@ -1959,8 +1986,8 @@ def test_compat_line_number_logic_adversarial(tmp_path):
 def test_compat_token_masks_adversarial(tmp_path):
     """C-01, ATTACK with the real tokenizer: eval()/FFI/token_get_all hidden in comments, strings,
     heredoc/nowdoc, inline HTML, escaped quotes or a string carrying `*/` must NOT be flagged, while the
-    genuine ones right next to them MUST be — and a header-looking line in code or a string is not a
-    WordPress header. A detector that can be fooled either way is the whole point of C-01."""
+    genuine ones right next to them MUST be — and an annotation-looking line in code or a string is not
+    an annotation. A detector that can be fooled either way is the whole point of C-01."""
     ext = {".php"}
     src = tmp_path / "proj"
     src.mkdir()
@@ -1989,12 +2016,12 @@ def test_compat_token_masks_adversarial(tmp_path):
         'echo "a */ tricky string"; eval($again);\n',  # a string holding */ then a real eval
         encoding="utf-8")
     (src / "plug.php").write_text(
-        "<?php\n/**\n * Plugin Name: Real One\n */\n$x = 1;\n", encoding="utf-8")
+        "<?php\n/**\n * @Entity(table=\"real\")\n */\n$x = 1;\n", encoding="utf-8")
     (src / "fakehdr.php").write_text(
         "<?php\n"
-        '$t = "Plugin Name: inside a string, not a header";\n'
-        "register_block_pattern(slug: $s, title: $t);\n"   # named args, not a header
-        "// Plugin Name: after a // prefix, not a header\n", encoding="utf-8")
+        '$t = "\n * @Entity inside a string, not an annotation\n";\n'
+        "$y = $a\n    * @Helper::rate();\n"                 # code, not an annotation
+        "// * @Entity after a // prefix, not a docblock\n", encoding="utf-8")
 
     masks = a._php_code_comment_masks("php", src, ext)
     assert masks is not None, "the token scan failed"
@@ -2004,8 +2031,8 @@ def test_compat_token_masks_adversarial(tmp_path):
     assert cats.get("source-tokenizer") == ["real.php"], cats.get("source-tokenizer")
     assert {h.split(":")[0] for h in a._tree_uses_runtime_compile(src, ext, masks=masks)} == {"real.php"}
     assert {h.split(":")[0] for h in a._tree_matches(src, ext, a._FFI_RE, masks=masks)} == {"real.php"}
-    # The header is found only in the REAL docblock, not in the string or the //-prefixed line:
-    assert cats.get("wp-file-header") == ["plug.php"], cats.get("wp-file-header")
+    # The annotation is found only in the REAL docblock, not in the string, the code or the // line:
+    assert cats.get("docblock-annotation") == ["plug.php"], cats.get("docblock-annotation")
     # getDocComment hidden in a comment is not a reads-own-docblock finding:
     assert "noise.php" not in cats.get("reads-own-docblock", [])
 
@@ -2026,7 +2053,7 @@ def test_php_code_comment_masks_absent_php_returns_none(tmp_path, monkeypatch):
 @pytest.mark.skipif(not HAVE_PHP, reason="needs a php CLI with the tokenizer")
 def test_php_code_comment_masks_integration(tmp_path):
     """C-01 end to end with the real tokenizer: eval()/FFI/token_get_all written inside a comment or a
-    string, and a `slug:` named argument, are NOT flagged; the genuine ones are."""
+    string, and an annotation-looking code line, are NOT flagged; the genuine ones are."""
     ext = {".php"}
     src = tmp_path / "proj"
     src.mkdir()
@@ -2035,15 +2062,15 @@ def test_php_code_comment_masks_integration(tmp_path):
         "/* token_get_all( ) and FFI:: in a comment */\n"
         "$q = 'SELECT eval( FROM t';\n$r->eval($s);\n", encoding="utf-8")
     (src / "named.php").write_text(
-        "<?php\nregister_block_pattern(\n    slug: $this->slug,\n);\n", encoding="utf-8")
+        "<?php\n$v = $w\n    * @Helper::rate();\n", encoding="utf-8")
     (src / "real.php").write_text(
-        "<?php\n/**\n * Plugin Name: Real\n */\neval($c);\n$f = FFI::cdef('int x();','l.so');\n",
+        "<?php\n/**\n * @Cache(ttl=60)\n */\neval($c);\n$f = FFI::cdef('int x();','l.so');\n",
         encoding="utf-8")
     masks = a._php_code_comment_masks("php", src, ext)
     assert masks is not None
     cats = {c: sorted({h[0] for h in d["hits"]})
             for c, d in a.compatibility_findings(src, ext, masks=masks).items()}
-    assert cats.get("wp-file-header") == ["real.php"]
+    assert cats.get("docblock-annotation") == ["real.php"]
     assert "source-tokenizer" not in cats
     assert a._tree_uses_runtime_compile(src, ext, masks=masks) == ["real.php:5"]
     assert [h for h in a._tree_matches(src, ext, a._FFI_RE, masks=masks)] == ["real.php:6"]

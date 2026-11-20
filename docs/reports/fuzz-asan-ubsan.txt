@@ -1,5 +1,5 @@
 Envelock crypto core — gcc AddressSanitizer + UndefinedBehaviorSanitizer exerciser
-date: 2026-11-19T10:23:07Z
+date: 2026-11-20T08:53:34Z
 built against: OpenSSL 3.5.9
 inputs: 1 valid small blob (every byte with its top bit flipped, one mutation per byte, and
         every truncation), 1 valid 100 KiB blob, and 200000 pseudo-random inputs (seed 1234).

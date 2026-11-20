@@ -321,7 +321,7 @@ it flags the self-introspection patterns that the aggressive flags break.
 ### Recommended profiles
 
 - **Maximum protection (code you control end-to-end, own servers):** `--bytecode` + the full obfuscation
-  set (`--strip-comments --compact --encode-strings --obfuscate --obfuscate-flow --obfuscate-methods`) +
+  set (`--strip-comments --compact --encode-strings --obfuscate --obfuscate-flow --obfuscate-flatten --obfuscate-methods`) +
   `--include-protection --no-ffi --no-prepend --sealed` (with `envelock.sealed_cleartext` for the paths
   the app writes). This keeps no source in memory and refuses injected cleartext/eval. Test thoroughly;
   drop `--sealed`/`--strip-comments`/`--compact` per the CMS notes above where they don't apply.
@@ -343,7 +343,7 @@ it flags the self-introspection patterns that the aggressive flags break.
 | **`--no-prepend`** | Refuses `auto_prepend_file`/`auto_append_file`, a classic injection point. | None measured; requires both directives empty on the server. | Almost always. | The deployment relies on an auto-prepend bootstrap (some hosting security/monitoring agents use one). |
 | **`--sealed`** (+ `envelock.sealed_cleartext`) | Refuses *all* cleartext `.php` under the tree **and** `eval()` while active — closes "drop a readable script next to the protected code" and run-time string compilation. Strongest injection defense. | Breaks any app that runs cleartext PHP it generates (template/container caches) or uses `eval()`; needs the `sealed_cleartext` allowlist for the dirs the app writes, and it never relaxes the `eval()` refusal. Measured: Drupal/Joomla OK with allowlist; WordPress/PrestaShop ❌ (they `eval()`). | Every `.php` in the tree is protected and the app doesn't `eval()`. | The app ships/writes cleartext PHP or relies on `eval()` (don't force it). |
 | **`--enforce-manifest`** (on by default) | Signed inventory of every file; the loader fails closed if a protected file was deleted (e.g. an auth check silently removed). Also enables the ~5× cold-start fast path when the server trusts a single developer. | None; on by default (opt out with `--no-manifest`). | Always — deploy the package as one unit. | Only if you deliberately ship partial packages. |
-| **`--strip-comments`** | Removes comments/docblocks — less to read if recovered. | **Removes docblocks that some frameworks read at run time** (`getDocComment()` annotations, WP file headers). Can break silently. Line numbers preserved. | Drupal, WordPress, Joomla, and any app that doesn't read its own docblocks. | PrestaShop and any app with runtime docblock annotations (`preflight` flags it). |
+| **`--strip-comments`** | Removes comments/docblocks — less to read if recovered. | **Removes docblocks that some code reads at run time** (`getDocComment()`, docblock annotations an annotation reader parses). Can break silently. Line numbers preserved. | Drupal, WordPress, Joomla, and any app that doesn't read its own docblocks. | PrestaShop and any app with runtime docblock annotations (`preflight` flags `reads-own-docblock`/`docblock-annotation`). |
 | **`--compact`** | Collapses whitespace/comments to one space — removes indentation and line structure. | Same docblock caveat as `--strip-comments`; **line numbers not preserved** (errors report the collapsed line). | You don't need production line numbers and the app passes the docblock check. | PrestaShop (docblocks), or when you need accurate error line numbers. |
 | **`--encode-strings`** | String literals become `\xNN` escapes — hides readable strings (URLs, messages, SQL) from a casual `strings`/grep. | Low; measured byte-identical on all four CMSs. | Almost always — good readability win for little cost. | No strong reason to avoid. |
 | **`--obfuscate`** (local vars) | Renames local variables to short names; the single best readability-reduction with the lowest risk. Safe even on WordPress (it skips `compact()`/`extract()`/variable-variable scopes). | Low; byte-identical on all four CMSs. Notices show short names. | Almost always. | No strong reason to avoid. |
@@ -371,8 +371,10 @@ envelock pack ... --exclude 'wp-content/themes/*/patterns/*'
 ```
 
 They carry no business logic worth protecting (just block markup + a header), so leaving them clear costs
-nothing. `envelock preflight --source <app>` now flags these as `wp-file-header`. Classic (non-FSE)
-themes do not need this.
+nothing. Envelock has **no per-CMS conditions** — it protects any PHP project the same way — so it does
+not single these files out for you; apply the recipe above when you deploy a block theme. (`preflight`
+does flag the *generic* cases it can see from the code itself: a file read as text by a tokenizer, a
+docblock annotation, or code that reads its own source.) Classic (non-FSE) themes do not need this.
 
 ## Checklist
 

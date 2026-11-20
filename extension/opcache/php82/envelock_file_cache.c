@@ -115,8 +115,8 @@
 	} while (0)
 #define UNSERIALIZE_PTR(ptr) do { \
 		if (ptr) { \
-			if (UNEXPECTED(!IS_SERIALIZED(ptr))) { \
-				zend_error_noreturn(E_ERROR, "Envelock: corrupt bytecode image (pointer out of range)"); \
+			if (UNEXPECTED(!IS_SERIALIZED(ptr) || !ENVELOCK_FC_ALIGNED(ptr))) { \
+				zend_error_noreturn(E_ERROR, "Envelock: corrupt bytecode image (pointer out of range or misaligned)"); \
 			} \
 			(ptr) = (void*)((char*)buf + (size_t)(ptr)); \
 		} \
@@ -141,20 +141,23 @@
 			if (IS_SERIALIZED_INTERNED(ptr)) { \
 				(ptr) = (void*)envelock_file_cache_unserialize_interned((zend_string*)(ptr)); \
 			} else { \
-				if (UNEXPECTED(!IS_SERIALIZED(ptr))) { \
-					zend_error_noreturn(E_ERROR, "Envelock: corrupt bytecode image (string out of range)"); \
+				if (UNEXPECTED(!IS_SERIALIZED(ptr) || !ENVELOCK_FC_ALIGNED(ptr))) { \
+					zend_error_noreturn(E_ERROR, "Envelock: corrupt bytecode image (string out of range or misaligned)"); \
 				} \
-				(ptr) = (void*)((char*)buf + (size_t)(ptr)); \
-				/* Envelock: whole string inside the region, flags and hash reset (BC-8/9/15) */ \
-				envelock_fc_check_string((zend_string*)(ptr)); \
+				zend_string *envelock_str_ = (zend_string*)((char*)buf + (size_t)(ptr)); \
+				/* Envelock: whole string inside the region, flags and hash reset (BC-8/9/15). Done on a \
+				 * local and assigned last: a string laid over the field that points to it would \
+				 * otherwise have its normalized header read back as the pointer (fuzzing Nov 2026). */ \
+				envelock_fc_check_string(envelock_str_); \
 				/* script->corrupted shows if the script in SHM or not */ \
 				if (EXPECTED(!envelock_fc_corrupted)) { \
-					GC_ADD_FLAGS(ptr, IS_STR_INTERNED | IS_STR_PERMANENT); \
+					GC_ADD_FLAGS(envelock_str_, IS_STR_INTERNED | IS_STR_PERMANENT); \
 				} else { \
-					GC_ADD_FLAGS(ptr, IS_STR_INTERNED); \
-					GC_DEL_FLAGS(ptr, IS_STR_PERMANENT); \
+					GC_ADD_FLAGS(envelock_str_, IS_STR_INTERNED); \
+					GC_DEL_FLAGS(envelock_str_, IS_STR_PERMANENT); \
 				} \
-				GC_DEL_FLAGS(ptr, IS_STR_CLASS_NAME_MAP_PTR); \
+				GC_DEL_FLAGS(envelock_str_, IS_STR_CLASS_NAME_MAP_PTR); \
+				(ptr) = (void*)envelock_str_; \
 			} \
 		} \
 	} while (0)
@@ -174,6 +177,7 @@
 		HashTable *ht; \
 		UNSERIALIZE_PTR(attributes); \
 		ht = (attributes); \
+		ENVELOCK_FC_CLAIM(ht, sizeof(HashTable), ENVELOCK_FC_K_TABLE); \
 		envelock_file_cache_unserialize_hash(ht, script, buf, envelock_file_cache_unserialize_attribute, NULL); \
 	} \
 } while (0)
@@ -1073,7 +1077,9 @@ static void envelock_file_cache_unserialize_zval(zval                    *zv,
 			ENVELOCK_FC_EXTENT(Z_INDIRECT_P(zv), sizeof(zval));
 			break;
 		default:
-			ZEND_ASSERT(Z_TYPE_P(zv) < IS_STRING);
+			if (UNEXPECTED(Z_TYPE_P(zv) >= IS_STRING)) {
+				ENVELOCK_FC_FAIL("value type");
+			}
 			break;
 	}
 }
@@ -1090,6 +1096,7 @@ static void envelock_file_cache_unserialize_attribute(zval *zv, envelock_persist
 	attr = Z_PTR_P(zv);
 	ENVELOCK_FC_EXTENT(attr, offsetof(zend_attribute, args));
 	ENVELOCK_BOUND_COUNT(attr->args, attr->argc);
+	ENVELOCK_FC_CLAIM(attr, ZEND_ATTRIBUTE_SIZE(attr->argc), ENVELOCK_FC_K_ATTRIBUTE);
 
 	UNSERIALIZE_STR(attr->name);
 	UNSERIALIZE_STR(attr->lcname);
@@ -1109,6 +1116,7 @@ static void envelock_file_cache_unserialize_type(
 		UNSERIALIZE_PTR(list);
 		ENVELOCK_FC_EXTENT(list, offsetof(zend_type_list, types));
 		ENVELOCK_BOUND_COUNT(list->types, list->num_types);
+		ENVELOCK_FC_CLAIM(list, ZEND_TYPE_LIST_SIZE(list->num_types), ENVELOCK_FC_K_TYPE_LIST);
 		ZEND_TYPE_SET_PTR(*type, list);
 
 		zend_type *list_type;
@@ -1136,12 +1144,15 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 	if (UNEXPECTED(!ZEND_USER_CODE(op_array->type))) {
 		ENVELOCK_FC_FAIL("op_array type");
 	}
+	envelock_fc_check_op_array_names(op_array, op_array == &script->script.main_op_array);
 	if (!envelock_fc_corrupted) {
 		if (op_array != &script->script.main_op_array) {
 			op_array->fn_flags |= ZEND_ACC_IMMUTABLE;
 			ZEND_MAP_PTR_NEW(op_array->run_time_cache);
 		} else {
-			ZEND_ASSERT(!(op_array->fn_flags & ZEND_ACC_IMMUTABLE));
+			if (UNEXPECTED(op_array->fn_flags & ZEND_ACC_IMMUTABLE)) {
+				ENVELOCK_FC_FAIL("main op_array flags");
+			}
 			ZEND_MAP_PTR_INIT(op_array->run_time_cache, NULL);
 		}
 		if (op_array->static_variables) {
@@ -1155,7 +1166,9 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 	/* Check whether this op_array has already been unserialized. */
 	if (IS_UNSERIALIZED(op_array->opcodes)) {
-		ZEND_ASSERT(op_array->scope && "Only method op_arrays should be shared");
+		if (UNEXPECTED(!op_array->scope)) {
+			ENVELOCK_FC_FAIL("shared op_array outside a class");
+		}
 		/* only a struct this walk already handled; anything else overlaps another one */
 		envelock_fc_check_op_array_seen(op_array);
 		return;
@@ -1186,6 +1199,7 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 		UNSERIALIZE_PTR(op_array->static_variables);
 		ht = op_array->static_variables;
+		ENVELOCK_FC_CLAIM(ht, sizeof(HashTable), ENVELOCK_FC_K_TABLE);
 		envelock_file_cache_unserialize_hash(ht,
 				script, buf, envelock_file_cache_unserialize_zval, ZVAL_PTR_DTOR);
 	}
@@ -1195,7 +1209,7 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 		UNSERIALIZE_PTR(op_array->literals);
 		p = op_array->literals;
-		ENVELOCK_BOUND_COUNT(p, op_array->last_literal);
+		ENVELOCK_FC_CLAIM_ARRAY(p, op_array->last_literal, ENVELOCK_FC_K_ZVALS);
 		end = p + op_array->last_literal;
 		while (p < end) {
 			envelock_file_cache_unserialize_zval(p, script, buf);
@@ -1208,7 +1222,7 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 		UNSERIALIZE_PTR(op_array->opcodes);
 		opline = op_array->opcodes;
-		ENVELOCK_BOUND_COUNT(opline, op_array->last);
+		ENVELOCK_FC_CLAIM_ARRAY(opline, op_array->last, ENVELOCK_FC_K_OPCODES);
 		if (opline) {
 			envelock_fc_own_op_array(op_array);
 		} else if (UNEXPECTED(op_array->last)) {
@@ -1302,7 +1316,7 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 			UNSERIALIZE_PTR(op_array->vars);
 			p = op_array->vars;
-			ENVELOCK_BOUND_COUNT(p, op_array->last_var);
+			ENVELOCK_FC_CLAIM_ARRAY(p, op_array->last_var, ENVELOCK_FC_K_PTRS);
 			end = p + op_array->last_var;
 			while (p < end) {
 				if (!IS_UNSERIALIZED(*p)) {
@@ -1316,9 +1330,10 @@ static void envelock_file_cache_unserialize_op_array(zend_op_array           *op
 
 		if (op_array->num_dynamic_func_defs) {
 			UNSERIALIZE_PTR(op_array->dynamic_func_defs);
-			ENVELOCK_BOUND_COUNT(op_array->dynamic_func_defs, op_array->num_dynamic_func_defs);
+			ENVELOCK_FC_CLAIM_ARRAY(op_array->dynamic_func_defs, op_array->num_dynamic_func_defs, ENVELOCK_FC_K_PTRS);
 			for (uint32_t i = 0; i < op_array->num_dynamic_func_defs; i++) {
 				UNSERIALIZE_PTR(op_array->dynamic_func_defs[i]);
+				ENVELOCK_FC_CLAIM(op_array->dynamic_func_defs[i], sizeof(zend_op_array), ENVELOCK_FC_K_OP_ARRAY);
 				envelock_file_cache_unserialize_op_array(op_array->dynamic_func_defs[i], script, buf);
 			}
 		}
@@ -1344,7 +1359,7 @@ static void envelock_file_cache_unserialize_func(zval                    *zv,
 	}
 	UNSERIALIZE_PTR(Z_PTR_P(zv));
 	func = Z_PTR_P(zv);
-	ENVELOCK_FC_EXTENT(func, sizeof(zend_op_array));
+	ENVELOCK_FC_CLAIM(func, sizeof(zend_op_array), ENVELOCK_FC_K_OP_ARRAY);
 	if (UNEXPECTED(func->type != ZEND_USER_FUNCTION)) {
 		/* an internal function's handler would be a raw image value */
 		ENVELOCK_FC_FAIL("function type");
@@ -1364,7 +1379,7 @@ static void envelock_file_cache_unserialize_prop_info(zval                    *z
 
 		UNSERIALIZE_PTR(Z_PTR_P(zv));
 		prop = Z_PTR_P(zv);
-		ENVELOCK_FC_EXTENT(prop, sizeof(zend_property_info));
+		ENVELOCK_FC_CLAIM(prop, sizeof(zend_property_info), ENVELOCK_FC_K_PROP);
 
 		if (UNEXPECTED(prop->ce == NULL || prop->name == NULL)) {
 			ENVELOCK_FC_FAIL("property without a class or a name");
@@ -1395,9 +1410,11 @@ static void envelock_file_cache_unserialize_class_constant(zval                 
 
 		UNSERIALIZE_PTR(Z_PTR_P(zv));
 		c = Z_PTR_P(zv);
-		ENVELOCK_FC_EXTENT(c, sizeof(zend_class_constant));
+		ENVELOCK_FC_CLAIM(c, sizeof(zend_class_constant), ENVELOCK_FC_K_CONST);
 
-		ZEND_ASSERT(c->ce != NULL);
+		if (UNEXPECTED(c->ce == NULL)) {
+			ENVELOCK_FC_FAIL("class constant without its class");
+		}
 		if (!IS_UNSERIALIZED(c->ce)) {
 			UNSERIALIZE_PTR(c->ce);
 
@@ -1422,7 +1439,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 	}
 	UNSERIALIZE_PTR(Z_PTR_P(zv));
 	ce = Z_PTR_P(zv);
-	ENVELOCK_FC_EXTENT(ce, sizeof(zend_class_entry));
+	ENVELOCK_FC_CLAIM(ce, sizeof(zend_class_entry), ENVELOCK_FC_K_CLASS);
 	envelock_fc_fix_class(ce);
 
 	UNSERIALIZE_STR(ce->name);
@@ -1447,7 +1464,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 
 		UNSERIALIZE_PTR(ce->default_properties_table);
 		p = ce->default_properties_table;
-		ENVELOCK_BOUND_COUNT(p, ce->default_properties_count);
+		ENVELOCK_FC_CLAIM_ARRAY(p, ce->default_properties_count, ENVELOCK_FC_K_ZVALS);
 		end = p + ce->default_properties_count;
 		while (p < end) {
 			envelock_file_cache_unserialize_zval(p, script, buf);
@@ -1458,7 +1475,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 		zval *p, *end;
 		UNSERIALIZE_PTR(ce->default_static_members_table);
 		p = ce->default_static_members_table;
-		ENVELOCK_BOUND_COUNT(p, ce->default_static_members_count);
+		ENVELOCK_FC_CLAIM_ARRAY(p, ce->default_static_members_count, ENVELOCK_FC_K_ZVALS);
 		end = p + ce->default_static_members_count;
 		while (p < end) {
 			envelock_file_cache_unserialize_zval(p, script, buf);
@@ -1483,12 +1500,12 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 		uint32_t i;
 		UNSERIALIZE_PTR(ce->properties_info_table);
 		/* bounded by its own count, also when default_properties_table is NULL (BC-4) */
-		ENVELOCK_BOUND_COUNT(ce->properties_info_table, ce->default_properties_count);
+		ENVELOCK_FC_CLAIM_ARRAY(ce->properties_info_table, ce->default_properties_count, ENVELOCK_FC_K_PTRS);
 
 		for (i = 0; i < ce->default_properties_count; i++) {
 			UNSERIALIZE_PTR(ce->properties_info_table[i]);
 			if (ce->properties_info_table[i]) {
-				ENVELOCK_FC_EXTENT(ce->properties_info_table[i], sizeof(zend_property_info));
+				ENVELOCK_FC_CLAIM(ce->properties_info_table[i], sizeof(zend_property_info), ENVELOCK_FC_K_PROP);
 			}
 		}
 	}
@@ -1496,13 +1513,21 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 	if (ce->num_interfaces) {
 		uint32_t i;
 
-		ZEND_ASSERT(!(ce->ce_flags & ZEND_ACC_LINKED));
+		if (UNEXPECTED(ce->ce_flags & ZEND_ACC_LINKED)) {
+			ENVELOCK_FC_FAIL("linked class with interface names");
+		}
 		UNSERIALIZE_PTR(ce->interface_names);
-		ENVELOCK_BOUND_COUNT(ce->interface_names, ce->num_interfaces);
+		ENVELOCK_FC_CLAIM_ARRAY(ce->interface_names, ce->num_interfaces, ENVELOCK_FC_K_CLASS_NAMES);
 
 		for (i = 0; i < ce->num_interfaces; i++) {
 			UNSERIALIZE_STR(ce->interface_names[i].name);
 			UNSERIALIZE_STR(ce->interface_names[i].lc_name);
+			/* BC-17: mandatory for an unlinked class; a NULL offset is a NULL deref at link time
+			 * (zend_string_tolower / hash lookup), reachable outside the install guard with delayed
+			 * binding. The if-guarded alias/precedence names below may legitimately be NULL. */
+			if (UNEXPECTED(!ce->interface_names[i].name || !ce->interface_names[i].lc_name)) {
+				ENVELOCK_FC_FAIL("interface name without a name");
+			}
 		}
 	}
 
@@ -1510,11 +1535,14 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 		uint32_t i;
 
 		UNSERIALIZE_PTR(ce->trait_names);
-		ENVELOCK_BOUND_COUNT(ce->trait_names, ce->num_traits);
+		ENVELOCK_FC_CLAIM_ARRAY(ce->trait_names, ce->num_traits, ENVELOCK_FC_K_CLASS_NAMES);
 
 		for (i = 0; i < ce->num_traits; i++) {
 			UNSERIALIZE_STR(ce->trait_names[i].name);
 			UNSERIALIZE_STR(ce->trait_names[i].lc_name);
+			if (UNEXPECTED(!ce->trait_names[i].name || !ce->trait_names[i].lc_name)) {   /* BC-17 */
+				ENVELOCK_FC_FAIL("trait name without a name");
+			}
 		}
 
 		if (ce->trait_aliases) {
@@ -1524,11 +1552,11 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 			p = ce->trait_aliases;
 
 			/* NULL-terminated: every slot read is bounded */
-			ENVELOCK_BOUND_COUNT(p, 1);
+			ENVELOCK_FC_CLAIM_ARRAY(p, 1, ENVELOCK_FC_K_SLOT);
 			while (*p) {
 				UNSERIALIZE_PTR(*p);
 				q = *p;
-				ENVELOCK_FC_EXTENT(q, sizeof(zend_trait_alias));
+				ENVELOCK_FC_CLAIM(q, sizeof(zend_trait_alias), ENVELOCK_FC_K_MISC);
 
 				if (q->trait_method.method_name) {
 					UNSERIALIZE_STR(q->trait_method.method_name);
@@ -1541,7 +1569,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 					UNSERIALIZE_STR(q->alias);
 				}
 				p++;
-				ENVELOCK_BOUND_COUNT(p, 1);
+				ENVELOCK_FC_CLAIM_ARRAY(p, 1, ENVELOCK_FC_K_SLOT);
 			}
 		}
 
@@ -1552,12 +1580,14 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 			UNSERIALIZE_PTR(ce->trait_precedences);
 			p = ce->trait_precedences;
 
-			ENVELOCK_BOUND_COUNT(p, 1);
+			ENVELOCK_FC_CLAIM_ARRAY(p, 1, ENVELOCK_FC_K_SLOT);
 			while (*p) {
 				UNSERIALIZE_PTR(*p);
 				q = *p;
 				ENVELOCK_FC_EXTENT(q, offsetof(zend_trait_precedence, exclude_class_names));
 				ENVELOCK_BOUND_COUNT(q->exclude_class_names, q->num_excludes);
+				ENVELOCK_FC_CLAIM(q, offsetof(zend_trait_precedence, exclude_class_names)
+					+ (size_t) q->num_excludes * sizeof(zend_string *), ENVELOCK_FC_K_MISC);
 
 				if (q->trait_method.method_name) {
 					UNSERIALIZE_STR(q->trait_method.method_name);
@@ -1570,7 +1600,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 					UNSERIALIZE_STR(q->exclude_class_names[j]);
 				}
 				p++;
-				ENVELOCK_BOUND_COUNT(p, 1);
+				ENVELOCK_FC_CLAIM_ARRAY(p, 1, ENVELOCK_FC_K_SLOT);
 			}
 		}
 	}
@@ -1591,7 +1621,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 
 	if (ce->iterator_funcs_ptr) {
 		UNSERIALIZE_PTR(ce->iterator_funcs_ptr);
-		ENVELOCK_FC_EXTENT(ce->iterator_funcs_ptr, sizeof(zend_class_iterator_funcs));
+		ENVELOCK_FC_CLAIM(ce->iterator_funcs_ptr, sizeof(zend_class_iterator_funcs), ENVELOCK_FC_K_MISC);
 		UNSERIALIZE_PTR(ce->iterator_funcs_ptr->zf_new_iterator);
 		UNSERIALIZE_PTR(ce->iterator_funcs_ptr->zf_rewind);
 		UNSERIALIZE_PTR(ce->iterator_funcs_ptr->zf_valid);
@@ -1601,7 +1631,7 @@ static void envelock_file_cache_unserialize_class(zval                    *zv,
 	}
 	if (ce->arrayaccess_funcs_ptr) {
 		UNSERIALIZE_PTR(ce->arrayaccess_funcs_ptr);
-		ENVELOCK_FC_EXTENT(ce->arrayaccess_funcs_ptr, sizeof(zend_class_arrayaccess_funcs));
+		ENVELOCK_FC_CLAIM(ce->arrayaccess_funcs_ptr, sizeof(zend_class_arrayaccess_funcs), ENVELOCK_FC_K_MISC);
 		UNSERIALIZE_PTR(ce->arrayaccess_funcs_ptr->zf_offsetget);
 		UNSERIALIZE_PTR(ce->arrayaccess_funcs_ptr->zf_offsetexists);
 		UNSERIALIZE_PTR(ce->arrayaccess_funcs_ptr->zf_offsetset);
@@ -1630,10 +1660,10 @@ static void envelock_file_cache_unserialize_warnings(envelock_persistent_script 
 {
 	if (script->warnings) {
 		UNSERIALIZE_PTR(script->warnings);
-		ENVELOCK_BOUND_COUNT(script->warnings, script->num_warnings);
+		ENVELOCK_FC_CLAIM_ARRAY(script->warnings, script->num_warnings, ENVELOCK_FC_K_PTRS);
 		for (uint32_t i = 0; i < script->num_warnings; i++) {
 			UNSERIALIZE_PTR(script->warnings[i]);
-			ENVELOCK_FC_EXTENT(script->warnings[i], sizeof(zend_error_info));
+			ENVELOCK_FC_CLAIM(script->warnings[i], sizeof(zend_error_info), ENVELOCK_FC_K_MISC);
 			UNSERIALIZE_STR(script->warnings[i]->filename);
 			UNSERIALIZE_STR(script->warnings[i]->message);
 		}
@@ -1648,7 +1678,7 @@ static void envelock_file_cache_unserialize_early_bindings(envelock_persistent_s
 		uint32_t cache_size = script->script.main_op_array.cache_size;
 
 		UNSERIALIZE_PTR(script->early_bindings);
-		ENVELOCK_BOUND_COUNT(script->early_bindings, script->num_early_bindings);
+		ENVELOCK_FC_CLAIM_ARRAY(script->early_bindings, script->num_early_bindings, ENVELOCK_FC_K_MISC);
 		for (uint32_t i = 0; i < script->num_early_bindings; i++) {
 			zend_early_binding *early_binding = &script->early_bindings[i];
 
@@ -1682,7 +1712,7 @@ void envelock_file_cache_unserialize(envelock_persistent_script  *script,
 	volatile char stack_marker = 0;
 
 	envelock_fc_begin(buf, size, (uintptr_t) &stack_marker);
-	ENVELOCK_FC_EXTENT(script, sizeof(*script));
+	ENVELOCK_FC_CLAIM(script, sizeof(*script), ENVELOCK_FC_K_SCRIPT);
 	script->mem = buf;
 
 	UNSERIALIZE_STR(script->script.filename);

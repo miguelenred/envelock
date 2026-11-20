@@ -97,8 +97,8 @@ python encoder/envelock.py pack --owner owner.enc.json --recipient servidor1.pub
 ```
 
 The command line also has `--php-ext .module` (extra PHP extensions), `--serial <n>`, and the
-advanced transforms the assistant deliberately omits (`--obfuscate-flatten`, `--obfuscate-names`,
-`--virtualize`, `--bytecode`), which `recommend` never enables on its own. Deploy the output folder; leave `vendor/` out of the encryption and
+advanced transforms the assistant deliberately omits (`--obfuscate-names`, `--virtualize`,
+`--bytecode`), which `recommend` never enables on its own. Deploy the output folder; leave `vendor/` out of the encryption and
 deploy it separately ([MANUAL](MANUAL.md) §14). With `vendor/` left out, keep **Include protection**
 off: an error or shutdown handler registered from `vendor/` would be refused when it loads one of your
 protected classes ([MANUAL](MANUAL.md) §14, `--include-protection`). If Composer's `vendor/` does go
@@ -121,13 +121,13 @@ tree and shows the **strongest protection that is safe for it**, with every prot
 - **Enable, but check first** — recommended, but whether it works depends on something the analysis
   cannot see: the server's `php.ini` (`--no-ffi`, `--no-prepend`), its PHP build and your pack-time
   setup (`--bytecode`), whether the whole application is in the package (`--include-protection`), code
-  that dispatches by names built at run time (`--obfuscate-methods`), libraries that read docblocks
-  (`--strip-comments`, `--compact`; it names the one it finds in `vendor/`), or PHP the app writes at
-  run time (`--sealed`). Each says why it is unsure and how to check (often:
-  `scripts/envelock-preflight.php` on the server); drop any you cannot confirm.
+  that dispatches by names built at run time (`--obfuscate-methods`), control-flow flattening whose
+  only cost is some speed (`--obfuscate-flatten`), libraries that read docblocks (`--strip-comments`,
+  `--compact`), or PHP the app writes at run time (`--sealed`). Each says why it is unsure and how to
+  check (often: `scripts/envelock-preflight.php` on the server); drop any you cannot confirm.
 - **Do not enable** — with the reason for each, including the options it never recommends on its own
-  (`--obfuscate-properties`, `--vault-strings`, `--obfuscate-flatten`, `--obfuscate-names`,
-  `--virtualize`), and where an option *might* work it says so and how to try it.
+  (`--obfuscate-properties`, `--vault-strings`, `--obfuscate-names`, `--virtualize`), and where an
+  option *might* work it says so and how to try it.
 
 It also lists any files to keep cleartext (`--exclude`) because they read
 their own source, and prints a ready-to-fill `pack` command. It is read-only and changes nothing. It

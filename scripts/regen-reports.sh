@@ -75,7 +75,7 @@ int main(int c,char**v){ unsigned char*seed=0; size_t sn=0;
   printf("exerciser completed\n"); return 0; }
 EOF
 gcc -fsanitize=address,undefined -fno-sanitize-recover=all -O1 -g -I"$work" -I"$root/extension" \
-  "$work/exercise.c" "$root/extension/envelock_crypto.c" $(pkg-config --cflags --libs libcrypto) -o "$work/exercise"
+  "$work/exercise.c" "$root/extension/envelock_crypto.c" $(pkg-config --static --cflags --libs libcrypto) -o "$work/exercise"
 {
   echo "Envelock crypto core — gcc AddressSanitizer + UndefinedBehaviorSanitizer exerciser"
   echo "date: $now"

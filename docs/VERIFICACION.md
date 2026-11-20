@@ -11,6 +11,8 @@
 
 All the evidence in `docs/reports/` is **regenerated** by running `scripts/regen-reports.sh` (it is not hand-edited). What this machine produces and what corresponds to CI is in `docs/reports/README.md`.
 
+**Released-artifact provenance.** Every released loader and PIE asset attached to a GitHub Release carries a GitHub artifact **attestation**, produced by `.github/workflows/release.yml` (which also builds a portable Linux loader). Check a downloaded binary's provenance against the repository with `gh attestation verify <file> --repo miguelenred/envelock` before trusting it; this is in addition to the per-file hashes in `prebuilt/SHA256SUMS` and the assets' own `SHA256SUMS`.
+
 ## Anti-root architecture verification (November 5, 2026)
 
 After adopting the independent anti-root continuation (see `docs/AUDITORIA.md`, Pass 15), the suite was
@@ -68,6 +70,7 @@ re-run in this environment. Honest status, with what could not be verified here 
 | Static analysis of the C code | Clang Static Analyzer | no diagnostics | `clang-crypto.txt`, `clang-file.txt`, `clang-zend.txt` (empty) |
 | Memory safety of the C core | gcc ASan + UBSan (bounded exerciser) | no errors | `fuzz-asan-ubsan.txt` |
 | Coverage-guided fuzzing of the C core | libFuzzer + ASan + UBSan, leak detection (`scripts/audit-native.sh`) | 5,000,000 executions, no crashes, no leaks | — |
+| Continuous fuzzing of the bytecode deserializer | `scripts/fuzz_bytecode.py` under ASan + UBSan on every supported PHP, a permanent CI job (`.github/workflows/checks.yml`) | a mutated image is always rejected — never a crash nor an access outside its buffer | — |
 | Static analysis of the encoder/scripts | bandit 1.9.4 | 0 findings | `bandit.json` |
 | Style/lint | ruff 0.17.2 | no issues | `ruff.json` (`[]`) |
 | Dependencies (full hash-pinned lock) | pip-audit 2.10.1 | 0 known vulnerabilities | `dependencies.json` |

@@ -338,6 +338,9 @@ pie install --with-php-path=C:\php\php.exe envelock/loader     # Windows
   needs PHP's development files, OpenSSL 3 headers, `pkg-config` and a compiler
   (`sudo apt install php8.4-dev libssl-dev pkg-config` or the `dnf` equivalent); the build is
   hardened as the prebuilt one is (`extension/config.m4`).
+- **Provenance of the downloaded binary (optional).** Every loader and PIE asset attached to the
+  GitHub Release carries a GitHub artifact attestation; verify one against the repository with
+  `gh attestation verify <file> --repo miguelenred/envelock`.
 - PIE then adds `extension=envelock` (to a `conf.d` file, through `phpenmod` or
   `docker-php-ext-enable`, or to `php.ini`), using `sudo` if it has to.
 - **What PIE does not do:** the identity file and the `envelock.identity` line (§3.1–3.2), the

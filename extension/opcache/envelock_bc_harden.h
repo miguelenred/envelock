@@ -74,6 +74,15 @@ static zend_always_inline bool envelock_fc_inside(const void *p, size_t bytes)
 		&& bytes <= (size_t) (envelock_fc_base + envelock_fc_size - c);
 }
 
+/* Every structure the persistence step lays out starts on a ZEND_MM_ALIGNMENT boundary (its arena
+ * rounds each allocation up with ZEND_ALIGNED_SIZE, and the region itself starts aligned: the image
+ * header is a multiple of 8 bytes and the buffer comes from emalloc/malloc). So a relocated offset
+ * that is not a multiple of it cannot come from the emitter, and dereferencing the pointer it makes
+ * (a HashTable, a zend_string, a zval, an opline...) would be a misaligned access: undefined behaviour
+ * the compiler is free to exploit (UBSan, bytecode deserializer fuzzing, Nov 2026). Checked where the
+ * two relocation macros of every layer turn an offset into a pointer. */
+#define ENVELOCK_FC_ALIGNED(offset) ((((size_t) (offset)) & (ZEND_MM_ALIGNMENT - 1)) == 0)
+
 /* A structure the walk is about to read or write must lie entirely inside the region (BC-15). */
 #define ENVELOCK_FC_EXTENT(p, bytes) do { \
 		if (UNEXPECTED(!envelock_fc_inside((p), (bytes)))) { \
@@ -89,6 +98,71 @@ static zend_always_inline bool envelock_fc_inside(const void *p, size_t bytes)
 				/ sizeof(*(p)))) { \
 			ENVELOCK_FC_FAIL("element count out of range"); \
 		} \
+	} while (0)
+
+/* ------------------------------------------------------------ ownership (fuzzing Nov 2026)
+ * The walk writes in place: relocated pointers, normalized string headers, rebuilt hash indexes,
+ * opline handlers. Two structures laid over each other in a malformed image let a write meant for one
+ * change the other after it was checked (a table's struct under its own hash index, a string over the
+ * field that points to it, a class pointer in a bucket rewritten later), and the damage surfaced at
+ * install or at the engine's shutdown, as reads of wild addresses. So every structure the persistence
+ * step allocated is CLAIMED, granule by granule (ZEND_MM_ALIGNMENT bytes, the step's own rounding): a
+ * granule belongs to one structure only. The same structure reached again (a shared string, an
+ * inherited method, a shared array) is the same claim, of the same kind, and passes; anything else that
+ * overlaps it is refused, and so is one address claimed as two kinds. A structure embedded in another
+ * (a class's method table, the script's main op_array) is part of its container's claim. Every claim
+ * is made during the walk, so a refused image never reaches the install step. */
+enum {
+	ENVELOCK_FC_K_STRING = 1, ENVELOCK_FC_K_TABLE, ENVELOCK_FC_K_TABLE_DATA, ENVELOCK_FC_K_ZVALS,
+	ENVELOCK_FC_K_OPCODES, ENVELOCK_FC_K_ARG_INFO, ENVELOCK_FC_K_PTRS, ENVELOCK_FC_K_OP_ARRAY,
+	ENVELOCK_FC_K_PROP, ENVELOCK_FC_K_CONST, ENVELOCK_FC_K_CLASS, ENVELOCK_FC_K_CLASS_NAMES,
+	ENVELOCK_FC_K_ATTRIBUTE, ENVELOCK_FC_K_TYPE_LIST, ENVELOCK_FC_K_AST, ENVELOCK_FC_K_AST_REF,
+	ENVELOCK_FC_K_SLOT, ENVELOCK_FC_K_LIVE_RANGE, ENVELOCK_FC_K_TRY_CATCH, ENVELOCK_FC_K_SCRIPT,
+	ENVELOCK_FC_K_MISC
+};
+/* One byte per granule: the kind of the structure that owns it, with ENVELOCK_FC_START on the
+ * structure's first granule; 0 = free. A claim always covers a contiguous run of granules, so a
+ * granule after a start and before the next one belongs to the structure of that start. A claim
+ * therefore passes only if its first granule is free or the start of the same kind, and every later
+ * granule is free or a non-start granule of the same kind: the same structure reached again. A claim
+ * that starts inside another structure, runs into another's start, or names another kind is refused.
+ * That decides exactly what a per-granule owner tag (start index and kind) decides, in an eighth of
+ * the image's size instead of half of it. */
+#define ENVELOCK_FC_START 0x80
+
+static unsigned char *envelock_fc_owner;
+
+static void envelock_fc_claim(const void *p, size_t bytes, uint32_t kind)
+{
+	size_t first, last, g;
+	unsigned char *owner = envelock_fc_owner;
+	const unsigned char body = (unsigned char) kind, head = (unsigned char) (kind | ENVELOCK_FC_START);
+
+	if (bytes == 0) {
+		return;
+	}
+	ENVELOCK_FC_EXTENT(p, bytes);
+	first = (size_t) ((const char *) p - envelock_fc_base) / ZEND_MM_ALIGNMENT;
+	last = ((size_t) ((const char *) p - envelock_fc_base) + bytes - 1) / ZEND_MM_ALIGNMENT;
+	if (owner[first] == 0) {
+		owner[first] = head;
+	} else if (UNEXPECTED(owner[first] != head)) {
+		ENVELOCK_FC_FAIL("structures overlap");
+	}
+	for (g = first + 1; g <= last; g++) {
+		if (owner[g] == 0) {
+			owner[g] = body;
+		} else if (UNEXPECTED(owner[g] != body)) {
+			ENVELOCK_FC_FAIL("structures overlap");
+		}
+	}
+}
+
+#define ENVELOCK_FC_CLAIM(p, bytes, kind) envelock_fc_claim((p), (bytes), (kind))
+/* A counted array the image allocated: bounded like ENVELOCK_BOUND_COUNT, then claimed whole. */
+#define ENVELOCK_FC_CLAIM_ARRAY(p, count, kind) do { \
+		ENVELOCK_BOUND_COUNT(p, count); \
+		envelock_fc_claim((p), (size_t) (count) * sizeof(*(p)), (kind)); \
 	} while (0)
 
 /* -------------------------------------------------------------- recursion depth (BC-13)
@@ -126,6 +200,7 @@ static zend_always_inline void envelock_fc_check_string(zend_string *s)
 		|| ZSTR_LEN(s) > (size_t) (envelock_fc_base + envelock_fc_size - ZSTR_VAL(s)) - 1)) {
 		ENVELOCK_FC_FAIL("string out of range");
 	}
+	ENVELOCK_FC_CLAIM(s, _ZSTR_HEADER_SIZE + ZSTR_LEN(s) + 1, ENVELOCK_FC_K_STRING);
 	GC_SET_REFCOUNT(s, 2);
 	GC_TYPE_INFO(s) = GC_STRING | (IS_STR_INTERNED << GC_FLAGS_SHIFT);
 	ZSTR_VAL(s)[ZSTR_LEN(s)] = '\0';
@@ -158,6 +233,7 @@ static void envelock_fc_begin(void *buf, size_t size, uintptr_t stack_top)
 	zend_hash_init(&envelock_fc_opcodes, 64, NULL, NULL, 0);
 	zend_hash_init(&envelock_fc_op_arrays, 64, NULL, NULL, 0);
 	envelock_fc_live = true;
+	envelock_fc_owner = ecalloc(size / ZEND_MM_ALIGNMENT + 1, 1);
 }
 
 /* After a FAULT caught by the guard the bookkeeping may be half-updated: forget it without freeing
@@ -170,6 +246,7 @@ void envelock_file_cache_unserialize_abandon(void)
 	envelock_fc_base = NULL;
 	envelock_fc_size = 0;
 	envelock_fc_class = NULL;
+	envelock_fc_owner = NULL;   /* request heap memory: reclaimed with the request if not freed */
 }
 
 /* Release the bookkeeping of the last walk (idempotent; the walk ended normally or by a bailout). */
@@ -184,6 +261,9 @@ void envelock_file_cache_unserialize_cleanup(void)
 		}
 		if (envelock_fc_shared.items) {
 			efree(envelock_fc_shared.items);
+		}
+		if (envelock_fc_owner) {
+			efree(envelock_fc_owner);
 		}
 	}
 	envelock_file_cache_unserialize_abandon();
@@ -208,29 +288,46 @@ static void envelock_fc_check_table(HashTable *ht)
 {
 	uint32_t size = ht->nTableSize;
 
+	/* An initialized table always has data; a NULL left by the relocation (a zero offset is not
+	 * relocated) would make the extent below arithmetic on a null pointer (UBSan, fuzzing Nov 2026). */
+	if (UNEXPECTED(ht->arData == NULL)) {
+		ENVELOCK_FC_FAIL("hash table without data");
+	}
 	HT_SET_ITERATORS_COUNT(ht, 0);
 	ht->nInternalPointer = 0;
 	if (UNEXPECTED(size == 0 || (size & (size - 1)) != 0 || size > HT_MAX_SIZE
 		|| ht->nNumUsed > size || ht->nNumOfElements > ht->nNumUsed)) {
 		ENVELOCK_FC_FAIL("hash table size");
 	}
+	const char *data;
+	size_t data_size;
+
 	if (HT_IS_PACKED(ht)) {
 		if (UNEXPECTED(ht->nTableMask != HT_MIN_MASK)) {
 			ENVELOCK_FC_FAIL("packed table mask");
 		}
-		ENVELOCK_FC_EXTENT((char *) ht->arPacked - HT_HASH_SIZE(HT_MIN_MASK),
-			HT_HASH_SIZE(HT_MIN_MASK) + (size_t) ht->nNumUsed * sizeof(zval));
+		data = (const char *) ht->arPacked - HT_HASH_SIZE(HT_MIN_MASK);
+		data_size = HT_HASH_SIZE(HT_MIN_MASK) + (size_t) ht->nNumUsed * sizeof(zval);
 	} else {
-		uint32_t hash_size = (uint32_t) -(int32_t) ht->nTableMask;
+		/* Unsigned negation: -(int32_t) of INT32_MIN is undefined (UBSan, fuzzing Nov 2026). */
+		uint32_t hash_size = 0u - (uint32_t) ht->nTableMask;
 
 		/* h | nTableMask stays inside the hash part only when its size is a power of two. */
 		if (UNEXPECTED(hash_size < 2 || (hash_size & (hash_size - 1)) != 0
 			|| hash_size > 2u * HT_MAX_SIZE)) {
 			ENVELOCK_FC_FAIL("hash table mask");
 		}
-		ENVELOCK_FC_EXTENT((char *) ht->arData - (size_t) hash_size * sizeof(uint32_t),
-			(size_t) hash_size * sizeof(uint32_t) + (size_t) ht->nNumUsed * sizeof(Bucket));
+		data = (const char *) ht->arData - (size_t) hash_size * sizeof(uint32_t);
+		data_size = (size_t) hash_size * sizeof(uint32_t) + (size_t) ht->nNumUsed * sizeof(Bucket);
 	}
+	ENVELOCK_FC_EXTENT(data, data_size);
+	/* The index is rebuilt in place (envelock_fc_rehash fills it with 0xff first): data laid over the
+	 * table's own struct would overwrite arData and the counts that bound the rebuild, which then walked
+	 * a Bucket at 0xffffffffffffffff (UBSan, fuzzing Nov 2026). */
+	if (UNEXPECTED((const char *) ht < data + data_size && (const char *) (ht + 1) > data)) {
+		ENVELOCK_FC_FAIL("hash table data overlaps the table");
+	}
+	ENVELOCK_FC_CLAIM(data, data_size, ENVELOCK_FC_K_TABLE_DATA);
 	zend_hash_index_add_empty_element(&envelock_fc_tables, (zend_ulong) (uintptr_t) ht);
 }
 
@@ -290,6 +387,7 @@ static zend_always_inline void envelock_fc_fix_array(zval *zv)
 {
 	HashTable *ht = Z_ARR_P(zv);
 
+	ENVELOCK_FC_CLAIM(ht, sizeof(HashTable), ENVELOCK_FC_K_TABLE);
 	Z_TYPE_FLAGS_P(zv) = 0;
 	GC_SET_REFCOUNT(ht, 2);
 	GC_TYPE_INFO(ht) = GC_ARRAY | ((IS_ARRAY_IMMUTABLE | GC_NOT_COLLECTABLE) << GC_FLAGS_SHIFT);
@@ -321,20 +419,37 @@ static zend_always_inline void envelock_fc_check_ast(zend_ast *ast)
 {
 	ENVELOCK_FC_EXTENT(ast, offsetof(zend_ast, child));
 	if (ast->kind == ZEND_AST_ZVAL || ast->kind == ZEND_AST_CONSTANT) {
-		ENVELOCK_FC_EXTENT(ast, sizeof(zend_ast_zval));
+		ENVELOCK_FC_CLAIM(ast, sizeof(zend_ast_zval), ENVELOCK_FC_K_AST);
 	} else if (zend_ast_is_list(ast)) {
 		zend_ast_list *list = zend_ast_get_list(ast);
 
 		ENVELOCK_FC_EXTENT(list, offsetof(zend_ast_list, child));
 		ENVELOCK_BOUND_COUNT(list->child, list->children);
+		ENVELOCK_FC_CLAIM(list, offsetof(zend_ast_list, child) + (size_t) list->children * sizeof(zend_ast *),
+			ENVELOCK_FC_K_AST);
+	} else if (zend_ast_is_special(ast)) {
+		/* A special node has no child count: zend_ast_get_num_children() assumes one that is not
+		 * special, and on 8.5 asserts it (undefined behaviour in a release build). A znode or a
+		 * declaration never appears in a persisted constant expression; the 8.5 op_array node is sized
+		 * where the walk handles it (UBSan, bytecode deserializer fuzzing, Nov 2026). */
+#if PHP_VERSION_ID >= 80500
+		if (ast->kind == ZEND_AST_OP_ARRAY) {
+			ENVELOCK_FC_CLAIM(ast, sizeof(zend_ast_op_array), ENVELOCK_FC_K_AST);
+		} else
+#endif
+		{
+			ENVELOCK_FC_FAIL("special node in a constant expression");
+		}
 	} else {
-		ENVELOCK_FC_EXTENT(ast, zend_ast_size(zend_ast_get_num_children(ast)));
+		ENVELOCK_FC_CLAIM(ast, zend_ast_size(zend_ast_get_num_children(ast)), ENVELOCK_FC_K_AST);
 	}
 }
 
 static zend_always_inline void envelock_fc_fix_ast_ref(zval *zv)
 {
 	ENVELOCK_FC_EXTENT(Z_AST_P(zv), sizeof(zend_ast_ref) + offsetof(zend_ast, child));
+	/* the reference header only: its root node, right after it, is claimed as an AST node */
+	ENVELOCK_FC_CLAIM(Z_AST_P(zv), sizeof(zend_ast_ref), ENVELOCK_FC_K_AST_REF);
 	GC_SET_REFCOUNT(Z_AST_P(zv), 1);
 	GC_TYPE_INFO(Z_AST_P(zv)) = GC_CONSTANT_AST | (GC_IMMUTABLE << GC_FLAGS_SHIFT);
 }
@@ -432,6 +547,98 @@ static zend_always_inline void envelock_fc_generic_call(zend_op *opline)
 	}
 }
 
+/* BC-16: a branch's target must land exactly on an opline of THIS op_array. A signed-but-malicious
+ * image can set any jump offset; at run time the VM computes opline+offset and reads that address's
+ * first qword as opline->handler and calls it. Handlers are re-selected (envelock_fc_set_handlers) only
+ * for oplines in [opcodes, opcodes+last), so a target outside that range keeps the image's raw bytes --
+ * an attacker-chosen code pointer. Relative targets (the x86-64/GCC default, ZEND_USE_ABS_JMP_ADDR=0)
+ * are never relocated, so nothing else looks at them; an absolute jmp_addr is only bounded to the whole
+ * image. The target is computed exactly as the VM computes it (OP_JMP_ADDR for op1/op2,
+ * ZEND_OFFSET_TO_OPLINE for the relative extended_value and the switch/match tables), then required to
+ * be an aligned, in-range opline. */
+static zend_always_inline void envelock_fc_require_opline(const zend_op_array *op_array, const void *target)
+{
+	const char *lo = (const char *) op_array->opcodes;
+	const char *hi = (const char *) (op_array->opcodes + op_array->last);
+	const char *t = (const char *) target;
+
+	if (UNEXPECTED(t < lo || t >= hi || (size_t) (t - lo) % sizeof(zend_op) != 0)) {
+		ENVELOCK_FC_FAIL("jump target outside the opcode array");
+	}
+}
+
+/* SWITCH_LONG/SWITCH_STRING/MATCH jump through op2's literal table (an array of relative offsets, each
+ * taken as opline+offset) and fall through to opline+extended_value; every target is validated. The
+ * table is a literal, already relocated and structurally checked before the opline walk. */
+static void envelock_fc_check_jumptable(const zend_op_array *op_array, const zend_op *opline)
+{
+	zval *table, *entry;
+
+	envelock_fc_require_opline(op_array, ZEND_OFFSET_TO_OPLINE(opline, opline->extended_value));
+	if (UNEXPECTED(opline->op2_type != IS_CONST)) {
+		ENVELOCK_FC_FAIL("switch/match without a jump table");
+	}
+	table = RT_CONSTANT(opline, opline->op2);
+	if (UNEXPECTED(Z_TYPE_P(table) != IS_ARRAY)) {
+		ENVELOCK_FC_FAIL("switch/match jump table is not an array");
+	}
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(table), entry) {
+		if (UNEXPECTED(Z_TYPE_P(entry) != IS_LONG)) {
+			ENVELOCK_FC_FAIL("switch/match jump table entry is not an offset");
+		}
+		envelock_fc_require_opline(op_array, ZEND_OFFSET_TO_OPLINE(opline, Z_LVAL_P(entry)));
+	} ZEND_HASH_FOREACH_END();
+}
+
+/* The jump operands match the serialise switch: op1 for JMP/FAST_CALL, op2 for the conditional jumps
+ * and CATCH (unless LAST_CATCH), extended_value for FE_FETCH, the op2 table for SWITCH/MATCH. Runs
+ * after the opline loop, where op1/op2 and the literal tables have been relocated. */
+static void envelock_fc_check_jumps(const zend_op_array *op_array)
+{
+	const zend_op *opline = op_array->opcodes, *end = opline + op_array->last;
+
+	for (; opline < end; opline++) {
+		switch (opline->opcode) {
+			case ZEND_JMP:
+			case ZEND_FAST_CALL:
+				envelock_fc_require_opline(op_array, OP_JMP_ADDR(opline, opline->op1));
+				break;
+			case ZEND_JMPZ:
+			case ZEND_JMPNZ:
+			case ZEND_JMPZ_EX:
+			case ZEND_JMPNZ_EX:
+			case ZEND_JMP_SET:
+			case ZEND_COALESCE:
+			case ZEND_FE_RESET_R:
+			case ZEND_FE_RESET_RW:
+			case ZEND_ASSERT_CHECK:
+			case ZEND_JMP_NULL:
+#if PHP_VERSION_ID >= 80300
+			case ZEND_BIND_INIT_STATIC_OR_JMP:   /* op2 jump, added in 8.3 */
+#endif
+#if PHP_VERSION_ID >= 80400
+			case ZEND_JMP_FRAMELESS:             /* op2 jump, added in 8.4 */
+#endif
+				envelock_fc_require_opline(op_array, OP_JMP_ADDR(opline, opline->op2));
+				break;
+			case ZEND_CATCH:
+				if (!(opline->extended_value & ZEND_LAST_CATCH)) {
+					envelock_fc_require_opline(op_array, OP_JMP_ADDR(opline, opline->op2));
+				}
+				break;
+			case ZEND_FE_FETCH_R:
+			case ZEND_FE_FETCH_RW:
+				envelock_fc_require_opline(op_array, ZEND_OFFSET_TO_OPLINE(opline, opline->extended_value));
+				break;
+			case ZEND_SWITCH_LONG:
+			case ZEND_SWITCH_STRING:
+			case ZEND_MATCH:
+				envelock_fc_check_jumptable(op_array, opline);
+				break;
+		}
+	}
+}
+
 /* The handler of every opline is chosen by THIS process' VM from the validated opline, exactly as
  * pass_two does (BC-12): the image's handler value is an index into zend_opcode_handlers that
  * zend_deserialize_opcode_handler() would use unchecked. The VM reads (opline + 1)->op1_type for
@@ -441,6 +648,7 @@ static void envelock_fc_set_handlers(zend_op_array *op_array)
 {
 	zend_op *opline = op_array->opcodes, *end = opline + op_array->last;
 
+	envelock_fc_check_jumps(op_array);
 	for (; opline < end; opline++) {
 		envelock_fc_generic_call(opline);
 		if (opline + 1 < end) {
@@ -473,9 +681,19 @@ static zend_always_inline void envelock_fc_check_arg_info(const zend_op_array *o
 	if (op_array->fn_flags & ZEND_ACC_VARIADIC) {
 		count++;
 	}
-	ENVELOCK_BOUND_COUNT((const zend_arg_info *) start, count);
+	ENVELOCK_FC_CLAIM_ARRAY((const zend_arg_info *) start, count, ENVELOCK_FC_K_ARG_INFO);
 	if (UNEXPECTED(op_array->required_num_args > op_array->num_args)) {
 		ENVELOCK_FC_FAIL("arg_info counts");
+	}
+}
+
+/* The engine reads a function's name and file without a check: the install step's redeclaration
+ * errors, backtraces, reflection. Only a script's main op_array has no name. A NULL there crashed the
+ * install of a second image declaring the same function (UBSan, fuzzing Nov 2026). */
+static zend_always_inline void envelock_fc_check_op_array_names(const zend_op_array *op_array, bool is_main)
+{
+	if (UNEXPECTED(op_array->filename == NULL || (op_array->function_name == NULL && !is_main))) {
+		ENVELOCK_FC_FAIL("op_array without a name or a file");
 	}
 }
 
@@ -493,13 +711,13 @@ static void envelock_fc_check_op_array_arrays(const zend_op_array *op_array)
 		if (UNEXPECTED(!op_array->live_range)) {
 			ENVELOCK_FC_FAIL("op_array without its live ranges");
 		}
-		ENVELOCK_BOUND_COUNT(op_array->live_range, op_array->last_live_range);
+		ENVELOCK_FC_CLAIM_ARRAY(op_array->live_range, op_array->last_live_range, ENVELOCK_FC_K_LIVE_RANGE);
 	}
 	if (op_array->last_try_catch) {
 		if (UNEXPECTED(!op_array->try_catch_array)) {
 			ENVELOCK_FC_FAIL("op_array without its try/catch table");
 		}
-		ENVELOCK_BOUND_COUNT(op_array->try_catch_array, op_array->last_try_catch);
+		ENVELOCK_FC_CLAIM_ARRAY(op_array->try_catch_array, op_array->last_try_catch, ENVELOCK_FC_K_TRY_CATCH);
 	}
 }
 
@@ -570,6 +788,17 @@ static zend_always_inline void envelock_fc_fix_class(zend_class_entry *ce)
 	if (UNEXPECTED(ce->type != ZEND_USER_CLASS)) {
 		ENVELOCK_FC_FAIL("class type");
 	}
+	/* read unchecked by the install step (redeclaration errors, the class-name cache) */
+	if (UNEXPECTED(ce->name == NULL || ce->info.user.filename == NULL)) {
+		ENVELOCK_FC_FAIL("class without a name or a file");
+	}
+	/* Built at run time, never persisted (the persistence step asserts it is NULL), so the walk never
+	 * relocates it: a value kept from the image was later released by the engine's shutdown
+	 * (zend_shutdown_executor_values -> zend_hash_release) at an arbitrary address (ASan, fuzzing
+	 * Nov 2026). */
+	if (UNEXPECTED(ce->backed_enum_table != NULL)) {
+		ENVELOCK_FC_FAIL("enum table in the image");
+	}
 	if (UNEXPECTED(ce->default_properties_count < 0 || ce->default_static_members_count < 0
 		|| (ce->default_properties_count && !ce->default_properties_table)
 		|| (ce->default_static_members_count && !ce->default_static_members_table))) {
@@ -627,7 +856,12 @@ static void envelock_fc_finish(envelock_persistent_script *script)
 		op_array->num_dynamic_func_defs = owner->num_dynamic_func_defs;
 	}
 
-	/* The install step assumes both script tables are dense and string-keyed. */
+	/* The install step assumes both script tables are dense and string-keyed. ZEND_HASH_MAP_FOREACH
+	 * below (and the install's own walk) assumes a hash, not a packed list: an assumption, undefined
+	 * behaviour when false in a release build (UBSan, fuzzing Nov 2026). */
+	if (UNEXPECTED(HT_IS_PACKED(&script->script.function_table) || HT_IS_PACKED(&script->script.class_table))) {
+		ENVELOCK_FC_FAIL("packed script table");
+	}
 	if (UNEXPECTED(script->script.function_table.nNumOfElements != script->script.function_table.nNumUsed
 		|| script->script.class_table.nNumOfElements != script->script.class_table.nNumUsed)) {
 		ENVELOCK_FC_FAIL("script tables with holes");

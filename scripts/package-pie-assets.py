@@ -109,10 +109,13 @@ def main(argv=None):
         sys.exit(f"version {args.version!r}: use the bare tag, e.g. 1.0.0 (PIE matches asset names on it)")
     prebuilt, out = Path(args.prebuilt), Path(args.out)
     sums = {}
+    # Accept both the text ("<hash>  name") and binary ("<hash> *name") sha256sum forms, exactly like
+    # scripts/check_release.py's SUM_LINE, so the two tools never disagree on the same manifest.
+    sum_line = re.compile(r"^([0-9a-fA-F]{64}) [ *](.+?)\s*$")
     for line in (prebuilt / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
-        if "  " in line:
-            digest, name = line.split("  ", 1)
-            sums[name.lstrip("*")] = digest
+        m = sum_line.match(line)
+        if m:
+            sums[m.group(2)] = m.group(1)
     extras = [(name, (ROOT / name).read_bytes()) for name in ("LICENSE", "NOTICE")]
 
     plan = []

@@ -1,9 +1,58 @@
 # Changelog
 
-## Unreleased
+## 1.1.2 — 2026-11-20 (end-to-end audit: deserializer hardening, attestations, continuous fuzzing)
+
+No format change: 1.1.x packages, identity files and licences are unchanged and interoperate in both
+directions, and nothing has to be repacked. A full end-to-end audit of the loader, the crypto core and
+the encoder found no attacker-reachable defect (every finding sits behind the Ed25519 signature that is
+verified before anything is decrypted or deserialized); this release closes the defense-in-depth gaps it
+raised and adds supply-chain attestations and continuous fuzzing.
+
+**Loader — bytecode deserializer (defense-in-depth; it treats a signed image as hostile).**
+- **Jump targets are validated (BC-16).** Every branch — `JMP`, the conditional jumps, `CATCH`,
+  `FE_FETCH`, the `SWITCH`/`MATCH` jump tables, and the 8.3+ `BIND_INIT_STATIC_OR_JMP` and 8.4+
+  `JMP_FRAMELESS` — must land on an aligned opline of the same op_array. A relative jump offset (the
+  x86-64 default, never relocated at load) could otherwise point at bytes the VM reads as
+  `opline->handler` and calls, hijacking control flow at execution time. The target is computed exactly
+  as the VM computes it (`OP_JMP_ADDR` / `ZEND_OFFSET_TO_OPLINE`) and checked after the opline walk.
+- **Interface and trait names cannot be NULL (BC-17).** An unlinked class resolves them at link time; a
+  NULL offset was a NULL dereference reachable outside the install guard with delayed binding. Refused
+  now, like class and function names.
+- **PHP 8.5 `IS_PTR` is refused outside a genuine attributed-constant literal (BC-18).** The loader
+  accepted `IS_PTR` in every zval, leaving a raw image offset as a forged pointer in a property default,
+  class constant or nested array. Now only the attributed-constant attribute pointer — the one a
+  `DECLARE_ATTRIBUTED_CONST` `OP_DATA` consumes — is allowed, and every `IS_PTR` literal must be
+  relocated or it is refused. php82–84 already refused `IS_PTR` everywhere; php85 now matches them.
+- `scripts/check_bc_layers.py` pins all three layers.
+
+**Loader — sealed mode.** A sealed package now refuses to run if Envelock's eval() gate (its
+`zend_compile_string` hook) was replaced after `MINIT`; otherwise `eval()` could run unguarded under a
+sealed package. Fail closed, and scoped to sealed packages only — non-sealed packages are unaffected.
+
+**Encoder.** `protect()`'s default random file nonce clears the top bit, matching the counter `pack_tree`
+passes, so a content-key nonce can never collide with the top-bit-set vault-wrap nonce even if a caller
+lets `protect()` choose the nonce — the invariant now lives in the primitive, not only in the caller.
+`scripts/package-pie-assets.py` reads both the text (`<hash>  name`) and binary (`<hash> *name`)
+sha256sum manifest forms, exactly like `scripts/check_release.py`.
+
+**Supply chain and CI.**
+- **Every released loader and PIE asset is attested** (GitHub artifact provenance, `actions/attest-build-provenance`):
+  a signed record of the workflow, commit and run that produced each file. Verify any downloaded binary
+  with `gh attestation verify <file> --repo miguelenred/envelock`. The release workflow builds the Linux
+  loaders as portable glibc-2.28 binaries with OpenSSL 3 linked in, each download checked against its
+  published SHA-256.
+- **The bytecode deserializer is fuzzed continuously in CI** under AddressSanitizer + UndefinedBehaviorSanitizer
+  on every supported PHP (`scripts/fuzz_bytecode.py`): a mutated image must be rejected, never crash or
+  touch memory outside its buffer.
+
+**Encoder — analysis and obfuscation.**
+- The compatibility analysis is **fully generic**: no condition is tied to any named CMS or framework. The
+  six CMSs appear only in the documentation and in the tests that measure that Envelock protects them.
+- Control-flow flattening (`--obfuscate-flatten`) **randomises its state labels** and is recommended by
+  default.
 
 **Compatibility measured on two more real applications, like the four CMSs; nothing in the loader or the
-encoder changed.** `docs/DEPLOYING-APPS.md` has the measurements and the recipes.
+encoder changed for them.** `docs/DEPLOYING-APPS.md` has the measurements and the recipes.
 - **CodeIgniter 4.7.6**, its own code packed as bytecode, is identical to the cleartext application once
   `app/Config/Filters.php` stays cleartext. CodeIgniter's filter discovery reads that file and tokenizes it
   to find its class (`FileLocator::getClassname`), so on an encrypted file it took the app's own config for

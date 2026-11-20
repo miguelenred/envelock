@@ -65,6 +65,77 @@ jobs:
           ENVELOCK_FUZZ_RUNS: '2000000'
         run: bash scripts/audit-native.sh "$RUNNER_TEMP/audit"
 
+  fuzz-bytecode:
+    # The bytecode deserializer under AddressSanitizer + UBSan, on every supported PHP: mutated images
+    # must be rejected, never crash or touch memory outside their buffer (scripts/fuzz_bytecode.py).
+    # PHP itself is built with ASan (php.net tarball, SHA-256 checked, cached): a PHP without it loads
+    # extensions with RTLD_DEEPBIND, which the sanitizer runtime refuses. The loader built here has the
+    # TEST-ONLY deserialize entry (--enable-envelock-bcrun-unsafe) and is never shipped or uploaded.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '8.2.36'
+            sha256: df50a00d2b453096608bf2bd98a9fab9a3df8678a77b93011b65c3cfe9a018fa
+          - php: '8.3.37'
+            sha256: 0237af84478b7a7649d3964153f1b8653d622550b846f56d63062de683fb86bb
+          - php: '8.4.28'
+            sha256: 0c8ec360e5dd8154f270b2fd50cd44ecc824e6ee39c85f911312b80d4daecd72
+          - php: '8.5.13'
+            sha256: 607602acaf0c3061818e9916ec44a058e8b3d43959a83862b9cd3ec7bf5b785f
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config autoconf
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: php-asan
+        with:
+          path: ${{ runner.temp }}/php-asan
+          key: php-asan-${{ matrix.php }}-${{ matrix.sha256 }}-v1
+      - name: Build PHP ${{ matrix.php }} with AddressSanitizer
+        if: steps.php-asan.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL -o php.tar.xz "https://www.php.net/distributions/php-${{ matrix.php }}.tar.xz"
+          echo "${{ matrix.sha256 }}  php.tar.xz" | sha256sum -c -
+          tar -xf php.tar.xz
+          cd "php-${{ matrix.php }}"
+          ./configure --prefix="$RUNNER_TEMP/php-asan" --disable-all --enable-cli --disable-cgi --disable-phpdbg \
+            CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address" LDFLAGS="-fsanitize=address" > /dev/null
+          make -j4 > /dev/null
+          make install > /dev/null
+          "$RUNNER_TEMP/php-asan/bin/php" -v
+      - name: Build a TEST-ONLY loader with AddressSanitizer and UBSan
+        run: |
+          export PATH="$RUNNER_TEMP/php-asan/bin:$PATH"
+          cp -R extension "$RUNNER_TEMP/fuzz-src"
+          cd "$RUNNER_TEMP/fuzz-src"
+          phpize
+          ./configure --with-php-config="$RUNNER_TEMP/php-asan/bin/php-config" \
+            --enable-envelock --enable-envelock-bcrun-unsafe \
+            CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined" \
+            LDFLAGS="-fsanitize=address,undefined -lubsan"
+          make -j4
+      - name: Fuzz the deserializer (mutated images must be rejected, never crash)
+        env:
+          USE_ZEND_ALLOC: '0'
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1:allow_user_segv_handler=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: >-
+          python scripts/fuzz_bytecode.py --php "$RUNNER_TEMP/php-asan/bin/php"
+          --loader "$RUNNER_TEMP/fuzz-src/modules/envelock.so" --seconds 420 --out "$RUNNER_TEMP/fuzz-bc"
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-bytecode-php-${{ matrix.php }}
+          path: ${{ runner.temp }}/fuzz-bc
+          if-no-files-found: ignore
+
   unix:
     strategy:
       fail-fast: false

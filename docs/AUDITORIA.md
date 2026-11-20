@@ -586,9 +586,9 @@ in the code paths that run on a server. Findings acted on:
   visibility-default — and it hides the `envelock_*` internals from a loaded extension), plus the symbol
   gate.
 - **Documented, not changed (by design or low):** the bytecode **deserializer is a trust boundary** — its
-  in-band checks are `ZEND_ASSERT` (compiled out in production), so it relies on the Ed25519 signature
-  verified before load (this is the OPcache `file_cache` posture; hardening it with real range checks is
-  future work); the manifest **fast-path cross-attribution** (only a *trusted* developer could mislabel a
+  in-band checks were `ZEND_ASSERT` (compiled out in production), so it relied on the Ed25519 signature
+  verified before load (this was the OPcache `file_cache` posture; hardened since, as defense-in-depth
+  behind that signature, with real in-band range, offset and jump-target checks — see Pass 36); the manifest **fast-path cross-attribution** (only a *trusted* developer could mislabel a
   file; shown exploitable and fixed in Pass 32); the licence/trusted-time **fail-open** (anti-rollback, not access control — the real perimeter is
   encryption + signature); the always-registered **mini-VM** `__envelock_vm` (its validator is the trust
   boundary; recommend continuous fuzzing); the Wine-build robustness and the `check_release` exemption of
@@ -732,8 +732,8 @@ character in the path is a separator (`/`, or `\` on Windows). The sibling is no
 - **Crypto order.** `envelock_compile_file` parses and bounds-checks the header, then verifies the Ed25519
   signature against the trusted signers, and only *then* decrypts (`envelock_open`, AES-256-GCM, which
   authenticates) and — for a bytecode image — deserializes. So nothing untrusted reaches the bytecode
-  deserializer (whose runtime checks are `ZEND_ASSERT`, by design backed by the prior signature) or the
-  source compiler. Signature-before-use holds on both paths.
+  deserializer (which, as defense-in-depth behind that prior signature, now actively validates the image
+  fail-closed — see Pass 36) or the source compiler. Signature-before-use holds on both paths.
 - **Vault parsers** (`envelock_parse_vault`, `_enc`): every length field is bounds-checked against the
   authenticated plaintext with no integer overflow (table_bytes ≤ total−4, count ≤ (table−4)/4, each
   entry's len ≤ remaining); malformed-but-signed tables are rejected cleanly.
@@ -985,6 +985,41 @@ was run against the fix undone (a scratch build of the loader for the C ones) an
 | Encoder | PowerShell password files (BOM/UTF-16) bypassed the length check and locked keys to the file | Fixed (old keys still open) |
 | Encoder | POSIX identity updates dropped owner/mode; manifest over 16 MiB accepted at pack; `--obfuscate-properties` renamed names a class reads; `server-install --identity` accepted any file; empty licence bindings; `write_public` intermediate folders; `verify` could not pin project/serial | Fixed |
 | Assistant / scripts | GUI hid pack warnings, ran a bare `php` from the current folder, saved keys at an unstated path; release gate: terms file in tree, symlinks, archive formats, BOM, unpinned sources; evidence: wrong OpenSSL, exerciser text, host name; `build-unix.sh` path gate; PIE build-id check; preflight paths, ZTS names, `phpinfo` | Fixed |
+
+## Pass 36: full end-to-end audit of 1.1.1, verified and fixed (November 19–20)
+
+After the artifact-attestation and continuous-fuzzing work was added and CI was green, a full end-to-end
+audit ran: four independent reviewers in parallel — the bytecode deserializer; the crypto core and the
+encoder's crypto; the bytecode VM and the loader's sealed/manifest/eval enforcement; licences, trusted
+time, the release gate and the obfuscation transforms — plus a review of the CI workflows. No
+attacker-reachable defect was found: every finding sits behind the Ed25519 signature, which is verified
+over the whole container before anything is decrypted or deserialized. Each finding was checked against
+the code here and fixed with a test; the fixes were validated natively on PHP 8.2, 8.3, 8.4 and 8.5
+(1790–1792 tests per version) and under the ASan/UBSan deserializer fuzzer.
+
+| Area | Finding | Status |
+|---|---|---|
+| Bytecode | Jump/branch targets were never validated: a relative offset (the x86-64 default, never relocated) could aim a jump at image bytes the VM reads as `opline->handler` and calls (control-flow hijack on a hostile image). | **Fixed (BC-16).** Every branch target — `JMP`/`FAST_CALL` op1, the conditional jumps and `CATCH` op2, `FE_FETCH` `extended_value`, the `SWITCH`/`MATCH` op2 jump tables, and the 8.3+ `BIND_INIT_STATIC_OR_JMP` / 8.4+ `JMP_FRAMELESS` — must land on an aligned opline of the op_array, computed exactly as the VM computes it. |
+| Bytecode | `interface_names`/`trait_names` of an unlinked class were relocated but a NULL offset was left NULL: a NULL dereference at link time, reachable outside the install guard with delayed binding (DoS). | **Fixed (BC-17).** Both are required and refused if NULL, like class and function names; the if-guarded alias/precedence names may legitimately be NULL and are unchanged. |
+| Bytecode | PHP 8.5 accepted `IS_PTR` in every zval (`allow_ptr=1`), leaving a raw image offset as a forged pointer in a property default, class constant or nested array (type confusion); php82–84 refused it. | **Fixed (BC-18).** `IS_PTR` is refused in the general walk on 8.5 too; the one legitimate `IS_PTR` — an attributed-constant attribute literal — is skipped in the literals walk and must be consumed (relocated) by its `DECLARE_ATTRIBUTED_CONST` `OP_DATA`, or it is refused. |
+| Loader | The eval() gate (`zend_compile_string`) was not re-checked: if a module replaced it after `MINIT` without chaining, `eval()` could run unguarded under a sealed package. | **Fixed.** A sealed package refuses to run unless the hook is still Envelock's (fail closed; scoped to sealed packages, so non-sealed ones are unaffected). |
+| Encoder | `protect()`'s default random file nonce upheld the vault nonce-domain split only via `pack_tree`'s counter; a caller using the default could land a file nonce in the vault-wrap domain. | **Fixed.** The default clears the top bit of byte 0, so the disjoint-domain invariant lives in the primitive. |
+| Scripts | `package-pie-assets.py` read only the two-space `sha256sum` form; a binary-mode manifest left the loaders unverified and the build broke (not a bypass — the full hash is checked first). | **Fixed.** Both forms accepted, like `check_release.py`. |
+
+**Verified sound (not changed):** the crypto core (no nonce reuse, AAD binds header/path/table, signature
+before decrypt, bounded in-place decrypt), the bytecode VM (two-pass validation, bounded stack and
+jumps), manifest and sealed/prepend enforcement (fail closed on every path), licence/clock/trusted-time
+parsing, the release gate, and the obfuscation transforms (flatten/rename/strip behaviour-preserving, one
+checked empirically on 8.5). The CI workflows pin every action to a SHA, run at least privilege and verify
+every download's SHA-256.
+
+**Security-first decisions (deliberately not changed):** the per-worker `sealed_roots` set is not
+capped — evicting entries would drop the cross-request refusal of plain files under a sealed root,
+trading a security property for a negligible memory saving. Several relocated-but-unclaimed pointers
+(`c->ce`, `prototype`, …) are left bounded-only: they can be legitimately aliased, so claiming them in the
+overlap map would reject valid images; the jump-address case among them is covered by BC-16. The largest
+available speed win — a per-worker cache of decrypted code — is rejected because it would retain plaintext
+in process memory.
 
 ## Open risks and necessary work
 

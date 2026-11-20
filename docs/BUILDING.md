@@ -363,7 +363,7 @@ cd third_party && find . -type f ! -path ./SHA256SUMS ! -path ./README.md ! -pat
 Linux it prefers a prebuilt `.so` attached to the Release and otherwise builds from source. Users'
 side: `docs/HOSTING.md` §4.1.
 
-1. **Tag without a `v`** (`1.1.1`, not `v1.1.1`): PIE puts the package version in the asset names it
+1. **Tag without a `v`** (`1.1.2`, not `v1.1.2`): PIE puts the package version in the asset names it
    looks for.
 2. **Build and test the loaders** (section 2; Linux on the AlmaLinux 8 baseline with
    `ENVELOCK_OPENSSL_STATIC` and `ENVELOCK_MAX_GLIBC=2.28`, see `docs/PLATAFORMAS.md`), copy them to
@@ -390,20 +390,26 @@ side: `docs/HOSTING.md` §4.1.
 4. **Package the assets** with their exact PIE names:
 
    ```bash
-   python scripts/package-pie-assets.py --version 1.1.1     # writes dist/pie/
+   python scripts/package-pie-assets.py --version 1.1.2     # writes dist/pie/
    ```
 
-   It refuses any binary not listed with its hash in `prebuilt/SHA256SUMS` or whose PHP build id
+   It reads `prebuilt/SHA256SUMS` in either the text or the binary (`*`-prefixed) `sha256sum` manifest
+   form, and refuses any binary not listed there with its hash or whose PHP build id
    (`API<date>,NTS|TS[,VS16|VS17]`, what PHP itself checks when loading it) does not match its folder,
    reads each DLL's compiler from its PE header (VS16 for PHP 8.2/8.3, VS17 for 8.4/8.5) and writes
-   `php_envelock-1.1.1-8.4-nts-vs17-x86_64.zip` (the DLL inside under the same name) for Windows,
-   `php_envelock-1.1.1_php8.4-x86_64-linux-glibc-nts.zip` (`envelock.so` inside) for Linux, LICENSE
+   `php_envelock-1.1.2-8.4-nts-vs17-x86_64.zip` (the DLL inside under the same name) for Windows,
+   `php_envelock-1.1.2_php8.4-x86_64-linux-glibc-nts.zip` (`envelock.so` inside) for Linux, LICENSE
    and NOTICE in each, and a `SHA256SUMS` of the assets. The ZIPs are deterministic.
 5. **Create the GitHub Release** for the tag and attach the assets:
 
    ```bash
-   gh release create 1.1.1 dist/pie/*.zip dist/pie/SHA256SUMS --title "Envelock 1.1.1" --notes-file CHANGELOG.md
+   gh release create 1.1.2 dist/pie/*.zip dist/pie/SHA256SUMS --title "Envelock 1.1.2" --notes-file CHANGELOG.md
    ```
+
+   The automated `.github/workflows/release.yml` additionally builds a portable Linux loader and
+   generates a GitHub artifact **attestation** for every released loader and PIE asset. Anyone can
+   then check a downloaded binary's provenance with
+   `gh attestation verify <file> --repo miguelenred/envelock`.
 
 6. **Packagist, once:** with the repository public, submit its URL at
    <https://packagist.org/packages/submit> (logged in with the maintainer's account) and enable the

@@ -980,9 +980,10 @@ static zend_op_array *envelock_bc_load_image_inner(unsigned char *image, size_t 
         /* A normally-compiled file arms the auto-globals ($_SERVER, $_GET, ...) the first time the
          * compiler sees each one, so the engine populates them for the request. A deserialized
          * op_array never passes through that step: if the first use of an auto-global in a request
-         * comes from bytecode inside a function, it would read as null (e.g. WordPress's
-         * wp_fix_server_vars(): array_merge($defaults, $_SERVER)). Arm the standard set here, the
-         * same restoration OPcache performs from ping_auto_globals_mask when it loads a script. */
+         * comes from bytecode inside a function, it would read as null (e.g. a function that does
+         * array_merge($defaults, $_SERVER) before anything else reads $_SERVER). Arm the standard set
+         * here, the same restoration OPcache performs from ping_auto_globals_mask when it loads a
+         * script. */
         zend_op_array *envelock_loaded = envelock_load_script(script, 1);
 
         if (envelock_loaded != NULL) {

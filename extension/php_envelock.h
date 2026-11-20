@@ -35,6 +35,6 @@ extern zend_module_entry envelock_module_entry;
  * and the phpinfo() row both use it. It is the release it was built for, and it must equal the newest
  * version in CHANGELOG.md (tests/test_release_guard.py); 1.1.1 first shipped with the phpinfo() row
  * still saying 1.1.0, because the two were separate literals. */
-#define PHP_ENVELOCK_VERSION "1.1.1"
+#define PHP_ENVELOCK_VERSION "1.1.2"
 
 #endif /* PHP_ENVELOCK_H */
