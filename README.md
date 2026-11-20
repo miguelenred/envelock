@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/envelock-icon-256.png" alt="Envelock logo" width="140" height="140">
+</p>
+
 # Envelock
 
 **Offline encoder and loader extension for PHP 8.2–8.5.**  
